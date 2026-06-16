@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod config;
 pub mod contracts;
 pub mod lane_state;
+pub mod monitor;
 
 pub const CRATE_NAME: &str = "hepa-core";
 

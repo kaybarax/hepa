@@ -1,5 +1,13 @@
 use crate::spec::{HepaAdapterMode, HepaAdapterRole, HepaAdapterSpec, HepaAdapterTemplateContext};
-use std::{collections::BTreeMap, error::Error, fmt, path::PathBuf, process::Command};
+use hepa_core::monitor::{HepaMonitorPolicy, HepaMonitorStop, HepaMonitorStopKind};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaOneshotAdapterInvocation {
@@ -7,6 +15,7 @@ pub struct HepaOneshotAdapterInvocation {
     pub role: HepaAdapterRole,
     pub context: HepaAdapterTemplateContext,
     pub environment: BTreeMap<String, String>,
+    pub monitor_policy: HepaMonitorPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +60,10 @@ impl HepaOneshotAdapterExecutor {
         }
 
         let command = rendered_command(invocation)?;
+        invocation
+            .monitor_policy
+            .check_command(&command)
+            .map_err(monitor_error)?;
         let argv = split_command_line(&command)?;
         let (program, args) = argv
             .split_first()
@@ -70,9 +83,18 @@ impl HepaOneshotAdapterExecutor {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
-        let output = child.output().map_err(|error| {
+        child.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = child.spawn().map_err(|error| {
             HepaAdapterExecutionError::new("command", format!("failed to spawn adapter: {error}"))
         })?;
+        let output = wait_with_monitor(child, &invocation.monitor_policy)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        invocation
+            .monitor_policy
+            .check_output(&stdout)
+            .and_then(|_| invocation.monitor_policy.check_output(&stderr))
+            .map_err(monitor_error)?;
 
         Ok(HepaOneshotAdapterResult {
             adapter_id: invocation.spec.id.clone(),
@@ -81,8 +103,8 @@ impl HepaOneshotAdapterExecutor {
             workdir,
             allowed_env_keys: filtered_env.keys().cloned().collect(),
             exit_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            stdout,
+            stderr,
         })
     }
 }
@@ -109,6 +131,42 @@ impl fmt::Display for HepaAdapterExecutionError {
 }
 
 impl Error for HepaAdapterExecutionError {}
+
+fn wait_with_monitor(
+    mut child: std::process::Child,
+    policy: &HepaMonitorPolicy,
+) -> Result<std::process::Output, HepaAdapterExecutionError> {
+    let started_at = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| HepaAdapterExecutionError::new("command", error.to_string()))?
+            .is_some()
+        {
+            return child.wait_with_output().map_err(|error| {
+                HepaAdapterExecutionError::new("command", format!("failed to read output: {error}"))
+            });
+        }
+        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if let Err(stop) = policy.check_elapsed(elapsed_ms) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(monitor_error(stop));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn monitor_error(stop: HepaMonitorStop) -> HepaAdapterExecutionError {
+    let reason = match stop.kind {
+        HepaMonitorStopKind::CommandPolicy => "command_policy",
+        HepaMonitorStopKind::SecretDetected => "secret_detected",
+        HepaMonitorStopKind::ScopeViolation => "scope_violation",
+        HepaMonitorStopKind::Timeout => "timeout",
+        HepaMonitorStopKind::Stall => "stall",
+    };
+    HepaAdapterExecutionError::new("monitor", format!("{reason}: {}", stop.evidence))
+}
 
 fn rendered_command(
     invocation: &HepaOneshotAdapterInvocation,
@@ -259,6 +317,7 @@ printf 'worker stderr' >&2
                 ("ALLOWED_CONTEXT".to_string(), "visible".to_string()),
                 ("UNLISTED_CONTEXT".to_string(), "hidden".to_string()),
             ]),
+            monitor_policy: HepaMonitorPolicy::default(),
         };
 
         let result = HepaOneshotAdapterExecutor::new()
@@ -305,6 +364,7 @@ printf 'worker stderr' >&2
                 &artifact_dir.join("out.json"),
             ),
             environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy::default(),
         };
 
         let error = HepaOneshotAdapterExecutor::new()
@@ -358,6 +418,7 @@ env | sort > "$2"
                     ("HEPA_MANAGER_SESSION".to_string(), "blocked".to_string()),
                     (github_token_key.clone(), "blocked".to_string()),
                 ]),
+                monitor_policy: HepaMonitorPolicy::default(),
             };
 
             let result = HepaOneshotAdapterExecutor::new()
@@ -387,6 +448,83 @@ env | sort > "$2"
         }
     }
 
+    #[test]
+    fn oneshot_executor_monitor_blocks_command_output_scope_timeout_and_stall() {
+        let root = unique_test_dir("monitor");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("fake-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+case "$1" in
+  leak) printf 'password=blocked' ;;
+  scope) printf '%s' "$2" ;;
+  slow) sleep 1 ;;
+  ok) printf 'ok' ;;
+esac
+"#,
+        );
+
+        let command_error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} ok && git push", script.display()),
+            HepaMonitorPolicy::default(),
+        )
+        .expect_err("command policy should stop");
+        assert!(command_error.message.contains("command_policy"));
+
+        let secret_error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} leak", script.display()),
+            HepaMonitorPolicy::default(),
+        )
+        .expect_err("secret output should stop");
+        assert!(secret_error.message.contains("secret_detected"));
+
+        let scope_error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} scope <OUT_OF_SCOPE>", script.display()),
+            HepaMonitorPolicy {
+                blocked_scope_refs: vec!["<OUT_OF_SCOPE>".to_string()],
+                ..HepaMonitorPolicy::default()
+            },
+        )
+        .expect_err("scope output should stop");
+        assert!(scope_error.message.contains("scope_violation"));
+
+        let timeout_error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} slow", script.display()),
+            HepaMonitorPolicy {
+                timeout_ms: Some(50),
+                ..HepaMonitorPolicy::default()
+            },
+        )
+        .expect_err("timeout should stop");
+        assert!(timeout_error.message.contains("timeout"));
+
+        let stall_error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} slow", script.display()),
+            HepaMonitorPolicy {
+                stall_ms: Some(50),
+                ..HepaMonitorPolicy::default()
+            },
+        )
+        .expect_err("stall should stop");
+        assert!(stall_error.message.contains("stall"));
+
+        remove_test_dir(root);
+    }
+
     fn adapter_spec(
         id: &str,
         roles: Vec<HepaAdapterRole>,
@@ -413,6 +551,29 @@ env | sort > "$2"
             resource_weight: 1,
             max_concurrency: 1,
         }
+    }
+
+    fn run_monitor_case(
+        worktree: &Path,
+        artifact_dir: &Path,
+        command: String,
+        monitor_policy: HepaMonitorPolicy,
+    ) -> Result<HepaOneshotAdapterResult, HepaAdapterExecutionError> {
+        let output_file = artifact_dir.join("monitor-output.json");
+        let invocation = HepaOneshotAdapterInvocation {
+            spec: adapter_spec(
+                "monitor-adapter",
+                vec![HepaAdapterRole::Worker],
+                command,
+                None,
+                Vec::new(),
+            ),
+            role: HepaAdapterRole::Worker,
+            context: template_context(worktree, artifact_dir, &output_file),
+            environment: BTreeMap::new(),
+            monitor_policy,
+        };
+        HepaOneshotAdapterExecutor::new().run(&invocation)
     }
 
     fn template_context(
