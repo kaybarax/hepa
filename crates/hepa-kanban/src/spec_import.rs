@@ -346,4 +346,23 @@ Acceptance:
             Some(&HepaHermesFieldValue::Text("not_ready".to_string()))
         );
     }
+
+    #[test]
+    fn imported_tasks_stay_draft_not_ready_until_readiness_passes() {
+        let imported = import_markdown_spec(
+            r#"
+Project: project-1
+## Task: task-1: Launch feature
+Ready: true
+Acceptance:
+- Feature is documented.
+"#,
+        )
+        .expect("spec should import");
+
+        let task = &imported.tasks[0].fleet_task;
+        assert_eq!(task.status, HepaTaskStatus::Draft);
+        assert_eq!(task.readiness, HepaReadinessState::NotReady);
+        assert!(task.lane_ids.is_empty());
+    }
 }
