@@ -1,3 +1,4 @@
+use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
 use hepa_kanban::sync::{
     HepaKanbanSyncEngine, HepaKanbanSyncStatus, HepaUnavailableHermesCardStore,
 };
@@ -36,6 +37,16 @@ fn run_cli(args: &[String]) -> Result<String, String> {
                 )),
             }
         }
+        [command, subcommand] if command == "kanban" && subcommand == "doctor" => {
+            let report = HepaKanbanDoctorReport::from_checks([
+                HepaKanbanDoctorCheck::missing("cli", "Install or configure the Hermes CLI/API."),
+                HepaKanbanDoctorCheck::missing("api", "Configure Hermes API access."),
+                HepaKanbanDoctorCheck::missing("auth", "Authenticate the Hermes integration."),
+                HepaKanbanDoctorCheck::missing("workspace", "Select a Hermes workspace."),
+                HepaKanbanDoctorCheck::missing("board", "Select a reachable Hermes board."),
+            ]);
+            Ok(report.to_redacted_summary())
+        }
         [command, ..] if command == "kanban" => Err("unknown kanban command".to_string()),
         _ => Err("unknown command".to_string()),
     }
@@ -57,5 +68,14 @@ mod tests {
             output,
             "HEPA kanban sync degraded: reason=Hermes CLI/API unavailable skipped=0"
         );
+    }
+
+    #[test]
+    fn kanban_doctor_command_reports_degraded_status() {
+        let output = run_cli(&args(&["kanban", "doctor"])).expect("doctor should run");
+
+        assert!(output.contains("HEPA kanban doctor: degraded"));
+        assert!(output.contains("cli=missing"));
+        assert!(output.contains("board=missing"));
     }
 }
