@@ -1,3 +1,4 @@
+pub mod builtin;
 pub mod engine;
 pub mod fake;
 pub mod registry;

@@ -1,4 +1,4 @@
-use crate::spec::HepaAdapterSpec;
+use crate::{builtin::builtin_adapter_specs, spec::HepaAdapterSpec};
 use hepa_core::config::HepaConfig;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,7 +20,7 @@ impl Default for HepaAdapterRegistryDocument {
     fn default() -> Self {
         Self {
             schema_version: ADAPTER_REGISTRY_SCHEMA_VERSION,
-            adapters: BTreeMap::new(),
+            adapters: builtin_adapter_specs(),
         }
     }
 }
@@ -176,7 +176,10 @@ mod tests {
             registry.path(),
             Path::new(&config.control_root).join("adapters/registry.json")
         );
-        assert!(registry.list().is_empty());
+        assert_eq!(
+            registry.list().len(),
+            crate::builtin::BUILTIN_ADAPTER_IDS.len()
+        );
 
         registry.upsert(worker.clone()).expect("create should work");
         registry.save().expect("registry should save");
@@ -209,6 +212,42 @@ mod tests {
         let loaded =
             HepaAdapterRegistry::load_from_config(&config).expect("deleted registry loads");
         assert!(loaded.get("worker-primary").is_none());
+        assert!(loaded.get("fake").is_some());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn missing_registry_loads_default_builtins_deterministically() {
+        let root = unique_test_dir("defaults");
+        let registry_path = root.join("control/adapters/registry.json");
+
+        let registry = HepaAdapterRegistry::load(&registry_path).expect("missing registry loads");
+        let ids = registry
+            .list()
+            .into_iter()
+            .map(|spec| spec.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, crate::builtin::BUILTIN_ADAPTER_LIST_ORDER);
+        assert_eq!(
+            registry
+                .get("external-worker")
+                .map(|spec| spec.mode.clone()),
+            Some(HepaAdapterMode::External)
+        );
+        assert_eq!(
+            registry
+                .get("local-worker")
+                .map(|spec| spec.cost_class.clone()),
+            Some(HepaAdapterCostClass::Local)
+        );
+        assert!(
+            registry
+                .list()
+                .into_iter()
+                .all(|spec| spec.required_env.is_empty())
+        );
 
         remove_test_dir(root);
     }
