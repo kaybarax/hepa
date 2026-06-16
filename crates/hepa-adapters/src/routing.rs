@@ -510,6 +510,18 @@ mod tests {
     }
 
     #[test]
+    fn unknown_capability_keys_fail_loudly() {
+        let policy = sample_policy();
+
+        let error = policy
+            .resolve_adapter(Some("backend"))
+            .expect_err("unknown capabilities must fail");
+
+        assert_eq!(error.field, "capability");
+        assert!(error.message.contains("unknown capability key"));
+    }
+
+    #[test]
     fn manager_override_requires_and_records_reason() {
         let policy = sample_policy();
         let adapters = sample_adapters(HepaAdapterCostClass::PaidCloud);
