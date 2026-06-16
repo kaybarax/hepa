@@ -43,6 +43,30 @@ impl HepaKanbanSyncEngine {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HepaKanbanReconciliationReport {
+    pub drift_detected: bool,
+    pub reason: String,
+    pub reconciled_payload: HepaHermesCardPayload,
+}
+
+pub fn reconcile_card_with_hepa_state(
+    task: &HepaHermesCardMappingInput,
+    board_payload: &HepaHermesCardPayload,
+) -> Result<HepaKanbanReconciliationReport, String> {
+    let expected_payload = map_task_to_hermes_card(task).map_err(|error| error.to_string())?;
+    let drift_detected = &expected_payload != board_payload;
+    Ok(HepaKanbanReconciliationReport {
+        drift_detected,
+        reason: if drift_detected {
+            "board card payload drifted from authoritative HEPA state".to_string()
+        } else {
+            "board card payload matches authoritative HEPA state".to_string()
+        },
+        reconciled_payload: expected_payload,
+    })
+}
+
 pub trait HepaHermesCardStore {
     fn availability(&self) -> HepaHermesStoreAvailability {
         HepaHermesStoreAvailability::Available
@@ -377,6 +401,28 @@ mod tests {
         assert_eq!(
             first_catch_up.results[0].external_card_id,
             second_catch_up.results[0].external_card_id
+        );
+    }
+
+    #[test]
+    fn reconciliation_restores_card_payload_from_hepa_state_after_drift() {
+        let task = sample_task(None);
+        let expected = map_task_to_hermes_card(&task).expect("mapping should work");
+        let mut drifted = expected.clone();
+        drifted.fields.insert(
+            "task_status".to_string(),
+            HepaHermesFieldValue::Text("completed".to_string()),
+        );
+
+        let report = reconcile_card_with_hepa_state(&task, &drifted)
+            .expect("reconciliation should compare payloads");
+
+        assert!(report.drift_detected);
+        assert!(report.reason.contains("authoritative HEPA state"));
+        assert_eq!(report.reconciled_payload, expected);
+        assert_eq!(
+            report.reconciled_payload.fields.get("task_status"),
+            Some(&HepaHermesFieldValue::Text("queued".to_string()))
         );
     }
 }
