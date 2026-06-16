@@ -10,3 +10,10 @@ unavailable.
 
 This repository is the initial workspace skeleton for the v1.0.0 implementation.
 
+## Development Checks
+
+Run the standard local gate with:
+
+```bash
+bin/hepa-check
+```
