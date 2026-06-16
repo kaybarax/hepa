@@ -24,6 +24,25 @@ pub struct HepaAdapterSpec {
     pub max_concurrency: u32,
 }
 
+impl HepaAdapterSpec {
+    pub fn render_worker_command(
+        &self,
+        context: &HepaAdapterTemplateContext,
+    ) -> Result<String, HepaAdapterTemplateError> {
+        render_command_template(&self.command, context)
+    }
+
+    pub fn render_review_command(
+        &self,
+        context: &HepaAdapterTemplateContext,
+    ) -> Result<Option<String>, HepaAdapterTemplateError> {
+        self.review_command
+            .as_deref()
+            .map(|template| render_command_template(template, context))
+            .transpose()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaAdapterTemplateContext {
     pub prompt_file: String,
@@ -223,5 +242,48 @@ mod tests {
             .expect_err("unterminated placeholders must fail");
 
         assert!(error.message.contains("unterminated"));
+    }
+
+    #[test]
+    fn raw_task_text_is_not_a_supported_command_placeholder() {
+        let context = HepaAdapterTemplateContext {
+            prompt_file: "<RUN_DIR>/prompt.md".to_string(),
+            worktree: "<WORKTREE>".to_string(),
+            review_prompt_file: "<RUN_DIR>/review.md".to_string(),
+            output_file: "<RUN_DIR>/worker.json".to_string(),
+            review_output_file: "<RUN_DIR>/review.json".to_string(),
+            artifact_dir: "<RUN_DIR>".to_string(),
+        };
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "unsafe-template".to_string(),
+            display_name: "Unsafe Template".to_string(),
+            roles: vec![HepaAdapterRole::Worker],
+            mode: HepaAdapterMode::Oneshot,
+            command: "agent --task {task_text} --prompt-file {prompt_file}".to_string(),
+            review_command: Some(
+                "reviewer --task {raw_task} --prompt-file {review_prompt_file}".to_string(),
+            ),
+            workdir: "{worktree}".to_string(),
+            required_commands: vec!["agent".to_string()],
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::AgentNative,
+            supports_resume: false,
+            supports_json_output: true,
+            capabilities: vec!["docs".to_string()],
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 1,
+            max_concurrency: 1,
+        };
+
+        let worker_error = spec
+            .render_worker_command(&context)
+            .expect_err("raw task placeholders must not render");
+        let review_error = spec
+            .render_review_command(&context)
+            .expect_err("raw task placeholders must not render in review commands");
+
+        assert_eq!(worker_error.placeholder, "task_text");
+        assert_eq!(review_error.placeholder, "raw_task");
     }
 }
