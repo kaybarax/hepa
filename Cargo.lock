@@ -27,6 +27,7 @@ name = "hepa-cli"
 version = "0.1.0"
 dependencies = [
  "hepa-core",
+ "hepa-kanban",
 ]
 
 [[package]]
