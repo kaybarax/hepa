@@ -365,4 +365,31 @@ Acceptance:
         assert_eq!(task.readiness, HepaReadinessState::NotReady);
         assert!(task.lane_ids.is_empty());
     }
+
+    #[test]
+    fn sample_spec_imports_into_multiple_dependent_cards() {
+        let imported = import_markdown_spec(
+            r#"
+Project: project-1
+## Task: task-1: Write docs
+Acceptance:
+- Docs describe usage.
+
+## Task: task-2: Review docs
+Acceptance:
+- Review is complete.
+Dependencies:
+- task-1
+"#,
+        )
+        .expect("spec should import");
+        let cards = imported_spec_to_draft_cards(project(), &imported)
+            .expect("imported spec should create cards");
+
+        assert_eq!(imported.tasks.len(), 2);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].title, "Write docs");
+        assert_eq!(cards[1].title, "Review docs");
+        assert_eq!(imported.tasks[1].task_spec.dependencies, vec!["task-1"]);
+    }
 }
