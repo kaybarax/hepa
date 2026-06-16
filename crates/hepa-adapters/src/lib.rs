@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod fake;
+pub mod registry;
 pub mod routing;
 pub mod spec;
 
