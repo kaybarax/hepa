@@ -1,3 +1,4 @@
+use hepa_core::contracts::{HepaFleetTask, HepaReadinessState, HepaTaskStatus};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
@@ -59,6 +60,132 @@ impl HepaBoardTransitionAction {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaBoardTransitionDecision {
+    pub request_id: String,
+    pub task_id: String,
+    pub status: HepaBoardTransitionDecisionStatus,
+    pub reason: String,
+    pub updated_task: Option<HepaFleetTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HepaBoardTransitionDecisionStatus {
+    Accepted,
+    Rejected,
+}
+
+pub fn evaluate_board_transition(
+    task: &HepaFleetTask,
+    request: &HepaBoardTransitionRequest,
+) -> Result<HepaBoardTransitionDecision, HepaBoardTransitionError> {
+    request.validate()?;
+    if task.task_id != request.task_id {
+        return Ok(rejected(
+            request,
+            "request task_id does not match HEPA task record",
+        ));
+    }
+
+    let mut updated_task = task.clone();
+    match &request.action {
+        HepaBoardTransitionAction::SetPriority { priority } => {
+            updated_task.priority = *priority;
+            Ok(accepted(request, "priority updated", updated_task))
+        }
+        HepaBoardTransitionAction::MarkReady => {
+            updated_task.readiness = HepaReadinessState::Ready;
+            transition_status(
+                request,
+                updated_task,
+                HepaTaskStatus::Ready,
+                "task marked ready",
+            )
+        }
+        HepaBoardTransitionAction::Block { .. } => {
+            updated_task.readiness = HepaReadinessState::Blocked;
+            transition_status(
+                request,
+                updated_task,
+                HepaTaskStatus::Blocked,
+                "task blocked",
+            )
+        }
+        HepaBoardTransitionAction::Cancel { .. } => transition_status(
+            request,
+            updated_task,
+            HepaTaskStatus::Cancelled,
+            "task cancelled",
+        ),
+        HepaBoardTransitionAction::Resume => {
+            let next_status = if matches!(updated_task.readiness, HepaReadinessState::Ready) {
+                HepaTaskStatus::Ready
+            } else {
+                HepaTaskStatus::Queued
+            };
+            transition_status(request, updated_task, next_status, "task resumed")
+        }
+        HepaBoardTransitionAction::SetDependencies { dependencies } => {
+            if dependencies
+                .iter()
+                .any(|dependency| dependency == &task.task_id)
+            {
+                return Ok(rejected(
+                    request,
+                    "dependencies must not reference the task itself",
+                ));
+            }
+            updated_task.dependencies = dependencies.clone();
+            Ok(accepted(request, "dependencies updated", updated_task))
+        }
+    }
+}
+
+fn transition_status(
+    request: &HepaBoardTransitionRequest,
+    mut task: HepaFleetTask,
+    next_status: HepaTaskStatus,
+    reason: &str,
+) -> Result<HepaBoardTransitionDecision, HepaBoardTransitionError> {
+    if task.status == next_status || task.status.can_transition_to(&next_status) {
+        task.status = next_status;
+        Ok(accepted(request, reason, task))
+    } else {
+        Ok(rejected(
+            request,
+            "requested status transition is not allowed by HEPA state machine",
+        ))
+    }
+}
+
+fn accepted(
+    request: &HepaBoardTransitionRequest,
+    reason: impl Into<String>,
+    updated_task: HepaFleetTask,
+) -> HepaBoardTransitionDecision {
+    HepaBoardTransitionDecision {
+        request_id: request.request_id.clone(),
+        task_id: request.task_id.clone(),
+        status: HepaBoardTransitionDecisionStatus::Accepted,
+        reason: reason.into(),
+        updated_task: Some(updated_task),
+    }
+}
+
+fn rejected(
+    request: &HepaBoardTransitionRequest,
+    reason: impl Into<String>,
+) -> HepaBoardTransitionDecision {
+    HepaBoardTransitionDecision {
+        request_id: request.request_id.clone(),
+        task_id: request.task_id.clone(),
+        status: HepaBoardTransitionDecisionStatus::Rejected,
+        reason: reason.into(),
+        updated_task: None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaBoardTransitionError {
     pub field: String,
@@ -102,6 +229,7 @@ fn require_single_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hepa_core::contracts::CONTRACT_SCHEMA_VERSION;
 
     fn request(action: HepaBoardTransitionAction) -> HepaBoardTransitionRequest {
         HepaBoardTransitionRequest {
@@ -111,6 +239,25 @@ mod tests {
             requested_by: "operator".to_string(),
             action,
             requested_at: "2026-06-16T00:00:00Z".to_string(),
+        }
+    }
+
+    fn task(status: HepaTaskStatus, readiness: HepaReadinessState) -> HepaFleetTask {
+        HepaFleetTask {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Update docs".to_string(),
+            description: "Documentation task".to_string(),
+            status,
+            readiness,
+            dependencies: Vec::new(),
+            lane_ids: Vec::new(),
+            external_card_id: Some("hermes-card-1".to_string()),
+            priority: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+            completed_at: None,
         }
     }
 
@@ -153,5 +300,59 @@ mod tests {
         .expect_err("duplicate dependencies must fail");
 
         assert_eq!(error.field, "action.dependencies");
+    }
+
+    #[test]
+    fn board_transition_evaluator_accepts_allowed_state_changes() {
+        let decision = evaluate_board_transition(
+            &task(HepaTaskStatus::Queued, HepaReadinessState::NotReady),
+            &request(HepaBoardTransitionAction::MarkReady),
+        )
+        .expect("transition should evaluate");
+
+        assert_eq!(decision.status, HepaBoardTransitionDecisionStatus::Accepted);
+        let updated = decision
+            .updated_task
+            .expect("accepted transition updates task");
+        assert_eq!(updated.status, HepaTaskStatus::Ready);
+        assert_eq!(updated.readiness, HepaReadinessState::Ready);
+    }
+
+    #[test]
+    fn board_transition_evaluator_rejects_disallowed_state_changes() {
+        let decision = evaluate_board_transition(
+            &task(HepaTaskStatus::Completed, HepaReadinessState::Ready),
+            &request(HepaBoardTransitionAction::Resume),
+        )
+        .expect("transition should evaluate");
+
+        assert_eq!(decision.status, HepaBoardTransitionDecisionStatus::Rejected);
+        assert!(decision.reason.contains("state machine"));
+        assert!(decision.updated_task.is_none());
+    }
+
+    #[test]
+    fn board_transition_evaluator_accepts_priority_and_dependency_updates() {
+        let priority = evaluate_board_transition(
+            &task(HepaTaskStatus::Draft, HepaReadinessState::NotReady),
+            &request(HepaBoardTransitionAction::SetPriority { priority: 9 }),
+        )
+        .expect("priority should evaluate");
+        let dependencies = evaluate_board_transition(
+            &task(HepaTaskStatus::Draft, HepaReadinessState::NotReady),
+            &request(HepaBoardTransitionAction::SetDependencies {
+                dependencies: vec!["task-0".to_string()],
+            }),
+        )
+        .expect("dependencies should evaluate");
+
+        assert_eq!(priority.updated_task.expect("priority update").priority, 9);
+        assert_eq!(
+            dependencies
+                .updated_task
+                .expect("dependency update")
+                .dependencies,
+            vec!["task-0".to_string()]
+        );
     }
 }
