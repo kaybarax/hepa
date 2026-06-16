@@ -156,6 +156,19 @@ pub struct HepaConfigOverrides {
     pub hermes_sync_interval_seconds: Option<u32>,
 }
 
+impl HepaConfigOverrides {
+    pub fn isolated_temp_root(temp_root: impl Into<String>) -> Self {
+        let temp_root = temp_root.into();
+        Self {
+            control_root: Some(join_config_path(&temp_root, "control")),
+            worktree_root: Some(join_config_path(&temp_root, "worktrees")),
+            archive_root: Some(join_config_path(&temp_root, "archive")),
+            routing_file: Some(join_config_path(&temp_root, "routing.yaml")),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaConfigError {
     pub field: String,
@@ -303,6 +316,10 @@ fn parse_optional(value: &str) -> Option<String> {
     }
 }
 
+fn join_config_path(root: &str, child: &str) -> String {
+    format!("{}/{}", root.trim_end_matches('/'), child)
+}
+
 fn parse_bool(field: &str, value: &str) -> Result<bool, HepaConfigError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -441,5 +458,21 @@ mod tests {
 
         assert_eq!(error.field, ".env:1");
         assert!(error.message.contains("KEY=value"));
+    }
+
+    #[test]
+    fn temp_root_overrides_mutable_test_paths() {
+        let config = HepaConfig::load(
+            None,
+            &BTreeMap::new(),
+            HepaConfigOverrides::isolated_temp_root("<TEMP_ROOT>/case-1"),
+        )
+        .expect("temp-root config should load");
+
+        assert_eq!(config.control_root, "<TEMP_ROOT>/case-1/control");
+        assert_eq!(config.worktree_root, "<TEMP_ROOT>/case-1/worktrees");
+        assert_eq!(config.archive_root, "<TEMP_ROOT>/case-1/archive");
+        assert_eq!(config.routing_file, "<TEMP_ROOT>/case-1/routing.yaml");
+        assert_eq!(config.default_adapter, "fake");
     }
 }
