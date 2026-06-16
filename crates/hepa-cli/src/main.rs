@@ -1,3 +1,5 @@
+mod run;
+
 use hepa_core::contracts::HepaTimingRecord;
 use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
 use hepa_kanban::spec_import::import_markdown_spec;
@@ -68,6 +70,38 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             Ok(format_timing_summary(&timing))
         }
         [command, ..] if command == "timing" => Err("unknown timing command".to_string()),
+        [command, repo_path, task_text, flag] if command == "run" && flag == "--fake" => {
+            let result = run::run_fake_task(&run::HepaFakeRunConfig {
+                repo_path: std::path::PathBuf::from(repo_path),
+                control_root: std::path::PathBuf::from(".hepa/control"),
+                worktree_root: std::path::PathBuf::from(".hepa/worktrees"),
+                archive_root: std::path::PathBuf::from(".hepa/archive"),
+                run_id: "run-cli-fake".to_string(),
+                task_id: "task-cli-fake".to_string(),
+                lane_id: "lane-cli-fake".to_string(),
+                task_text: task_text.clone(),
+                timing: false,
+            })?;
+            Ok(format!(
+                "HEPA fake run completed: run={} lane={} status={}",
+                result.run_id, result.lane_id, result.status
+            ))
+        }
+        [command, repo_path, task_text, flag] if command == "run" && flag == "--timing" => {
+            let result = run::run_fake_task(&run::HepaFakeRunConfig {
+                repo_path: std::path::PathBuf::from(repo_path),
+                control_root: std::path::PathBuf::from(".hepa/control"),
+                worktree_root: std::path::PathBuf::from(".hepa/worktrees"),
+                archive_root: std::path::PathBuf::from(".hepa/archive"),
+                run_id: "run-cli-fake".to_string(),
+                task_id: "task-cli-fake".to_string(),
+                lane_id: "lane-cli-fake".to_string(),
+                task_text: task_text.clone(),
+                timing: true,
+            })?;
+            Ok(format_timing_summary(&result.timing))
+        }
+        [command, ..] if command == "run" => Err("unknown run command".to_string()),
         _ => Err("unknown command".to_string()),
     }
 }

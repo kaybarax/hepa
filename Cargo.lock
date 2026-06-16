@@ -27,8 +27,11 @@ dependencies = [
 name = "hepa-cli"
 version = "0.1.0"
 dependencies = [
+ "hepa-adapters",
  "hepa-core",
+ "hepa-git",
  "hepa-kanban",
+ "serde",
  "serde_json",
 ]
 
