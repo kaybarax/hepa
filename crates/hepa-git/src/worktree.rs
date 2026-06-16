@@ -453,6 +453,30 @@ mod tests {
     }
 
     #[test]
+    fn allocate_lane_produces_unique_lane_branch_and_worktree_refs() {
+        let root = unique_test_dir("unique");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        init_repo(&repo);
+        let allocator = HepaWorktreeAllocator::new(&repo, &worktrees);
+
+        let first = allocator
+            .allocate_lane("lane-a")
+            .expect("first allocation should succeed");
+        let second = allocator
+            .allocate_lane("lane-b")
+            .expect("second allocation should succeed");
+
+        assert_ne!(first.lane_id, second.lane_id);
+        assert_ne!(first.branch, second.branch);
+        assert_ne!(first.worktree_path, second.worktree_path);
+        assert!(branch_exists(&repo, "hepa/manager/lane-a"));
+        assert!(branch_exists(&repo, "hepa/manager/lane-b"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn allocate_lane_requires_clean_source_tree_and_preserves_changes() {
         let root = unique_test_dir("dirty");
         let repo = root.join("repo");
