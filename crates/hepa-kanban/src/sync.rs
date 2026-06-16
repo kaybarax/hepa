@@ -177,6 +177,10 @@ impl HepaMemoryHermesCardStore {
     pub fn card(&self, external_card_id: &str) -> Option<&HepaHermesCardPayload> {
         self.cards.get(external_card_id)
     }
+
+    pub fn card_count(&self) -> usize {
+        self.cards.len()
+    }
 }
 
 impl HepaHermesCardStore for HepaMemoryHermesCardStore {
@@ -194,6 +198,21 @@ impl HepaHermesCardStore for HepaMemoryHermesCardStore {
             });
         }
 
+        if let Some(task_id) = payload_task_id(payload) {
+            if let Some((external_card_id, _)) = self.cards.iter().find(|(_, card)| {
+                payload_task_id(card)
+                    .as_deref()
+                    .is_some_and(|existing_task_id| existing_task_id == task_id)
+            }) {
+                let external_card_id = external_card_id.clone();
+                self.cards.insert(external_card_id.clone(), payload.clone());
+                return Ok(HepaHermesCardUpsert {
+                    external_card_id,
+                    action: HepaKanbanSyncAction::Updated,
+                });
+            }
+        }
+
         self.next_id += 1;
         let external_card_id = format!("hermes-card-{}", self.next_id);
         if self.cards.contains_key(&external_card_id) {
@@ -204,6 +223,13 @@ impl HepaHermesCardStore for HepaMemoryHermesCardStore {
             external_card_id,
             action: HepaKanbanSyncAction::Created,
         })
+    }
+}
+
+fn payload_task_id(payload: &HepaHermesCardPayload) -> Option<String> {
+    match payload.fields.get("task_id") {
+        Some(crate::card_mapping::HepaHermesFieldValue::Text(task_id)) => Some(task_id.clone()),
+        _ => None,
     }
 }
 
@@ -324,6 +350,33 @@ mod tests {
         assert_eq!(
             summary.degraded_reason.as_deref(),
             Some("Hermes CLI/API unavailable")
+        );
+    }
+
+    #[test]
+    fn sync_catches_up_after_outage_without_duplicate_cards() {
+        let mut unavailable = HepaUnavailableHermesCardStore::new("Hermes CLI/API unavailable");
+        let skipped = HepaKanbanSyncEngine::new()
+            .sync_tasks(&[sample_task(None)], &mut unavailable)
+            .expect("outage should degrade");
+        assert_eq!(skipped.status, HepaKanbanSyncStatus::Degraded);
+        assert_eq!(skipped.skipped, 1);
+
+        let mut store = HepaMemoryHermesCardStore::default();
+        let first_catch_up = HepaKanbanSyncEngine::new()
+            .sync_tasks(&[sample_task(None)], &mut store)
+            .expect("first catch-up should create");
+        let second_catch_up = HepaKanbanSyncEngine::new()
+            .sync_tasks(&[sample_task(None)], &mut store)
+            .expect("second catch-up should update");
+
+        assert_eq!(first_catch_up.created, 1);
+        assert_eq!(second_catch_up.created, 0);
+        assert_eq!(second_catch_up.updated, 1);
+        assert_eq!(store.card_count(), 1);
+        assert_eq!(
+            first_catch_up.results[0].external_card_id,
+            second_catch_up.results[0].external_card_id
         );
     }
 }
