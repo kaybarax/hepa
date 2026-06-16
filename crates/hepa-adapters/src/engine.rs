@@ -3,7 +3,7 @@ use hepa_core::monitor::{HepaMonitorPolicy, HepaMonitorStop, HepaMonitorStopKind
 use std::{
     collections::BTreeMap,
     error::Error,
-    fmt,
+    fmt, fs,
     path::PathBuf,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -14,6 +14,7 @@ pub struct HepaOneshotAdapterInvocation {
     pub spec: HepaAdapterSpec,
     pub role: HepaAdapterRole,
     pub context: HepaAdapterTemplateContext,
+    pub prompt: String,
     pub environment: BTreeMap<String, String>,
     pub monitor_policy: HepaMonitorPolicy,
 }
@@ -75,6 +76,7 @@ impl HepaOneshotAdapterExecutor {
                 "lane worktree must exist before adapter launch",
             ));
         }
+        write_prompt_file(invocation)?;
 
         let filtered_env = filtered_environment(invocation);
         let mut child = Command::new(program);
@@ -155,6 +157,26 @@ fn wait_with_monitor(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn write_prompt_file(
+    invocation: &HepaOneshotAdapterInvocation,
+) -> Result<(), HepaAdapterExecutionError> {
+    let prompt_path = match invocation.role {
+        HepaAdapterRole::Worker => PathBuf::from(&invocation.context.prompt_file),
+        HepaAdapterRole::Reviewer => PathBuf::from(&invocation.context.review_prompt_file),
+    };
+    if let Some(parent) = prompt_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            HepaAdapterExecutionError::new(
+                "prompt_file",
+                format!("failed to create parent: {error}"),
+            )
+        })?;
+    }
+    fs::write(&prompt_path, &invocation.prompt).map_err(|error| {
+        HepaAdapterExecutionError::new("prompt_file", format!("failed to write prompt: {error}"))
+    })
 }
 
 fn monitor_error(stop: HepaMonitorStop) -> HepaAdapterExecutionError {
@@ -313,6 +335,7 @@ printf 'worker stderr' >&2
             ),
             role: HepaAdapterRole::Worker,
             context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "Worker prompt from task spec".to_string(),
             environment: BTreeMap::from([
                 ("ALLOWED_CONTEXT".to_string(), "visible".to_string()),
                 ("UNLISTED_CONTEXT".to_string(), "hidden".to_string()),
@@ -363,6 +386,7 @@ printf 'worker stderr' >&2
                 &artifact_dir,
                 &artifact_dir.join("out.json"),
             ),
+            prompt: "Worker prompt from task spec".to_string(),
             environment: BTreeMap::new(),
             monitor_policy: HepaMonitorPolicy::default(),
         };
@@ -412,6 +436,7 @@ env | sort > "$2"
                 ),
                 role: role.clone(),
                 context: template_context(&worktree, &artifact_dir, &output_file),
+                prompt: "Role prompt from task spec".to_string(),
                 environment: BTreeMap::from([
                     ("ALLOWED_CONTEXT".to_string(), "visible".to_string()),
                     ("MANAGER_ONLY_CONTEXT".to_string(), "blocked".to_string()),
@@ -446,6 +471,67 @@ env | sort > "$2"
 
             remove_test_dir(root);
         }
+    }
+
+    #[test]
+    fn oneshot_executor_writes_prompt_files_and_passes_paths() {
+        let root = unique_test_dir("prompt-file");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("fake-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prompt-file) prompt_file="$2"; shift 2 ;;
+    --output) output_file="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' "$prompt_file" > "$output_file"
+cat "$prompt_file" >> "$output_file"
+"#,
+        );
+        let output_file = artifact_dir.join("prompt-capture.txt");
+        let invocation = HepaOneshotAdapterInvocation {
+            spec: adapter_spec(
+                "worker-primary",
+                vec![HepaAdapterRole::Worker],
+                format!(
+                    "{} --prompt-file {{prompt_file}} --output {{output_file}}",
+                    script.display()
+                ),
+                None,
+                Vec::new(),
+            ),
+            role: HepaAdapterRole::Worker,
+            context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "Implement the fixture task without inline task text.".to_string(),
+            environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy::default(),
+        };
+
+        let result = HepaOneshotAdapterExecutor::new()
+            .run(&invocation)
+            .expect("adapter should run");
+        let capture = fs::read_to_string(&output_file).expect("prompt capture");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(PathBuf::from(&invocation.context.prompt_file).exists());
+        assert!(
+            capture
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .ends_with("prompt.md")
+        );
+        assert!(capture.contains("Implement the fixture task"));
+        assert!(!result.command.contains("Implement the fixture task"));
+
+        remove_test_dir(root);
     }
 
     #[test]
@@ -570,6 +656,7 @@ esac
             ),
             role: HepaAdapterRole::Worker,
             context: template_context(worktree, artifact_dir, &output_file),
+            prompt: "Monitor fixture prompt".to_string(),
             environment: BTreeMap::new(),
             monitor_policy,
         };
