@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use crate::spec::{HepaAdapterCostClass, HepaAdapterSpec};
 
 pub const ROUTING_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const ROUTING_DECISION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaRoutingPolicy {
@@ -76,6 +77,58 @@ impl HepaRoutingPolicy {
             )
         })
     }
+
+    pub fn decide_adapter(
+        &self,
+        request: HepaRoutingDecisionRequest,
+        adapter_specs: &BTreeMap<String, HepaAdapterSpec>,
+    ) -> Result<HepaRoutingDecisionArtifact, HepaRoutingError> {
+        self.validate_against_adapters(adapter_specs)?;
+        request.validate()?;
+
+        let requested_capability = request
+            .requested_capability
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let (selected_adapter, route_source, manager_override) =
+            if let Some(manager_override) = request.manager_override {
+                require_adapter_allowed(
+                    "manager_override.adapter_id",
+                    &manager_override.adapter_id,
+                    self.project_policy,
+                    adapter_specs,
+                )?;
+                (
+                    manager_override.adapter_id.clone(),
+                    HepaRoutingDecisionSource::ManagerOverride,
+                    Some(manager_override),
+                )
+            } else {
+                let selected_adapter = self.resolve_adapter(requested_capability)?.to_string();
+                let route_source = if requested_capability.is_some() {
+                    HepaRoutingDecisionSource::Capability
+                } else {
+                    HepaRoutingDecisionSource::Default
+                };
+                (selected_adapter, route_source, None)
+            };
+
+        Ok(HepaRoutingDecisionArtifact {
+            schema_version: ROUTING_DECISION_SCHEMA_VERSION,
+            task_id: request.task_id,
+            lane_id: request.lane_id,
+            project_id: self.project_id.clone(),
+            project_policy: self.project_policy,
+            requested_capability: requested_capability.map(str::to_string),
+            selected_adapter,
+            route_source,
+            manager_override,
+            routing_table: self.capability_routes.clone(),
+            default_adapter: self.default.clone(),
+            review_fanout: self.review_fanout.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +136,66 @@ impl HepaRoutingPolicy {
 pub enum HepaProjectRoutingPolicy {
     Standard,
     LocalOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaRoutingDecisionRequest {
+    pub task_id: String,
+    pub lane_id: String,
+    pub requested_capability: Option<String>,
+    pub manager_override: Option<HepaManagerRoutingOverride>,
+}
+
+impl HepaRoutingDecisionRequest {
+    fn validate(&self) -> Result<(), HepaRoutingError> {
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        if let Some(capability) = &self.requested_capability {
+            require_single_line("requested_capability", capability)?;
+        }
+        if let Some(manager_override) = &self.manager_override {
+            manager_override.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaRoutingDecisionArtifact {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub lane_id: String,
+    pub project_id: String,
+    pub project_policy: HepaProjectRoutingPolicy,
+    pub requested_capability: Option<String>,
+    pub selected_adapter: String,
+    pub route_source: HepaRoutingDecisionSource,
+    pub manager_override: Option<HepaManagerRoutingOverride>,
+    pub routing_table: BTreeMap<String, String>,
+    pub default_adapter: String,
+    pub review_fanout: HepaReviewFanout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HepaRoutingDecisionSource {
+    Default,
+    Capability,
+    ManagerOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaManagerRoutingOverride {
+    pub adapter_id: String,
+    pub reason: String,
+}
+
+impl HepaManagerRoutingOverride {
+    fn validate(&self) -> Result<(), HepaRoutingError> {
+        require_single_line("manager_override.adapter_id", &self.adapter_id)?;
+        require_single_line("manager_override.reason", &self.reason)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +403,15 @@ mod tests {
         .collect()
     }
 
+    fn sample_decision_request(requested_capability: Option<&str>) -> HepaRoutingDecisionRequest {
+        HepaRoutingDecisionRequest {
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            requested_capability: requested_capability.map(str::to_string),
+            manager_override: None,
+        }
+    }
+
     #[test]
     fn routing_policy_contains_default_capabilities_and_review_fanout() {
         let policy = sample_policy();
@@ -350,5 +472,70 @@ mod tests {
             .expect("local-only projects may route to local adapters");
 
         assert_eq!(resolved.id, "worker-docs");
+    }
+
+    #[test]
+    fn routing_decision_artifact_records_selected_route() {
+        let policy = sample_policy();
+        let adapters = sample_adapters(HepaAdapterCostClass::PaidCloud);
+
+        let artifact = policy
+            .decide_adapter(sample_decision_request(Some("frontend")), &adapters)
+            .expect("routing decisions should produce artifacts");
+
+        assert_eq!(artifact.task_id, "task-1");
+        assert_eq!(artifact.requested_capability.as_deref(), Some("frontend"));
+        assert_eq!(artifact.selected_adapter, "worker-frontend");
+        assert_eq!(artifact.route_source, HepaRoutingDecisionSource::Capability);
+        assert!(artifact.manager_override.is_none());
+        assert_eq!(
+            artifact.routing_table.get("frontend").map(String::as_str),
+            Some("worker-frontend")
+        );
+    }
+
+    #[test]
+    fn manager_override_requires_and_records_reason() {
+        let policy = sample_policy();
+        let adapters = sample_adapters(HepaAdapterCostClass::PaidCloud);
+        let mut request = sample_decision_request(Some("docs"));
+        request.manager_override = Some(HepaManagerRoutingOverride {
+            adapter_id: "worker-design".to_string(),
+            reason: "manager selected stronger design adapter".to_string(),
+        });
+
+        let artifact = policy
+            .decide_adapter(request, &adapters)
+            .expect("manager override should produce a routing artifact");
+
+        assert_eq!(artifact.selected_adapter, "worker-design");
+        assert_eq!(
+            artifact.route_source,
+            HepaRoutingDecisionSource::ManagerOverride
+        );
+        assert_eq!(
+            artifact
+                .manager_override
+                .as_ref()
+                .map(|entry| entry.reason.as_str()),
+            Some("manager selected stronger design adapter")
+        );
+    }
+
+    #[test]
+    fn manager_override_without_reason_fails() {
+        let policy = sample_policy();
+        let adapters = sample_adapters(HepaAdapterCostClass::PaidCloud);
+        let mut request = sample_decision_request(Some("docs"));
+        request.manager_override = Some(HepaManagerRoutingOverride {
+            adapter_id: "worker-design".to_string(),
+            reason: " ".to_string(),
+        });
+
+        let error = policy
+            .decide_adapter(request, &adapters)
+            .expect_err("manager overrides must explain the reason");
+
+        assert_eq!(error.field, "manager_override.reason");
     }
 }
