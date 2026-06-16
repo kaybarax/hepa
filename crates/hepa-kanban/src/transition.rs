@@ -92,6 +92,26 @@ pub struct HepaBoardTransitionCardResponse {
     pub visible_reason: String,
 }
 
+pub const BOARD_TRANSITION_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaBoardTransitionArtifact {
+    pub schema_version: u32,
+    pub request: HepaBoardTransitionRequest,
+    pub decision: HepaBoardTransitionDecision,
+}
+
+pub fn board_transition_artifact(
+    request: HepaBoardTransitionRequest,
+    decision: HepaBoardTransitionDecision,
+) -> HepaBoardTransitionArtifact {
+    HepaBoardTransitionArtifact {
+        schema_version: BOARD_TRANSITION_ARTIFACT_SCHEMA_VERSION,
+        request,
+        decision,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaBoardTransitionDecisionStatus {
@@ -451,5 +471,29 @@ mod tests {
                 .visible_reason
                 .contains("review")
         );
+    }
+
+    #[test]
+    fn board_transition_requests_can_be_logged_as_artifacts() {
+        let request = request(HepaBoardTransitionAction::Cancel {
+            reason: "Superseded".to_string(),
+        });
+        let decision = evaluate_board_transition(
+            &task(HepaTaskStatus::Draft, HepaReadinessState::NotReady),
+            &request,
+        )
+        .expect("transition should evaluate");
+        let artifact = board_transition_artifact(request.clone(), decision.clone());
+        let json = serde_json::to_string(&artifact).expect("artifact should serialize");
+        let round_trip: HepaBoardTransitionArtifact =
+            serde_json::from_str(&json).expect("artifact should deserialize");
+
+        assert_eq!(
+            round_trip.schema_version,
+            BOARD_TRANSITION_ARTIFACT_SCHEMA_VERSION
+        );
+        assert_eq!(round_trip.request, request);
+        assert_eq!(round_trip.decision, decision);
+        assert!(json.contains("\"request_id\":\"request-1\""));
     }
 }
