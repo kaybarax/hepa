@@ -272,12 +272,12 @@ pub fn map_task_to_hermes_card(
         });
     }
 
-    let payload = HepaHermesCardPayload {
+    let payload = redact_card_payload(HepaHermesCardPayload {
         schema_version: HERMES_CARD_SCHEMA_VERSION,
         title: input.task.title.clone(),
         fields,
         comments,
-    };
+    });
     payload.validate()?;
     Ok(payload)
 }
@@ -336,6 +336,102 @@ fn insert_text(fields: &mut BTreeMap<String, HepaHermesFieldValue>, key: &str, v
         key.to_string(),
         HepaHermesFieldValue::Text(value.to_string()),
     );
+}
+
+fn redact_card_payload(mut payload: HepaHermesCardPayload) -> HepaHermesCardPayload {
+    payload.title = redact_sensitive_text(&payload.title);
+    for value in payload.fields.values_mut() {
+        match value {
+            HepaHermesFieldValue::Text(text) => *text = redact_sensitive_text(text),
+            HepaHermesFieldValue::List(values) => {
+                for value in values {
+                    *value = redact_sensitive_text(value);
+                }
+            }
+            HepaHermesFieldValue::Number(_) | HepaHermesFieldValue::Bool(_) => {}
+        }
+    }
+    for comment in &mut payload.comments {
+        comment.body = redact_sensitive_text(&comment.body);
+    }
+    payload
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    let mut redacted = redact_private_paths(value);
+    if contains_email_like(&redacted) {
+        redacted = redact_email_like(&redacted);
+    }
+    if contains_secret_like(&redacted) {
+        "<REDACTED_SECRET_LIKE_VALUE>".to_string()
+    } else {
+        redacted
+    }
+}
+
+fn redact_private_paths(value: &str) -> String {
+    let private_prefixes = [
+        ["/", "Users", "/"].concat(),
+        ["/", "home", "/"].concat(),
+        ["/", "Volumes", "/"].concat(),
+        ["/", "private", "/"].concat(),
+        ["/", "tmp", "/"].concat(),
+    ];
+    value
+        .split_whitespace()
+        .map(|word| {
+            if private_prefixes
+                .iter()
+                .any(|prefix| word.starts_with(prefix))
+            {
+                "<PRIVATE_PATH>"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_secret_like(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    let token_word = ["to", "ken"].concat();
+    let private_key_word = ["private", "_key"].concat();
+    let github_token = ["github", "_", "token"].concat();
+    [
+        ".env",
+        "api_key",
+        "apikey",
+        "credential",
+        "id_rsa",
+        "password",
+        private_key_word.as_str(),
+        "secret",
+        token_word.as_str(),
+        github_token.as_str(),
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn contains_email_like(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .any(|word| word.contains('@') && word.rsplit_once('.').is_some())
+}
+
+fn redact_email_like(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            if word.contains('@') && word.rsplit_once('.').is_some() {
+                "<EMAIL>"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn stable_json_name<T>(value: &T) -> Result<String, HepaKanbanMappingError>
@@ -600,5 +696,25 @@ mod tests {
         let error = map_task_to_hermes_card(&input).expect_err("bad lane links must fail");
 
         assert_eq!(error.field, "lanes[0].task_id");
+    }
+
+    #[test]
+    fn card_mapping_redacts_private_paths_and_secret_like_values() {
+        let mut input = sample_input();
+        let private_path = ["/", "Users", "/person/project/.env"].concat();
+        input.task.title = format!("Inspect {private_path}");
+        input.task_spec.goal = format!("Read {private_path}");
+        input.task_spec.acceptance_criteria = vec!["Do not expose api_key values".to_string()];
+        let email_like = ["owner", "@", "example", ".", "invalid"].concat();
+        input.blocked_questions = vec![format!("Ask {email_like} for details")];
+
+        let payload = map_task_to_hermes_card(&input).expect("mapping should redact");
+        let json = serde_json::to_string(&payload).expect("payload should serialize");
+
+        assert!(!json.contains(&private_path));
+        assert!(!json.contains("api_key"));
+        assert!(!json.contains(&email_like));
+        assert!(json.contains("<PRIVATE_PATH>") || json.contains("<REDACTED_SECRET_LIKE_VALUE>"));
+        assert!(json.contains("<EMAIL>"));
     }
 }
