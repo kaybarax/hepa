@@ -1,0 +1,27 @@
+{
+  "findings": [
+    {
+      "category": "test",
+      "file": "docs/setup.md",
+      "id": "F1",
+      "required_fix": "Add the documented validation command to the setup section.",
+      "schema_version": 1,
+      "severity": "medium",
+      "summary": "The docs change needs an explicit validation command."
+    }
+  ],
+  "pr_notes": {
+    "known_followups": [
+      "Consider adding a troubleshooting section in a later task."
+    ],
+    "summary": [
+      "Reviewer found one test-documentation gap."
+    ]
+  },
+  "role": "reviewer",
+  "round": 1,
+  "run_id": "run-docs-001",
+  "schema_version": 1,
+  "verdict": "fix_required"
+}
+

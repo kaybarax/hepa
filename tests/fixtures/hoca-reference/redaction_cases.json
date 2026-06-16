@@ -1,0 +1,19 @@
+{
+  "cases": [
+    {
+      "input": "Project <ABSOLUTE_PATH_SAMPLE> failed with api_key=<TOKEN_SAMPLE> for <EMAIL_SAMPLE>",
+      "output": "Project <LOCAL_PATH> failed with api_key=<REDACTED> for <EMAIL>",
+      "redactions": [
+        "absolute_path",
+        "token_assignment",
+        "email"
+      ]
+    },
+    {
+      "input": "Changed file .env.local was blocked as secret-like",
+      "output": "Changed file .env.local was blocked as secret-like",
+      "redactions": []
+    }
+  ],
+  "schema_version": 1
+}

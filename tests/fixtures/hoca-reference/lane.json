@@ -1,0 +1,23 @@
+{
+  "adapter_id": "hermes-worker",
+  "attempt_number": 1,
+  "branch": "hoca/task-docs-001",
+  "completed_at": null,
+  "created_at": "2026-06-16T09:05:00Z",
+  "lane_id": "lane-task-docs-001",
+  "metadata": {
+    "base_ref": "main",
+    "claimed_by": "scheduler"
+  },
+  "project_id": "project-alpha",
+  "run_dir": "<HOCA_RUN_DIR>",
+  "run_ref": "run-docs-001",
+  "schema_version": 1,
+  "session_id": "session-lane-task-docs-001",
+  "started_at": "2026-06-16T09:06:00Z",
+  "status": "reviewing",
+  "task_id": "task-docs-001",
+  "updated_at": "2026-06-16T09:12:00Z",
+  "worktree_path": "<WORKTREE>/project-alpha/lane-task-docs-001"
+}
+

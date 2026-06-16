@@ -1,0 +1,16 @@
+{
+  "checked_at": "2026-06-16T09:18:00Z",
+  "checks": [
+    "validation_passed",
+    "review_passed",
+    "safe_staging_ready"
+  ],
+  "ci_status": "passed",
+  "human_review_required": true,
+  "lane_id": "lane-task-docs-001",
+  "pr_url": "https://example.invalid/project-alpha/pull/42",
+  "readiness": "ready",
+  "reason": null,
+  "schema_version": 1
+}
+

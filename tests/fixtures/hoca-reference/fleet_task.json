@@ -1,0 +1,30 @@
+{
+  "completed_at": null,
+  "created_at": "2026-06-16T09:00:00Z",
+  "dependencies": [
+    "task-docs-setup"
+  ],
+  "description": "Update a small docs section and keep validation evidence attached.",
+  "goal": "Document the setup command for a fixture project.",
+  "issue_id": "42",
+  "lane_ids": [
+    "lane-task-docs-001"
+  ],
+  "metadata": {
+    "expected_areas": [
+      "docs/setup.md"
+    ],
+    "validation_commands": [
+      "cargo test"
+    ]
+  },
+  "priority": 1,
+  "project_id": "project-alpha",
+  "readiness": "ready",
+  "schema_version": 1,
+  "status": "running",
+  "task_id": "task-docs-001",
+  "title": "Document setup command",
+  "updated_at": "2026-06-16T09:05:00Z"
+}
+

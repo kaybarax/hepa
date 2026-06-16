@@ -1,0 +1,41 @@
+{
+  "acceptance_criteria": [
+    "docs/setup.md explains the setup command.",
+    "cargo test is listed as validation evidence.",
+    "No secret-like paths are introduced."
+  ],
+  "base_branch": "main",
+  "expected_areas": [
+    "docs/setup.md"
+  ],
+  "goal": "Document the setup command for a fixture project.",
+  "issue_id": "42",
+  "max_total_rounds": 3,
+  "models": {
+    "fallback": "local-fallback",
+    "manager": "manager-primary",
+    "reviewer": "reviewer-primary",
+    "schema_version": 1,
+    "worker": "worker-primary"
+  },
+  "non_goals": [
+    "Do not change runtime code.",
+    "Do not read or edit secret-like files."
+  ],
+  "raw_request": "Update docs/setup.md with the setup command and validation evidence.",
+  "repo_root": "<TARGET_REPO>",
+  "requires_human_approval": false,
+  "risk_level": "low",
+  "run_id": "run-docs-001",
+  "sandbox": {
+    "enabled": true,
+    "network_mode": "offline",
+    "schema_version": 1
+  },
+  "schema_version": 1,
+  "task_branch": "feat/docs-setup-command",
+  "test_commands": [
+    "cargo test"
+  ]
+}
+
