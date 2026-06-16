@@ -149,6 +149,10 @@ pub fn map_task_to_hermes_card(
         "lane_ids".to_string(),
         HepaHermesFieldValue::List(input.task.lane_ids.clone()),
     );
+    fields.insert(
+        "lane_states".to_string(),
+        HepaHermesFieldValue::List(lane_state_refs(input)?),
+    );
     if let Some(external_card_id) = &input.task.external_card_id {
         insert_text(&mut fields, "external_card_id", external_card_id);
     }
@@ -314,6 +318,22 @@ fn validate_mapping_input(
         }
     }
     Ok(())
+}
+
+fn lane_state_refs(
+    input: &HepaHermesCardMappingInput,
+) -> Result<Vec<String>, HepaKanbanMappingError> {
+    input
+        .lanes
+        .iter()
+        .map(|lane| {
+            Ok(format!(
+                "{}:{}",
+                lane.lane_id,
+                stable_json_name(&lane.state)?
+            ))
+        })
+        .collect()
 }
 
 fn timing_comment(

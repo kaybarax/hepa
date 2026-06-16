@@ -1,6 +1,7 @@
 use crate::card_mapping::{
     HepaHermesCardMappingInput, HepaHermesCardPayload, map_task_to_hermes_card,
 };
+use hepa_core::contracts::HepaLane;
 use std::{collections::BTreeMap, error::Error, fmt};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,6 +41,41 @@ impl HepaKanbanSyncEngine {
             });
         }
         Ok(summary)
+    }
+
+    pub fn sync_lane_transition(
+        &self,
+        task: &HepaHermesCardMappingInput,
+        updated_lane: HepaLane,
+        store: &mut dyn HepaHermesCardStore,
+    ) -> Result<HepaKanbanSyncSummary, String> {
+        if let HepaHermesStoreAvailability::Unavailable { reason } = store.availability() {
+            return Ok(HepaKanbanSyncSummary {
+                status: HepaKanbanSyncStatus::Degraded,
+                skipped: 1,
+                degraded_reason: Some(reason),
+                ..HepaKanbanSyncSummary::default()
+            });
+        }
+        let mut updated_task = task.clone();
+        let mut replaced = false;
+        for lane in &mut updated_task.lanes {
+            if lane.lane_id == updated_lane.lane_id {
+                *lane = updated_lane.clone();
+                replaced = true;
+            }
+        }
+        if !replaced {
+            updated_task.lanes.push(updated_lane.clone());
+        }
+        if !updated_task.task.lane_ids.contains(&updated_lane.lane_id) {
+            updated_task
+                .task
+                .lane_ids
+                .push(updated_lane.lane_id.clone());
+        }
+
+        self.sync_tasks(&[updated_task], store)
     }
 }
 
@@ -262,8 +298,8 @@ mod tests {
     use super::*;
     use crate::card_mapping::HepaHermesFieldValue;
     use hepa_core::contracts::{
-        CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaProject, HepaReadinessState, HepaRiskLevel,
-        HepaTaskSpec, HepaTaskStatus,
+        CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaLane, HepaLaneState, HepaProject,
+        HepaReadinessState, HepaRiskLevel, HepaTaskSpec, HepaTaskStatus,
     };
 
     fn sample_task(external_card_id: Option<&str>) -> HepaHermesCardMappingInput {
@@ -321,6 +357,24 @@ mod tests {
             terminal_report: None,
             timing: None,
             blocked_questions: Vec::new(),
+        }
+    }
+
+    fn sample_lane(state: HepaLaneState) -> HepaLane {
+        HepaLane {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: "lane-1".to_string(),
+            project_id: "project-1".to_string(),
+            task_id: "task-1".to_string(),
+            adapter_id: "fake".to_string(),
+            state,
+            worktree_ref: "worktree:lane-1".to_string(),
+            branch: "hepa/manager/lane-1".to_string(),
+            run_dir_ref: "control:runs/run-1".to_string(),
+            attempt_count: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+            completed_at: None,
         }
     }
 
@@ -401,6 +455,51 @@ mod tests {
         assert_eq!(
             first_catch_up.results[0].external_card_id,
             second_catch_up.results[0].external_card_id
+        );
+    }
+
+    #[test]
+    fn sync_lane_transition_refreshes_hermes_card_state_projection() {
+        let mut input = sample_task(Some("hermes-card-7"));
+        input.task.lane_ids = vec!["lane-1".to_string()];
+        input.lanes = vec![sample_lane(HepaLaneState::Allocated)];
+        let mut store = HepaMemoryHermesCardStore::default();
+        HepaKanbanSyncEngine::new()
+            .sync_tasks(&[input.clone()], &mut store)
+            .expect("initial sync should work");
+
+        let summary = HepaKanbanSyncEngine::new()
+            .sync_lane_transition(&input, sample_lane(HepaLaneState::Running), &mut store)
+            .expect("transition sync should work");
+        let card = store
+            .card("hermes-card-7")
+            .expect("existing card should be updated");
+
+        assert_eq!(summary.updated, 1);
+        assert_eq!(
+            card.fields.get("lane_states"),
+            Some(&HepaHermesFieldValue::List(vec![
+                "lane-1:running".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn sync_lane_transition_degrades_when_hermes_is_unavailable() {
+        let mut input = sample_task(Some("hermes-card-7"));
+        input.task.lane_ids = vec!["lane-1".to_string()];
+        input.lanes = vec![sample_lane(HepaLaneState::Allocated)];
+        let mut store = HepaUnavailableHermesCardStore::new("Hermes CLI/API unavailable");
+
+        let summary = HepaKanbanSyncEngine::new()
+            .sync_lane_transition(&input, sample_lane(HepaLaneState::Running), &mut store)
+            .expect("unavailable Hermes should degrade");
+
+        assert_eq!(summary.status, HepaKanbanSyncStatus::Degraded);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(
+            summary.degraded_reason.as_deref(),
+            Some("Hermes CLI/API unavailable")
         );
     }
 
