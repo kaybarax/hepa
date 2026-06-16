@@ -34,6 +34,7 @@ impl HepaWorktreeAllocator {
             ));
         }
 
+        self.require_clean_tree()?;
         let base_commit = self.git_output(["rev-parse", "HEAD"])?;
         fs::create_dir_all(&self.worktree_root)?;
         self.git_output([
@@ -66,6 +67,17 @@ impl HepaWorktreeAllocator {
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn require_clean_tree(&self) -> Result<(), HepaWorktreeError> {
+        let status = self.git_output(["status", "--porcelain=v1", "--untracked-files=all"])?;
+        if !status.is_empty() {
+            return Err(HepaWorktreeError::new(
+                "repo_status",
+                "repository must be clean before lane launch",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +173,33 @@ mod tests {
         let duplicate = allocator.allocate_lane("lane-a");
 
         assert!(duplicate.is_err());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn allocate_lane_requires_clean_source_tree_and_preserves_changes() {
+        let root = unique_test_dir("dirty");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        init_repo(&repo);
+        fs::write(repo.join("notes.md"), "do not remove\n").expect("dirty file write");
+        let allocator = HepaWorktreeAllocator::new(&repo, &worktrees);
+
+        let allocation = allocator.allocate_lane("lane-a");
+
+        assert!(matches!(
+            allocation,
+            Err(HepaWorktreeError {
+                field,
+                ..
+            }) if field == "repo_status"
+        ));
+        assert_eq!(
+            fs::read_to_string(repo.join("notes.md")).expect("dirty file remains"),
+            "do not remove\n"
+        );
+        assert!(!worktrees.join("lane-a").exists());
 
         remove_test_dir(root);
     }
