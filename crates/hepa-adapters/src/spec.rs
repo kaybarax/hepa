@@ -25,6 +25,42 @@ pub struct HepaAdapterSpec {
 }
 
 impl HepaAdapterSpec {
+    pub fn validate(&self) -> Result<(), HepaAdapterSpecError> {
+        require_schema(self.schema_version)?;
+        require_single_line("id", &self.id)?;
+        require_non_empty("display_name", &self.display_name)?;
+        if self.roles.is_empty() {
+            return Err(HepaAdapterSpecError::new(
+                "roles",
+                "must include at least one role",
+            ));
+        }
+        require_non_empty("command", &self.command)?;
+        validate_template_placeholders("command", &self.command)?;
+        if let Some(review_command) = &self.review_command {
+            require_non_empty("review_command", review_command)?;
+            validate_template_placeholders("review_command", review_command)?;
+        }
+        require_non_empty("workdir", &self.workdir)?;
+        validate_template_placeholders("workdir", &self.workdir)?;
+        require_string_list("required_commands", &self.required_commands)?;
+        require_string_list("required_env", &self.required_env)?;
+        require_string_list("capabilities", &self.capabilities)?;
+        if self.resource_weight == 0 {
+            return Err(HepaAdapterSpecError::new(
+                "resource_weight",
+                "must be greater than zero",
+            ));
+        }
+        if self.max_concurrency == 0 {
+            return Err(HepaAdapterSpecError::new(
+                "max_concurrency",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn render_worker_command(
         &self,
         context: &HepaAdapterTemplateContext,
@@ -89,6 +125,29 @@ impl fmt::Display for HepaAdapterTemplateError {
 
 impl Error for HepaAdapterTemplateError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaAdapterSpecError {
+    pub field: String,
+    pub message: String,
+}
+
+impl HepaAdapterSpecError {
+    fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for HepaAdapterSpecError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.field, self.message)
+    }
+}
+
+impl Error for HepaAdapterSpecError {}
+
 pub fn render_command_template(
     template: &str,
     context: &HepaAdapterTemplateContext,
@@ -124,6 +183,55 @@ pub fn render_command_template(
     }
     rendered.push_str(rest);
     Ok(rendered)
+}
+
+fn validate_template_placeholders(field: &str, template: &str) -> Result<(), HepaAdapterSpecError> {
+    let context = HepaAdapterTemplateContext {
+        prompt_file: "<PROMPT_FILE>".to_string(),
+        worktree: "<WORKTREE>".to_string(),
+        review_prompt_file: "<REVIEW_PROMPT_FILE>".to_string(),
+        output_file: "<OUTPUT_FILE>".to_string(),
+        review_output_file: "<REVIEW_OUTPUT_FILE>".to_string(),
+        artifact_dir: "<ARTIFACT_DIR>".to_string(),
+    };
+    render_command_template(template, &context)
+        .map(|_| ())
+        .map_err(|error| HepaAdapterSpecError::new(field, error.to_string()))
+}
+
+fn require_schema(schema_version: u32) -> Result<(), HepaAdapterSpecError> {
+    if schema_version == ADAPTER_SPEC_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(HepaAdapterSpecError::new(
+            "schema_version",
+            format!("must be {ADAPTER_SPEC_SCHEMA_VERSION}"),
+        ))
+    }
+}
+
+fn require_non_empty(field: impl Into<String>, value: &str) -> Result<(), HepaAdapterSpecError> {
+    let field = field.into();
+    if value.trim().is_empty() {
+        return Err(HepaAdapterSpecError::new(field, "must not be empty"));
+    }
+    Ok(())
+}
+
+fn require_single_line(field: impl Into<String>, value: &str) -> Result<(), HepaAdapterSpecError> {
+    let field = field.into();
+    require_non_empty(field.clone(), value)?;
+    if value.contains('\n') || value.contains('\r') {
+        return Err(HepaAdapterSpecError::new(field, "must be a single line"));
+    }
+    Ok(())
+}
+
+fn require_string_list(field: &str, values: &[String]) -> Result<(), HepaAdapterSpecError> {
+    for (index, value) in values.iter().enumerate() {
+        require_single_line(format!("{field}[{index}]"), value)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,5 +393,62 @@ mod tests {
 
         assert_eq!(worker_error.placeholder, "task_text");
         assert_eq!(review_error.placeholder, "raw_task");
+    }
+
+    #[test]
+    fn invalid_adapter_specs_fail_with_clear_errors() {
+        let mut spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "worker-primary".to_string(),
+            display_name: "Primary Worker Adapter".to_string(),
+            roles: vec![HepaAdapterRole::Worker],
+            mode: HepaAdapterMode::Oneshot,
+            command: "agent --prompt-file {prompt_file}".to_string(),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: vec!["agent".to_string()],
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::AgentNative,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec!["docs".to_string()],
+            cost_class: HepaAdapterCostClass::PaidCloud,
+            resource_weight: 1,
+            max_concurrency: 2,
+        };
+        spec.max_concurrency = 0;
+
+        let error = spec.validate().expect_err("zero concurrency must fail");
+
+        assert_eq!(error.field, "max_concurrency");
+        assert!(error.message.contains("greater than zero"));
+    }
+
+    #[test]
+    fn invalid_adapter_templates_fail_validation() {
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "worker-primary".to_string(),
+            display_name: "Primary Worker Adapter".to_string(),
+            roles: vec![HepaAdapterRole::Worker],
+            mode: HepaAdapterMode::Oneshot,
+            command: "agent --prompt-file {missing_placeholder}".to_string(),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: vec!["agent".to_string()],
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::AgentNative,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec!["docs".to_string()],
+            cost_class: HepaAdapterCostClass::PaidCloud,
+            resource_weight: 1,
+            max_concurrency: 2,
+        };
+
+        let error = spec.validate().expect_err("unknown placeholders must fail");
+
+        assert_eq!(error.field, "command");
+        assert!(error.message.contains("missing_placeholder"));
     }
 }
