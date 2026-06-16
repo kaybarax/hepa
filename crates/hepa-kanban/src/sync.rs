@@ -17,6 +17,12 @@ impl HepaKanbanSyncEngine {
         store: &mut dyn HepaHermesCardStore,
     ) -> Result<HepaKanbanSyncSummary, String> {
         let mut summary = HepaKanbanSyncSummary::default();
+        if let HepaHermesStoreAvailability::Unavailable { reason } = store.availability() {
+            summary.status = HepaKanbanSyncStatus::Degraded;
+            summary.degraded_reason = Some(reason);
+            summary.skipped = tasks.len() as u32;
+            return Ok(summary);
+        }
         for task in tasks {
             let payload = map_task_to_hermes_card(task).map_err(|error| error.to_string())?;
             let existing_card_id = task.task.external_card_id.as_deref();
@@ -38,6 +44,10 @@ impl HepaKanbanSyncEngine {
 }
 
 pub trait HepaHermesCardStore {
+    fn availability(&self) -> HepaHermesStoreAvailability {
+        HepaHermesStoreAvailability::Available
+    }
+
     fn upsert_card(
         &mut self,
         existing_card_id: Option<&str>,
@@ -47,9 +57,25 @@ pub trait HepaHermesCardStore {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HepaKanbanSyncSummary {
+    pub status: HepaKanbanSyncStatus,
     pub created: u32,
     pub updated: u32,
+    pub skipped: u32,
+    pub degraded_reason: Option<String>,
     pub results: Vec<HepaKanbanSyncTaskResult>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HepaKanbanSyncStatus {
+    #[default]
+    Synced,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HepaHermesStoreAvailability {
+    Available,
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +135,35 @@ impl HepaHermesCardStore for HepaNullHermesCardStore {
                 HepaKanbanSyncAction::Created
             },
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaUnavailableHermesCardStore {
+    reason: String,
+}
+
+impl HepaUnavailableHermesCardStore {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl HepaHermesCardStore for HepaUnavailableHermesCardStore {
+    fn availability(&self) -> HepaHermesStoreAvailability {
+        HepaHermesStoreAvailability::Unavailable {
+            reason: self.reason.clone(),
+        }
+    }
+
+    fn upsert_card(
+        &mut self,
+        _existing_card_id: Option<&str>,
+        _payload: &HepaHermesCardPayload,
+    ) -> Result<HepaHermesCardUpsert, HepaKanbanSyncError> {
+        Err(HepaKanbanSyncError::new(self.reason.clone()))
     }
 }
 
@@ -227,6 +282,7 @@ mod tests {
             .sync_tasks(&[sample_task(None)], &mut store)
             .expect("sync should create cards");
 
+        assert_eq!(summary.status, HepaKanbanSyncStatus::Synced);
         assert_eq!(summary.created, 1);
         assert_eq!(summary.updated, 0);
         assert_eq!(summary.results[0].external_card_id, "hermes-card-1");
@@ -251,5 +307,23 @@ mod tests {
         assert_eq!(summary.updated, 1);
         assert_eq!(summary.results[0].action, HepaKanbanSyncAction::Updated);
         assert!(store.card("hermes-card-7").is_some());
+    }
+
+    #[test]
+    fn sync_reports_degraded_when_hermes_store_is_unavailable() {
+        let mut store = HepaUnavailableHermesCardStore::new("Hermes CLI/API unavailable");
+
+        let summary = HepaKanbanSyncEngine::new()
+            .sync_tasks(&[sample_task(None)], &mut store)
+            .expect("unavailable Hermes should degrade rather than fail");
+
+        assert_eq!(summary.status, HepaKanbanSyncStatus::Degraded);
+        assert_eq!(summary.created, 0);
+        assert_eq!(summary.updated, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(
+            summary.degraded_reason.as_deref(),
+            Some("Hermes CLI/API unavailable")
+        );
     }
 }

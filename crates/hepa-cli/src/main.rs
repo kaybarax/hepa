@@ -1,4 +1,6 @@
-use hepa_kanban::sync::{HepaKanbanSyncEngine, HepaNullHermesCardStore};
+use hepa_kanban::sync::{
+    HepaKanbanSyncEngine, HepaKanbanSyncStatus, HepaUnavailableHermesCardStore,
+};
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -18,12 +20,21 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             hepa_core::crate_name()
         )),
         [command, subcommand] if command == "kanban" && subcommand == "sync" => {
-            let mut store = HepaNullHermesCardStore;
+            let mut store = HepaUnavailableHermesCardStore::new("Hermes CLI/API unavailable");
             let summary = HepaKanbanSyncEngine::new().sync_tasks(&[], &mut store)?;
-            Ok(format!(
-                "HEPA kanban sync completed: created={} updated={}",
-                summary.created, summary.updated
-            ))
+            match summary.status {
+                HepaKanbanSyncStatus::Synced => Ok(format!(
+                    "HEPA kanban sync completed: created={} updated={}",
+                    summary.created, summary.updated
+                )),
+                HepaKanbanSyncStatus::Degraded => Ok(format!(
+                    "HEPA kanban sync degraded: reason={} skipped={}",
+                    summary
+                        .degraded_reason
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    summary.skipped
+                )),
+            }
         }
         [command, ..] if command == "kanban" => Err("unknown kanban command".to_string()),
         _ => Err("unknown command".to_string()),
@@ -42,6 +53,9 @@ mod tests {
     fn kanban_sync_command_runs_empty_sync() {
         let output = run_cli(&args(&["kanban", "sync"])).expect("sync should run");
 
-        assert_eq!(output, "HEPA kanban sync completed: created=0 updated=0");
+        assert_eq!(
+            output,
+            "HEPA kanban sync degraded: reason=Hermes CLI/API unavailable skipped=0"
+        );
     }
 }
