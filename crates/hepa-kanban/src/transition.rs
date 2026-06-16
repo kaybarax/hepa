@@ -1,4 +1,6 @@
-use hepa_core::contracts::{HepaFleetTask, HepaReadinessState, HepaTaskStatus};
+use hepa_core::contracts::{
+    HepaFleetTask, HepaLane, HepaLaneState, HepaReadinessState, HepaTaskStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
@@ -101,11 +103,25 @@ pub fn evaluate_board_transition(
     task: &HepaFleetTask,
     request: &HepaBoardTransitionRequest,
 ) -> Result<HepaBoardTransitionDecision, HepaBoardTransitionError> {
+    evaluate_board_transition_with_lanes(task, &[], request)
+}
+
+pub fn evaluate_board_transition_with_lanes(
+    task: &HepaFleetTask,
+    lanes: &[HepaLane],
+    request: &HepaBoardTransitionRequest,
+) -> Result<HepaBoardTransitionDecision, HepaBoardTransitionError> {
     request.validate()?;
     if task.task_id != request.task_id {
         return Ok(rejected(
             request,
             "request task_id does not match HEPA task record",
+        ));
+    }
+    if board_request_would_bypass_lane_gates(&request.action, lanes) {
+        return Ok(rejected(
+            request,
+            "cards cannot bypass validation, review, safety, or done gates",
         ));
     }
 
@@ -161,6 +177,26 @@ pub fn evaluate_board_transition(
             Ok(accepted(request, "dependencies updated", updated_task))
         }
     }
+}
+
+fn board_request_would_bypass_lane_gates(
+    action: &HepaBoardTransitionAction,
+    lanes: &[HepaLane],
+) -> bool {
+    matches!(
+        action,
+        HepaBoardTransitionAction::MarkReady | HepaBoardTransitionAction::Resume
+    ) && lanes.iter().any(|lane| {
+        matches!(
+            lane.state,
+            HepaLaneState::Validating
+                | HepaLaneState::Reviewing
+                | HepaLaneState::NeedsHumanStaging
+                | HepaLaneState::PrReady
+                | HepaLaneState::ReadyForHuman
+                | HepaLaneState::Completed
+        )
+    })
 }
 
 fn transition_status(
@@ -282,6 +318,24 @@ mod tests {
         }
     }
 
+    fn lane(state: HepaLaneState) -> HepaLane {
+        HepaLane {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: "lane-1".to_string(),
+            project_id: "project-1".to_string(),
+            task_id: "task-1".to_string(),
+            adapter_id: "fake".to_string(),
+            state,
+            worktree_ref: "<WORKTREE>".to_string(),
+            branch: "hepa/task-1".to_string(),
+            run_dir_ref: "<RUN_DIR>".to_string(),
+            attempt_count: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
     #[test]
     fn board_transition_requests_cover_supported_actions() {
         for request in [
@@ -377,6 +431,25 @@ mod tests {
                 .expect("dependency update")
                 .dependencies,
             vec!["task-0".to_string()]
+        );
+    }
+
+    #[test]
+    fn board_transitions_cannot_bypass_lane_gates() {
+        let decision = evaluate_board_transition_with_lanes(
+            &task(HepaTaskStatus::Blocked, HepaReadinessState::Ready),
+            &[lane(HepaLaneState::Reviewing)],
+            &request(HepaBoardTransitionAction::Resume),
+        )
+        .expect("transition should evaluate");
+
+        assert_eq!(decision.status, HepaBoardTransitionDecisionStatus::Rejected);
+        assert!(decision.reason.contains("cannot bypass"));
+        assert!(
+            decision
+                .to_card_response()
+                .visible_reason
+                .contains("review")
         );
     }
 }
