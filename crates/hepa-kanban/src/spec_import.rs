@@ -1,9 +1,13 @@
 use hepa_core::contracts::{
-    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaReadinessState, HepaRiskLevel, HepaTaskSpec,
-    HepaTaskStatus,
+    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaProject, HepaReadinessState, HepaRiskLevel,
+    HepaTaskSpec, HepaTaskStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
+
+use crate::card_mapping::{
+    HepaHermesCardMappingInput, HepaHermesCardPayload, map_task_to_hermes_card,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaImportedSpec {
@@ -106,6 +110,38 @@ pub fn import_markdown_spec(markdown: &str) -> Result<HepaImportedSpec, HepaSpec
         ));
     }
     Ok(HepaImportedSpec { project_id, tasks })
+}
+
+pub fn imported_spec_to_draft_cards(
+    project: HepaProject,
+    imported: &HepaImportedSpec,
+) -> Result<Vec<HepaHermesCardPayload>, HepaSpecImportError> {
+    if project.project_id != imported.project_id {
+        return Err(HepaSpecImportError::new(
+            "project_id",
+            "project and imported spec must agree",
+        ));
+    }
+    imported
+        .tasks
+        .iter()
+        .map(|task| {
+            let input = HepaHermesCardMappingInput {
+                project: project.clone(),
+                task_spec: task.task_spec.clone(),
+                task: task.fleet_task.clone(),
+                lanes: Vec::new(),
+                readiness: None,
+                validation: None,
+                review_signals: Vec::new(),
+                terminal_report: None,
+                timing: None,
+                blocked_questions: Vec::new(),
+            };
+            map_task_to_hermes_card(&input)
+                .map_err(|error| HepaSpecImportError::new("card_mapping", error.to_string()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +260,21 @@ fn strip_list_marker(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::card_mapping::HepaHermesFieldValue;
+
+    fn project() -> HepaProject {
+        HepaProject {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            project_id: "project-1".to_string(),
+            display_name: "Project One".to_string(),
+            repo_ref: "<PROJECT_REPO>".to_string(),
+            default_branch: "main".to_string(),
+            routing_policy_ref: None,
+            is_active: true,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+        }
+    }
 
     #[test]
     fn markdown_spec_imports_tasks_with_dependencies_acceptance_and_validation() {
@@ -267,5 +318,32 @@ Project: project-1
         .expect_err("tasks without acceptance criteria must fail");
 
         assert_eq!(error.field, "task-1.acceptance_criteria");
+    }
+
+    #[test]
+    fn imported_specs_create_draft_hermes_cards() {
+        let imported = import_markdown_spec(
+            r#"
+Project: project-1
+## Task: task-1: Write docs
+Acceptance:
+- Docs describe usage.
+"#,
+        )
+        .expect("spec should import");
+
+        let cards = imported_spec_to_draft_cards(project(), &imported)
+            .expect("imported spec should create cards");
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].title, "Write docs");
+        assert_eq!(
+            cards[0].fields.get("task_status"),
+            Some(&HepaHermesFieldValue::Text("draft".to_string()))
+        );
+        assert_eq!(
+            cards[0].fields.get("readiness_state"),
+            Some(&HepaHermesFieldValue::Text("not_ready".to_string()))
+        );
     }
 }
