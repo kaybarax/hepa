@@ -1,3 +1,4 @@
+pub mod fake;
 pub mod routing;
 pub mod spec;
 
