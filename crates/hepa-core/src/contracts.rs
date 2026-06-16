@@ -259,17 +259,20 @@ impl HepaValidate for HepaLane {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaLaneState {
+    DraftSpec,
+    Ready,
     Allocated,
     Starting,
     Running,
     Validating,
     Reviewing,
     Repairing,
-    NeedsHumanStaging,
-    PrReady,
+    Staging,
+    PrCreated,
     ReadyForHuman,
     Blocked,
     Failed,
+    Cancelled,
     Cleaned,
     Completed,
 }
@@ -279,26 +282,26 @@ impl HepaLaneState {
         use HepaLaneState::*;
         matches!(
             (self, next),
-            (Allocated, Starting | Blocked | Failed | Cleaned)
+            (DraftSpec, Ready | Blocked | Cancelled | Cleaned)
+                | (Ready, Allocated | Blocked | Cancelled | Cleaned)
+                | (Allocated, Starting | Blocked | Failed | Cancelled | Cleaned)
                 | (Starting, Running | Blocked | Failed | Cleaned)
                 | (Running, Validating | Blocked | Failed | Cleaned)
                 | (
                     Validating,
                     Reviewing | Repairing | Blocked | Failed | Cleaned
                 )
-                | (
-                    Reviewing,
-                    Repairing | NeedsHumanStaging | Blocked | Failed | Cleaned
-                )
+                | (Reviewing, Repairing | Staging | Blocked | Failed | Cleaned)
                 | (Repairing, Running | Validating | Blocked | Failed | Cleaned)
-                | (NeedsHumanStaging, PrReady | Blocked | Failed | Cleaned)
+                | (Staging, PrCreated | Blocked | Failed | Cleaned)
                 | (
-                    PrReady,
+                    PrCreated,
                     ReadyForHuman | Completed | Blocked | Failed | Cleaned
                 )
                 | (ReadyForHuman, Completed | Blocked | Failed | Cleaned)
                 | (Blocked, Running | Repairing | Cleaned)
                 | (Failed, Repairing | Cleaned)
+                | (Cancelled, Cleaned)
                 | (Completed, Cleaned)
         )
     }
@@ -961,5 +964,32 @@ mod tests {
         assert!(!HepaLaneState::Completed.can_transition_to(&HepaLaneState::Running));
         assert!(HepaTaskStatus::Running.can_transition_to(&HepaTaskStatus::Completed));
         assert!(!HepaTaskStatus::Completed.can_transition_to(&HepaTaskStatus::Running));
+    }
+
+    #[test]
+    fn lane_states_use_phase_three_stable_names() {
+        let states = [
+            (HepaLaneState::DraftSpec, "\"draft_spec\""),
+            (HepaLaneState::Ready, "\"ready\""),
+            (HepaLaneState::Allocated, "\"allocated\""),
+            (HepaLaneState::Starting, "\"starting\""),
+            (HepaLaneState::Running, "\"running\""),
+            (HepaLaneState::Validating, "\"validating\""),
+            (HepaLaneState::Reviewing, "\"reviewing\""),
+            (HepaLaneState::Repairing, "\"repairing\""),
+            (HepaLaneState::Staging, "\"staging\""),
+            (HepaLaneState::PrCreated, "\"pr_created\""),
+            (HepaLaneState::ReadyForHuman, "\"ready_for_human\""),
+            (HepaLaneState::Blocked, "\"blocked\""),
+            (HepaLaneState::Failed, "\"failed\""),
+            (HepaLaneState::Cancelled, "\"cancelled\""),
+            (HepaLaneState::Cleaned, "\"cleaned\""),
+            (HepaLaneState::Completed, "\"completed\""),
+        ];
+
+        for (state, expected_json) in states {
+            let json = serde_json::to_string(&state).expect("state should serialize");
+            assert_eq!(json, expected_json);
+        }
     }
 }

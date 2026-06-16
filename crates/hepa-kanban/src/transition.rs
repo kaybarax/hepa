@@ -211,8 +211,8 @@ fn board_request_would_bypass_lane_gates(
             lane.state,
             HepaLaneState::Validating
                 | HepaLaneState::Reviewing
-                | HepaLaneState::NeedsHumanStaging
-                | HepaLaneState::PrReady
+                | HepaLaneState::Staging
+                | HepaLaneState::PrCreated
                 | HepaLaneState::ReadyForHuman
                 | HepaLaneState::Completed
         )
