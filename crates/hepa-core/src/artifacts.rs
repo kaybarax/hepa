@@ -743,18 +743,48 @@ mod tests {
     }
 
     #[test]
-    fn archive_on_exit_accepts_interrupted_runs_without_existing_artifacts() {
-        let root = unique_test_dir("archive-empty");
+    fn archive_on_exit_preserves_interrupted_state_for_reconcile_and_cleanup() {
+        let root = unique_test_dir("archive-interrupted");
         let layout =
             HepaArtifactLayout::new(root.join("control"), root.join("archive")).expect("valid");
         let run = layout.run("run-1", "task-1").expect("valid run");
+        let lane = run.lane("lane-1").expect("valid lane");
+        fs::create_dir_all(&run.task_dir).expect("task dir should write");
+        fs::write(
+            &run.task_state,
+            "{\"task_id\":\"task-1\",\"status\":\"running\"}\n",
+        )
+        .expect("task state should write");
+        let record = HepaStateTransitionRecord::lane(
+            "run-1",
+            "task-1",
+            "lane-1",
+            "001-running",
+            Some("starting"),
+            "running",
+            "2026-06-16T00:00:02Z",
+        )
+        .with_reason("interrupted during worker attempt");
+        lane.write_transition_state(&record)
+            .expect("current lane state should write");
 
         let manifest = run
             .archive_on_exit("2026-06-16T00:00:03Z", HepaArchiveOutcome::Interrupted)
-            .expect("empty interrupted run archive should still produce manifest");
+            .expect("interrupted run archive should preserve state");
+        let archived_current_state = run
+            .archive_dir
+            .join("tasks/task-1/lanes/lane-1/state/current.json");
+        let archived_task_state = run.archive_dir.join("tasks/task-1/task.json");
+        let manifest_json =
+            fs::read_to_string(&run.archive_manifest).expect("manifest should exist");
 
         assert_eq!(manifest.outcome, HepaArchiveOutcome::Interrupted);
+        assert!(lane.current_state.exists());
+        assert!(archived_current_state.exists());
+        assert!(archived_task_state.exists());
         assert!(run.archive_manifest.exists());
+        assert!(manifest_json.contains("\"outcome\": \"interrupted\""));
+        assert!(!manifest_json.contains(root.to_string_lossy().as_ref()));
 
         remove_test_dir(root);
     }
