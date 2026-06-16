@@ -495,6 +495,21 @@ mod tests {
     }
 
     #[test]
+    fn routing_decision_resolves_deterministically_for_same_inputs() {
+        let policy = sample_policy();
+        let adapters = sample_adapters(HepaAdapterCostClass::PaidCloud);
+        let first = policy
+            .decide_adapter(sample_decision_request(Some("docs")), &adapters)
+            .expect("first routing decision should resolve");
+        let second = policy
+            .decide_adapter(sample_decision_request(Some("docs")), &adapters)
+            .expect("second routing decision should resolve");
+
+        assert_eq!(first, second);
+        assert_eq!(first.selected_adapter, "worker-docs");
+    }
+
+    #[test]
     fn manager_override_requires_and_records_reason() {
         let policy = sample_policy();
         let adapters = sample_adapters(HepaAdapterCostClass::PaidCloud);
