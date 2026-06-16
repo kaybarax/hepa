@@ -790,6 +790,38 @@ mod tests {
     }
 
     #[test]
+    fn archive_artifacts_are_deterministic_and_path_redacted() {
+        let first = archived_fixture_json("deterministic-a");
+        let second = archived_fixture_json("deterministic-b");
+
+        assert_eq!(first.manifest_json, second.manifest_json);
+        assert_eq!(first.current_state_json, second.current_state_json);
+        assert!(
+            !first
+                .manifest_json
+                .contains(first.root.to_string_lossy().as_ref())
+        );
+        assert!(
+            !first
+                .current_state_json
+                .contains(first.root.to_string_lossy().as_ref())
+        );
+        assert!(
+            !second
+                .manifest_json
+                .contains(second.root.to_string_lossy().as_ref())
+        );
+        assert!(
+            !second
+                .current_state_json
+                .contains(second.root.to_string_lossy().as_ref())
+        );
+
+        remove_test_dir(first.root);
+        remove_test_dir(second.root);
+    }
+
+    #[test]
     fn timing_records_write_to_lane_artifacts() {
         let root = unique_test_dir("timing");
         let layout =
@@ -831,6 +863,44 @@ mod tests {
         assert!(timing_json.contains("\"sandbox_posture\": \"host-worktree\""));
 
         remove_test_dir(root);
+    }
+
+    struct ArchivedFixtureJson {
+        root: PathBuf,
+        manifest_json: String,
+        current_state_json: String,
+    }
+
+    fn archived_fixture_json(label: &str) -> ArchivedFixtureJson {
+        let root = unique_test_dir(label);
+        let layout =
+            HepaArtifactLayout::new(root.join("control"), root.join("archive")).expect("valid");
+        let run = layout.run("run-1", "task-1").expect("valid run");
+        let lane = run.lane("lane-1").expect("valid lane");
+        let record = HepaStateTransitionRecord::lane(
+            "run-1",
+            "task-1",
+            "lane-1",
+            "001-completed",
+            Some("running"),
+            "completed",
+            "2026-06-16T00:00:02Z",
+        )
+        .with_reason("deterministic fixture");
+        lane.write_transition_state(&record)
+            .expect("transition should write");
+        run.archive_on_exit("2026-06-16T00:00:03Z", HepaArchiveOutcome::Completed)
+            .expect("archive should write");
+
+        ArchivedFixtureJson {
+            manifest_json: fs::read_to_string(&run.archive_manifest).expect("manifest exists"),
+            current_state_json: fs::read_to_string(
+                run.archive_dir
+                    .join("tasks/task-1/lanes/lane-1/state/current.json"),
+            )
+            .expect("current state exists"),
+            root,
+        }
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
