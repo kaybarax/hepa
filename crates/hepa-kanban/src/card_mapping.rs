@@ -704,6 +704,21 @@ mod tests {
     }
 
     #[test]
+    fn task_can_exist_without_external_card_id() {
+        let mut input = sample_input();
+        input.task.external_card_id = None;
+
+        let payload =
+            map_task_to_hermes_card(&input).expect("missing Hermes card ID should not block task");
+
+        assert!(!payload.fields.contains_key("external_card_id"));
+        assert_eq!(
+            payload.fields.get("task_id"),
+            Some(&HepaHermesFieldValue::Text("task-1".to_string()))
+        );
+    }
+
+    #[test]
     fn card_mapping_rejects_mismatched_lane_task() {
         let mut input = sample_input();
         input.lanes[0].task_id = "other-task".to_string();
