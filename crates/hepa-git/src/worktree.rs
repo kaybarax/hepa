@@ -1,4 +1,5 @@
 use crate::branches::{HepaBranchError, HepaManagerBranch};
+use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     fmt, fs, io,
@@ -24,7 +25,17 @@ impl HepaWorktreeAllocator {
         &self,
         lane_id: impl Into<String>,
     ) -> Result<HepaWorktreeAllocation, HepaWorktreeError> {
+        self.allocate_lane_with_metadata(lane_id, "unspecified")
+    }
+
+    pub fn allocate_lane_with_metadata(
+        &self,
+        lane_id: impl Into<String>,
+        created_at: impl Into<String>,
+    ) -> Result<HepaWorktreeAllocation, HepaWorktreeError> {
         let lane_id = lane_id.into();
+        let created_at = created_at.into();
+        require_single_line("created_at", &created_at)?;
         let branch = HepaManagerBranch::for_lane(&lane_id)?;
         let worktree_path = self.worktree_root.join(&lane_id);
         if worktree_path.exists() {
@@ -46,12 +57,15 @@ impl HepaWorktreeAllocator {
             &base_commit,
         ])?;
 
-        Ok(HepaWorktreeAllocation {
+        let mut allocation = HepaWorktreeAllocation {
             lane_id,
             branch: branch.as_str().to_string(),
             worktree_path,
             base_commit,
-        })
+            metadata_path: PathBuf::new(),
+        };
+        allocation.metadata_path = allocation.write_metadata(created_at)?;
+        Ok(allocation)
     }
 
     fn git_output<const N: usize>(&self, args: [&str; N]) -> Result<String, HepaWorktreeError> {
@@ -87,6 +101,59 @@ pub struct HepaWorktreeAllocation {
     pub branch: String,
     pub worktree_path: PathBuf,
     pub base_commit: String,
+    pub metadata_path: PathBuf,
+}
+
+impl HepaWorktreeAllocation {
+    pub fn metadata(&self, created_at: impl Into<String>) -> HepaWorktreeMetadata {
+        HepaWorktreeMetadata {
+            schema_version: WORKTREE_METADATA_SCHEMA_VERSION,
+            lane_id: self.lane_id.clone(),
+            branch: self.branch.clone(),
+            base_commit: self.base_commit.clone(),
+            worktree_ref: format!("worktree:{}", self.lane_id),
+            cleanup: HepaWorktreeCleanupMetadata {
+                status: HepaWorktreeCleanupStatus::Active,
+                created_at: created_at.into(),
+                cleaned_at: None,
+                prune_after: None,
+            },
+        }
+    }
+
+    fn write_metadata(&self, created_at: impl Into<String>) -> Result<PathBuf, HepaWorktreeError> {
+        let metadata_path = self.worktree_path.join(".hepa-worktree.json");
+        write_stable_json(&metadata_path, &self.metadata(created_at))?;
+        Ok(metadata_path)
+    }
+}
+
+pub const WORKTREE_METADATA_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaWorktreeMetadata {
+    pub schema_version: u32,
+    pub lane_id: String,
+    pub branch: String,
+    pub base_commit: String,
+    pub worktree_ref: String,
+    pub cleanup: HepaWorktreeCleanupMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaWorktreeCleanupMetadata {
+    pub status: HepaWorktreeCleanupStatus,
+    pub created_at: String,
+    pub cleaned_at: Option<String>,
+    pub prune_after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HepaWorktreeCleanupStatus {
+    Active,
+    Cleaned,
+    Stale,
 }
 
 #[derive(Debug)]
@@ -118,6 +185,12 @@ impl From<io::Error> for HepaWorktreeError {
     }
 }
 
+impl From<serde_json::Error> for HepaWorktreeError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::new("serde_json", error.to_string())
+    }
+}
+
 impl From<HepaBranchError> for HepaWorktreeError {
     fn from(error: HepaBranchError) -> Self {
         Self::new(error.field, error.message)
@@ -127,6 +200,28 @@ impl From<HepaBranchError> for HepaWorktreeError {
 fn path_to_str<'a>(field: &str, path: &'a Path) -> Result<&'a str, HepaWorktreeError> {
     path.to_str()
         .ok_or_else(|| HepaWorktreeError::new(field, "must be UTF-8"))
+}
+
+fn require_single_line(field: &str, value: &str) -> Result<(), HepaWorktreeError> {
+    if value.trim().is_empty() {
+        return Err(HepaWorktreeError::new(field, "must not be empty"));
+    }
+    if value.contains('\n') || value.contains('\r') {
+        return Err(HepaWorktreeError::new(field, "must be a single line"));
+    }
+    Ok(())
+}
+
+fn write_stable_json<T>(path: &Path, value: &T) -> Result<(), HepaWorktreeError>
+where
+    T: Serialize,
+{
+    let mut json = serde_json::to_string_pretty(value)?;
+    if !json.ends_with('\n') {
+        json.push('\n');
+    }
+    fs::write(path, json)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,6 +250,7 @@ mod tests {
             allocation.base_commit,
             git_output(&repo, ["rev-parse", "HEAD"])
         );
+        assert!(allocation.metadata_path.exists());
 
         remove_test_dir(root);
     }
@@ -200,6 +296,33 @@ mod tests {
             "do not remove\n"
         );
         assert!(!worktrees.join("lane-a").exists());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn allocate_lane_records_branch_worktree_base_and_cleanup_metadata() {
+        let root = unique_test_dir("metadata");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        init_repo(&repo);
+        let allocator = HepaWorktreeAllocator::new(&repo, &worktrees);
+
+        let allocation = allocator
+            .allocate_lane_with_metadata("lane-a", "2026-06-16T00:00:00Z")
+            .expect("allocation should succeed");
+        let metadata_json =
+            fs::read_to_string(&allocation.metadata_path).expect("metadata should exist");
+        let metadata: HepaWorktreeMetadata =
+            serde_json::from_str(&metadata_json).expect("metadata should parse");
+
+        assert_eq!(metadata.lane_id, "lane-a");
+        assert_eq!(metadata.branch, "hepa/manager/lane-a");
+        assert_eq!(metadata.base_commit, allocation.base_commit);
+        assert_eq!(metadata.worktree_ref, "worktree:lane-a");
+        assert_eq!(metadata.cleanup.status, HepaWorktreeCleanupStatus::Active);
+        assert_eq!(metadata.cleanup.created_at, "2026-06-16T00:00:00Z");
+        assert!(!metadata_json.contains(root.to_string_lossy().as_ref()));
 
         remove_test_dir(root);
     }
