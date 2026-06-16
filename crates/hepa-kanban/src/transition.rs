@@ -69,6 +69,27 @@ pub struct HepaBoardTransitionDecision {
     pub updated_task: Option<HepaFleetTask>,
 }
 
+impl HepaBoardTransitionDecision {
+    pub fn to_card_response(&self) -> HepaBoardTransitionCardResponse {
+        let status = match self.status {
+            HepaBoardTransitionDecisionStatus::Accepted => "accepted",
+            HepaBoardTransitionDecisionStatus::Rejected => "rejected",
+        };
+        HepaBoardTransitionCardResponse {
+            request_id: self.request_id.clone(),
+            task_id: self.task_id.clone(),
+            visible_reason: format!("Board transition {status}: {}", self.reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaBoardTransitionCardResponse {
+    pub request_id: String,
+    pub task_id: String,
+    pub visible_reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaBoardTransitionDecisionStatus {
@@ -329,6 +350,9 @@ mod tests {
         assert_eq!(decision.status, HepaBoardTransitionDecisionStatus::Rejected);
         assert!(decision.reason.contains("state machine"));
         assert!(decision.updated_task.is_none());
+        let card_response = decision.to_card_response();
+        assert!(card_response.visible_reason.contains("rejected"));
+        assert!(card_response.visible_reason.contains("state machine"));
     }
 
     #[test]
