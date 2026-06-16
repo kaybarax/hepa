@@ -115,6 +115,7 @@ impl HepaOneshotAdapterExecutor {
 pub struct HepaAdapterExecutionError {
     pub field: String,
     pub message: String,
+    pub status: Option<String>,
 }
 
 impl HepaAdapterExecutionError {
@@ -122,6 +123,15 @@ impl HepaAdapterExecutionError {
         Self {
             field: field.into(),
             message: message.into(),
+            status: None,
+        }
+    }
+
+    fn blocked(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+            status: Some("blocked".to_string()),
         }
     }
 }
@@ -187,7 +197,7 @@ fn monitor_error(stop: HepaMonitorStop) -> HepaAdapterExecutionError {
         HepaMonitorStopKind::Timeout => "timeout",
         HepaMonitorStopKind::Stall => "stall",
     };
-    HepaAdapterExecutionError::new("monitor", format!("{reason}: {}", stop.evidence))
+    HepaAdapterExecutionError::blocked("monitor", format!("{reason}: {}", stop.evidence))
 }
 
 fn rendered_command(
@@ -604,6 +614,7 @@ esac
             HepaMonitorPolicy::default(),
         )
         .expect_err("command policy should stop");
+        assert_eq!(command_error.status.as_deref(), Some("blocked"));
         assert!(command_error.message.contains("command_policy"));
 
         let secret_error = run_monitor_case(
@@ -613,6 +624,7 @@ esac
             HepaMonitorPolicy::default(),
         )
         .expect_err("secret output should stop");
+        assert_eq!(secret_error.status.as_deref(), Some("blocked"));
         assert!(secret_error.message.contains("secret_detected"));
 
         let scope_error = run_monitor_case(
@@ -625,6 +637,7 @@ esac
             },
         )
         .expect_err("scope output should stop");
+        assert_eq!(scope_error.status.as_deref(), Some("blocked"));
         assert!(scope_error.message.contains("scope_violation"));
 
         let timeout_error = run_monitor_case(
@@ -637,6 +650,7 @@ esac
             },
         )
         .expect_err("timeout should stop");
+        assert_eq!(timeout_error.status.as_deref(), Some("blocked"));
         assert!(timeout_error.message.contains("timeout"));
 
         let stall_error = run_monitor_case(
@@ -649,6 +663,7 @@ esac
             },
         )
         .expect_err("stall should stop");
+        assert_eq!(stall_error.status.as_deref(), Some("blocked"));
         assert!(stall_error.message.contains("stall"));
 
         remove_test_dir(root);
