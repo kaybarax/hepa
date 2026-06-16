@@ -540,6 +540,8 @@ pub struct HepaTimingPhase {
     pub round: Option<u32>,
     pub role: Option<HepaAgentRole>,
     pub adapter_id: Option<String>,
+    pub routing_reason: Option<String>,
+    pub sandbox_posture: Option<String>,
 }
 
 impl HepaValidate for HepaTimingPhase {
@@ -553,6 +555,12 @@ impl HepaValidate for HepaTimingPhase {
         }
         if let Some(adapter_id) = &self.adapter_id {
             require_single_line("adapter_id", adapter_id)?;
+        }
+        if let Some(routing_reason) = &self.routing_reason {
+            require_single_line("routing_reason", routing_reason)?;
+        }
+        if let Some(sandbox_posture) = &self.sandbox_posture {
+            require_single_line("sandbox_posture", sandbox_posture)?;
         }
         Ok(())
     }
@@ -572,8 +580,8 @@ pub struct HepaTimingCounters {
     pub agent_loops: u32,
     pub manager_passes: u32,
     pub reviewer_passes: u32,
-    pub container_starts: u32,
-    pub dependency_installs: u32,
+    pub install_events: u32,
+    pub container_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -837,13 +845,15 @@ mod tests {
                     round: Some(1),
                     role: Some(HepaAgentRole::Worker),
                     adapter_id: Some("fake".to_string()),
+                    routing_reason: Some("default fake adapter".to_string()),
+                    sandbox_posture: Some("host-worktree".to_string()),
                 }],
                 counters: HepaTimingCounters {
                     agent_loops: 1,
                     manager_passes: 0,
                     reviewer_passes: 0,
-                    container_starts: 0,
-                    dependency_installs: 0,
+                    install_events: 0,
+                    container_count: 0,
                 },
             }),
             summary: vec!["Blocked by fake adapter.".to_string()],
@@ -991,5 +1001,41 @@ mod tests {
             let json = serde_json::to_string(&state).expect("state should serialize");
             assert_eq!(json, expected_json);
         }
+    }
+
+    #[test]
+    fn timing_record_carries_structural_phase_and_counter_telemetry() {
+        let timing = HepaTimingRecord {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            run_id: "run-1".to_string(),
+            phases: vec![HepaTimingPhase {
+                name: "worker_attempt".to_string(),
+                status: HepaPhaseStatus::Completed,
+                duration_seconds: 3.25,
+                round: Some(1),
+                role: Some(HepaAgentRole::Worker),
+                adapter_id: Some("fake".to_string()),
+                routing_reason: Some("matched docs task capability".to_string()),
+                sandbox_posture: Some("host-worktree".to_string()),
+            }],
+            counters: HepaTimingCounters {
+                agent_loops: 1,
+                manager_passes: 1,
+                reviewer_passes: 2,
+                install_events: 1,
+                container_count: 0,
+            },
+        };
+
+        timing.validate().expect("timing telemetry should validate");
+        let json = to_stable_json(&timing).expect("timing should serialize");
+
+        assert!(json.contains("\"adapter_id\": \"fake\""));
+        assert!(json.contains("\"routing_reason\": \"matched docs task capability\""));
+        assert!(json.contains("\"sandbox_posture\": \"host-worktree\""));
+        assert!(json.contains("\"agent_loops\": 1"));
+        assert!(json.contains("\"manager_passes\": 1"));
+        assert!(json.contains("\"install_events\": 1"));
+        assert!(json.contains("\"container_count\": 0"));
     }
 }

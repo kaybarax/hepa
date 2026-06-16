@@ -613,13 +613,15 @@ mod tests {
                 round: Some(1),
                 role: None,
                 adapter_id: Some("reviewer-a".to_string()),
+                routing_reason: Some("review fanout".to_string()),
+                sandbox_posture: Some("host-worktree".to_string()),
             }],
             counters: HepaTimingCounters {
                 agent_loops: 1,
                 manager_passes: 1,
                 reviewer_passes: 1,
-                container_starts: 0,
-                dependency_installs: 0,
+                install_events: 0,
+                container_count: 0,
             },
         };
         let terminal_report = HepaTerminalTaskReport {
