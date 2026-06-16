@@ -1,3 +1,4 @@
+pub mod config;
 pub mod contracts;
 
 pub const CRATE_NAME: &str = "hepa-core";
