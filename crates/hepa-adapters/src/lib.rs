@@ -1,3 +1,4 @@
+pub mod routing;
 pub mod spec;
 
 pub const CRATE_NAME: &str = "hepa-adapters";
