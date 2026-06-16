@@ -502,42 +502,32 @@ mod tests {
         assert_eq!(result.timing.counters.agent_loops, 1);
         assert_eq!(result.timing.counters.container_count, 0);
         assert!(!config.worktree_root.join("lane-1").exists());
-        assert!(
-            config
-                .control_root
-                .join("runs/run-1/tasks/task-1/lanes/lane-1/attempts/attempt-1/attempt.json")
-                .exists()
-        );
-        assert!(
-            config
-                .control_root
-                .join("runs/run-1/tasks/task-1/lanes/lane-1/validation/summary.json")
-                .exists()
-        );
-        assert!(
-            config
-                .control_root
-                .join("runs/run-1/tasks/task-1/lanes/lane-1/review/signals/review-1.json")
-                .exists()
-        );
-        assert!(
-            config
-                .control_root
-                .join("runs/run-1/tasks/task-1/lanes/lane-1/timing.json")
-                .exists()
-        );
-        assert!(
-            config
-                .control_root
-                .join("runs/run-1/tasks/task-1/lanes/lane-1/final-report.json")
-                .exists()
-        );
-        assert!(
+        let run_dir = config.control_root.join("runs/run-1");
+        let lane_dir = run_dir.join("tasks/task-1/lanes/lane-1");
+        for artifact in [
+            run_dir.join("run.json"),
+            run_dir.join("tasks/task-1/task.json"),
+            lane_dir.join("lane.json"),
+            lane_dir.join("state/current.json"),
+            lane_dir.join("state/transitions/001-starting.json"),
+            lane_dir.join("state/transitions/002-running.json"),
+            lane_dir.join("state/transitions/003-validating.json"),
+            lane_dir.join("state/transitions/004-reviewing.json"),
+            lane_dir.join("state/transitions/005-staging.json"),
+            lane_dir.join("state/transitions/006-pr_created.json"),
+            lane_dir.join("state/transitions/007-completed.json"),
+            lane_dir.join("attempts/attempt-1/attempt.json"),
+            lane_dir.join("validation/summary.json"),
+            lane_dir.join("review/signals/review-1.json"),
+            lane_dir.join("timing.json"),
+            lane_dir.join("final-report.json"),
+            config.archive_root.join("runs/run-1/manifest.json"),
             config
                 .archive_root
-                .join("runs/run-1/manifest.json")
-                .exists()
-        );
+                .join("runs/run-1/tasks/task-1/lanes/lane-1/final-report.json"),
+        ] {
+            assert!(artifact.exists(), "missing artifact {}", artifact.display());
+        }
 
         remove_test_dir(root);
     }
