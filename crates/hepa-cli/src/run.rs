@@ -53,13 +53,14 @@ pub fn run_fake_task(config: &HepaFakeRunConfig) -> Result<HepaFakeRunResult, St
     let lane_paths = run_paths
         .lane(&config.lane_id)
         .map_err(|error| error.to_string())?;
-    fs::create_dir_all(&lane_paths.lane_dir).map_err(|error| error.to_string())?;
-    write_json(&run_paths.task_state, &task_spec).map_err(|error| error.to_string())?;
-
     let allocator = HepaWorktreeAllocator::new(&config.repo_path, &config.worktree_root);
     let allocation = allocator
         .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
         .map_err(|error| error.to_string())?;
+
+    fs::create_dir_all(&lane_paths.lane_dir).map_err(|error| error.to_string())?;
+    write_json(&run_paths.task_state, &task_spec).map_err(|error| error.to_string())?;
+
     let mut lane = initial_lane(config, &allocation);
     write_json(&lane_paths.lane_state, &lane).map_err(|error| error.to_string())?;
 

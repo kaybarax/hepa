@@ -71,11 +71,12 @@ fn run_cli(args: &[String]) -> Result<String, String> {
         }
         [command, ..] if command == "timing" => Err("unknown timing command".to_string()),
         [command, repo_path, task_text, flag] if command == "run" && flag == "--fake" => {
+            let repo_path = std::path::PathBuf::from(repo_path);
             let result = run::run_fake_task(&run::HepaFakeRunConfig {
-                repo_path: std::path::PathBuf::from(repo_path),
-                control_root: std::path::PathBuf::from(".hepa/control"),
-                worktree_root: std::path::PathBuf::from(".hepa/worktrees"),
-                archive_root: std::path::PathBuf::from(".hepa/archive"),
+                control_root: repo_path.join(".hepa/control"),
+                worktree_root: repo_path.join(".hepa/worktrees"),
+                archive_root: repo_path.join(".hepa/archive"),
+                repo_path,
                 run_id: "run-cli-fake".to_string(),
                 task_id: "task-cli-fake".to_string(),
                 lane_id: "lane-cli-fake".to_string(),
@@ -88,11 +89,12 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             ))
         }
         [command, repo_path, task_text, flag] if command == "run" && flag == "--timing" => {
+            let repo_path = std::path::PathBuf::from(repo_path);
             let result = run::run_fake_task(&run::HepaFakeRunConfig {
-                repo_path: std::path::PathBuf::from(repo_path),
-                control_root: std::path::PathBuf::from(".hepa/control"),
-                worktree_root: std::path::PathBuf::from(".hepa/worktrees"),
-                archive_root: std::path::PathBuf::from(".hepa/archive"),
+                control_root: repo_path.join(".hepa/control"),
+                worktree_root: repo_path.join(".hepa/worktrees"),
+                archive_root: repo_path.join(".hepa/archive"),
+                repo_path,
                 run_id: "run-cli-fake".to_string(),
                 task_id: "task-cli-fake".to_string(),
                 lane_id: "lane-cli-fake".to_string(),
@@ -140,7 +142,12 @@ mod tests {
         CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaPhaseStatus, HepaTimingCounters,
         HepaTimingPhase,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        fs,
+        path::Path,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -218,11 +225,73 @@ mod tests {
         std::fs::remove_file(path).expect("cleanup timing file");
     }
 
+    #[test]
+    fn run_timing_command_prints_fake_phase_breakdown() {
+        let root = unique_test_dir("run-timing");
+        let repo = root.join("repo");
+        init_repo(&repo);
+
+        let output = run_cli(&args(&[
+            "run",
+            repo.to_str().expect("test path is UTF-8"),
+            "Update docs",
+            "--timing",
+        ]))
+        .expect("fake timing run should complete");
+
+        assert!(output.contains("HEPA timing: run=run-cli-fake"));
+        assert!(output.contains("agent_loops=1"));
+        assert!(output.contains("manager_passes=1"));
+        assert!(output.contains("container_count=0"));
+        assert!(output.contains("fake_worker=1.000s"));
+        assert!(output.contains("fake_review=1.000s"));
+
+        remove_test_dir(root);
+    }
+
+    fn init_repo(repo: &Path) {
+        fs::create_dir_all(repo).expect("repo dir");
+        git(repo, ["init"]);
+        git(repo, ["config", "user.email", "hepa-test"]);
+        git(repo, ["config", "user.name", "HEPA Test"]);
+        fs::write(repo.join("README.md"), "fixture\n").expect("fixture write");
+        git(repo, ["add", "README.md"]);
+        git(repo, ["commit", "-m", "initial"]);
+    }
+
+    fn git<const N: usize>(repo: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn unique_test_file(label: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("hepa-cli-{label}-{nonce}.json"))
+    }
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("hepa-cli-{label}-{nonce}"))
+    }
+
+    fn remove_test_dir(root: std::path::PathBuf) {
+        if root.exists() {
+            fs::remove_dir_all(root).expect("test dir cleanup");
+        }
     }
 }
