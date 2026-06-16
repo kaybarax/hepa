@@ -1,7 +1,8 @@
 use crate::config::HepaConfig;
+use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
-    fmt,
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -98,6 +99,9 @@ impl HepaRunArtifactPaths {
             attempts_dir: lane_dir.join("attempts"),
             validation_summary: lane_dir.join("validation").join("summary.json"),
             review_dir: lane_dir.join("review"),
+            state_dir: lane_dir.join("state"),
+            transition_dir: lane_dir.join("state").join("transitions"),
+            current_state: lane_dir.join("state").join("current.json"),
             timing_record: lane_dir.join("timing.json"),
             final_report: lane_dir.join("final-report.json"),
         })
@@ -115,6 +119,9 @@ pub struct HepaLaneArtifactPaths {
     pub attempts_dir: PathBuf,
     pub validation_summary: PathBuf,
     pub review_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub transition_dir: PathBuf,
+    pub current_state: PathBuf,
     pub timing_record: PathBuf,
     pub final_report: PathBuf,
 }
@@ -149,6 +156,51 @@ impl HepaLaneArtifactPaths {
             .join("signals")
             .join(format!("{}.json", review_id.as_str())))
     }
+
+    pub fn transition_record(
+        &self,
+        transition_id: impl Into<String>,
+    ) -> Result<PathBuf, HepaArtifactPathError> {
+        let transition_id = HepaArtifactId::new("transition_id", transition_id)?;
+        Ok(self
+            .transition_dir
+            .join(format!("{}.json", transition_id.as_str())))
+    }
+
+    pub fn write_transition_state(
+        &self,
+        record: &HepaStateTransitionRecord,
+    ) -> Result<HepaStateWriteReceipt, HepaArtifactWriteError> {
+        self.require_record_matches(record)?;
+        let transition_path = self.transition_record(record.transition_id.as_str())?;
+        write_stable_json(&transition_path, record)?;
+        write_stable_json(&self.current_state, record)?;
+        Ok(HepaStateWriteReceipt {
+            transition_path,
+            current_state_path: self.current_state.clone(),
+        })
+    }
+
+    fn require_record_matches(
+        &self,
+        record: &HepaStateTransitionRecord,
+    ) -> Result<(), HepaArtifactWriteError> {
+        if record.schema_version != ARTIFACT_SCHEMA_VERSION {
+            return Err(HepaArtifactWriteError::InvalidRecord {
+                field: "schema_version".to_string(),
+                message: format!("must be {ARTIFACT_SCHEMA_VERSION}"),
+            });
+        }
+        require_matching_id("run_id", &self.run_id, &record.run_id)?;
+        require_matching_id("task_id", &self.task_id, &record.task_id)?;
+        require_matching_id("lane_id", &self.lane_id, &record.lane_id)?;
+        HepaArtifactId::new("transition_id", &record.transition_id)?;
+        require_single_line_record("from_state", record.from_state.as_deref())?;
+        require_single_line_record("to_state", Some(&record.to_state))?;
+        require_single_line_record("reason", record.reason.as_deref())?;
+        require_single_line_record("occurred_at", Some(&record.occurred_at))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +214,69 @@ pub struct HepaAttemptArtifactPaths {
     pub attempt_report: PathBuf,
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaStateTransitionRecord {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub task_id: String,
+    pub lane_id: String,
+    pub transition_id: String,
+    pub entity: HepaStateEntity,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub reason: Option<String>,
+    pub occurred_at: String,
+}
+
+impl HepaStateTransitionRecord {
+    pub fn lane(
+        run_id: impl Into<String>,
+        task_id: impl Into<String>,
+        lane_id: impl Into<String>,
+        transition_id: impl Into<String>,
+        from_state: Option<impl Into<String>>,
+        to_state: impl Into<String>,
+        occurred_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            lane_id: lane_id.into(),
+            transition_id: transition_id.into(),
+            entity: HepaStateEntity::Lane,
+            from_state: from_state.map(Into::into),
+            to_state: to_state.into(),
+            reason: None,
+            occurred_at: occurred_at.into(),
+        }
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HepaStateEntity {
+    Run,
+    Task,
+    Lane,
+    Attempt,
+    Validation,
+    Review,
+    Timing,
+    FinalReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaStateWriteReceipt {
+    pub transition_path: PathBuf,
+    pub current_state_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -225,9 +340,102 @@ impl fmt::Display for HepaArtifactPathError {
 
 impl Error for HepaArtifactPathError {}
 
+#[derive(Debug)]
+pub enum HepaArtifactWriteError {
+    Path(HepaArtifactPathError),
+    InvalidRecord { field: String, message: String },
+    Io(io::Error),
+    Serde(serde_json::Error),
+}
+
+impl fmt::Display for HepaArtifactWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Path(error) => write!(formatter, "{error}"),
+            Self::InvalidRecord { field, message } => write!(formatter, "{field}: {message}"),
+            Self::Io(error) => write!(formatter, "{error}"),
+            Self::Serde(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for HepaArtifactWriteError {}
+
+impl From<HepaArtifactPathError> for HepaArtifactWriteError {
+    fn from(error: HepaArtifactPathError) -> Self {
+        Self::Path(error)
+    }
+}
+
+impl From<io::Error> for HepaArtifactWriteError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for HepaArtifactWriteError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serde(error)
+    }
+}
+
+fn require_matching_id(
+    field: &str,
+    expected: &HepaArtifactId,
+    actual: &str,
+) -> Result<(), HepaArtifactWriteError> {
+    HepaArtifactId::new(field, actual)?;
+    if expected.as_str() != actual {
+        return Err(HepaArtifactWriteError::InvalidRecord {
+            field: field.to_string(),
+            message: "must match artifact path IDs".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn require_single_line_record(
+    field: &str,
+    value: Option<&str>,
+) -> Result<(), HepaArtifactWriteError> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(HepaArtifactWriteError::InvalidRecord {
+                field: field.to_string(),
+                message: "must not be empty".to_string(),
+            });
+        }
+        if value.contains('\n') || value.contains('\r') {
+            return Err(HepaArtifactWriteError::InvalidRecord {
+                field: field.to_string(),
+                message: "must be a single line".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_stable_json<T>(path: &Path, value: &T) -> Result<(), HepaArtifactWriteError>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut json = serde_json::to_string_pretty(value)?;
+    if !json.ends_with('\n') {
+        json.push('\n');
+    }
+    let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, json)?;
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn artifact_layout_defines_expected_control_and_archive_paths() {
@@ -283,6 +491,12 @@ mod tests {
             )
         );
         assert_eq!(
+            lane.current_state,
+            PathBuf::from(
+                ".hepa/control/runs/run-20260616-001/tasks/task-docs/lanes/lane-a/state/current.json"
+            )
+        );
+        assert_eq!(
             lane.timing_record,
             PathBuf::from(
                 ".hepa/control/runs/run-20260616-001/tasks/task-docs/lanes/lane-a/timing.json"
@@ -319,5 +533,99 @@ mod tests {
         assert!(layout.run("run-1", "task/1").is_err());
         assert!(layout.run("run-1", "task\\1").is_err());
         assert!(layout.run("run-1", "task\n1").is_err());
+    }
+
+    #[test]
+    fn transition_state_writes_machine_readable_current_and_history() {
+        let root = unique_test_dir("state-writes");
+        let control = root.join("control");
+        let archive = root.join("archive");
+        let layout = HepaArtifactLayout::new(&control, &archive).expect("valid layout");
+        let lane = layout
+            .run("run-1", "task-1")
+            .expect("valid run")
+            .lane("lane-1")
+            .expect("valid lane");
+
+        let first = HepaStateTransitionRecord::lane(
+            "run-1",
+            "task-1",
+            "lane-1",
+            "001-allocated",
+            None::<String>,
+            "allocated",
+            "2026-06-16T00:00:00Z",
+        );
+        let second = HepaStateTransitionRecord::lane(
+            "run-1",
+            "task-1",
+            "lane-1",
+            "002-running",
+            Some("allocated"),
+            "running",
+            "2026-06-16T00:00:01Z",
+        )
+        .with_reason("worker started");
+
+        lane.write_transition_state(&first)
+            .expect("first transition writes");
+        let receipt = lane
+            .write_transition_state(&second)
+            .expect("second transition writes");
+
+        let first_json = fs::read_to_string(lane.transition_record("001-allocated").unwrap())
+            .expect("first transition exists");
+        let second_json =
+            fs::read_to_string(receipt.transition_path).expect("second transition exists");
+        let current_json =
+            fs::read_to_string(receipt.current_state_path).expect("current state exists");
+
+        assert!(first_json.contains("\"to_state\": \"allocated\""));
+        assert!(second_json.contains("\"reason\": \"worker started\""));
+        assert_eq!(current_json, second_json);
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn transition_state_rejects_records_for_other_lanes() {
+        let root = unique_test_dir("state-rejects");
+        let layout =
+            HepaArtifactLayout::new(root.join("control"), root.join("archive")).expect("valid");
+        let lane = layout
+            .run("run-1", "task-1")
+            .expect("valid run")
+            .lane("lane-1")
+            .expect("valid lane");
+        let record = HepaStateTransitionRecord::lane(
+            "run-1",
+            "task-1",
+            "lane-2",
+            "001-allocated",
+            None::<String>,
+            "allocated",
+            "2026-06-16T00:00:00Z",
+        );
+
+        assert!(matches!(
+            lane.write_transition_state(&record),
+            Err(HepaArtifactWriteError::InvalidRecord { .. })
+        ));
+
+        remove_test_dir(root);
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("hepa-artifacts-{label}-{nonce}"))
+    }
+
+    fn remove_test_dir(root: PathBuf) {
+        if root.exists() {
+            fs::remove_dir_all(root).expect("test dir cleanup");
+        }
     }
 }
