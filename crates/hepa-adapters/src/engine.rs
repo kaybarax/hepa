@@ -402,6 +402,49 @@ printf 'worker stderr' >&2
     }
 
     #[test]
+    fn oneshot_executor_reports_fake_binary_failure() {
+        let root = unique_test_dir("oneshot-failure");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("fake-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+printf 'failure stdout'
+printf 'failure stderr' >&2
+exit 7
+"#,
+        );
+        let output_file = artifact_dir.join("failure.json");
+        let invocation = HepaOneshotAdapterInvocation {
+            spec: adapter_spec(
+                "worker-primary",
+                vec![HepaAdapterRole::Worker],
+                format!("{} --output {{output_file}}", script.display()),
+                None,
+                Vec::new(),
+            ),
+            role: HepaAdapterRole::Worker,
+            context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "Worker prompt from task spec".to_string(),
+            environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy::default(),
+        };
+
+        let result = HepaOneshotAdapterExecutor::new()
+            .run(&invocation)
+            .expect("adapter process should complete with failure status");
+
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.stdout, "failure stdout");
+        assert_eq!(result.stderr, "failure stderr");
+
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn oneshot_executor_blocks_manager_credentials_for_worker_and_reviewer() {
         for (role, label) in [
             (HepaAdapterRole::Worker, "worker"),
