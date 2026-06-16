@@ -68,6 +68,100 @@ impl HepaWorktreeAllocator {
         Ok(allocation)
     }
 
+    pub fn cleanup_lane(
+        &self,
+        lane_id: impl Into<String>,
+        cleaned_at: impl Into<String>,
+    ) -> Result<HepaWorktreeCleanupReport, HepaWorktreeError> {
+        let lane_id = lane_id.into();
+        let cleaned_at = cleaned_at.into();
+        require_single_line("cleaned_at", &cleaned_at)?;
+        let worktree_path = self.worktree_root.join(&lane_id);
+        let metadata_path = worktree_path.join(WORKTREE_METADATA_FILE);
+        let mut metadata = read_metadata(&metadata_path)?;
+        require_lane_metadata("lane_id", &lane_id, &metadata)?;
+        require_manager_branch(&metadata.branch)?;
+
+        if !worktree_is_clean_except_metadata(&worktree_path)? {
+            return Ok(HepaWorktreeCleanupReport {
+                lane_id,
+                branch: metadata.branch,
+                worktree_path,
+                status: HepaWorktreeCleanupStatus::PreservedDirty,
+            });
+        }
+
+        metadata.cleanup.status = HepaWorktreeCleanupStatus::Cleaned;
+        metadata.cleanup.cleaned_at = Some(cleaned_at);
+        write_stable_json(&metadata_path, &metadata)?;
+
+        self.git_output([
+            "worktree",
+            "remove",
+            "--force",
+            path_to_str("worktree_path", &worktree_path)?,
+        ])?;
+        self.git_output(["branch", "-D", &metadata.branch])?;
+
+        Ok(HepaWorktreeCleanupReport {
+            lane_id,
+            branch: metadata.branch,
+            worktree_path,
+            status: HepaWorktreeCleanupStatus::Cleaned,
+        })
+    }
+
+    pub fn mark_lane_stale(
+        &self,
+        lane_id: impl Into<String>,
+        prune_after: impl Into<String>,
+    ) -> Result<HepaWorktreeMetadata, HepaWorktreeError> {
+        let lane_id = lane_id.into();
+        let prune_after = prune_after.into();
+        require_single_line("prune_after", &prune_after)?;
+        let metadata_path = self
+            .worktree_root
+            .join(&lane_id)
+            .join(WORKTREE_METADATA_FILE);
+        let mut metadata = read_metadata(&metadata_path)?;
+        require_lane_metadata("lane_id", &lane_id, &metadata)?;
+        metadata.cleanup.status = HepaWorktreeCleanupStatus::Stale;
+        metadata.cleanup.prune_after = Some(prune_after);
+        write_stable_json(&metadata_path, &metadata)?;
+        Ok(metadata)
+    }
+
+    pub fn prune_stale_leases(
+        &self,
+        now: impl Into<String>,
+        cleaned_at: impl Into<String>,
+    ) -> Result<Vec<HepaWorktreeCleanupReport>, HepaWorktreeError> {
+        let now = now.into();
+        let cleaned_at = cleaned_at.into();
+        require_single_line("now", &now)?;
+        require_single_line("cleaned_at", &cleaned_at)?;
+        let mut reports = Vec::new();
+        if !self.worktree_root.exists() {
+            return Ok(reports);
+        }
+        for entry in fs::read_dir(&self.worktree_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let metadata_path = entry.path().join(WORKTREE_METADATA_FILE);
+            if !metadata_path.exists() {
+                continue;
+            }
+            let metadata = read_metadata(&metadata_path)?;
+            if metadata.is_prunable_at(&now) {
+                reports.push(self.cleanup_lane(metadata.lane_id, &cleaned_at)?);
+            }
+        }
+        reports.sort_by(|left, right| left.lane_id.cmp(&right.lane_id));
+        Ok(reports)
+    }
+
     fn git_output<const N: usize>(&self, args: [&str; N]) -> Result<String, HepaWorktreeError> {
         let output = Command::new("git")
             .arg("-C")
@@ -122,13 +216,14 @@ impl HepaWorktreeAllocation {
     }
 
     fn write_metadata(&self, created_at: impl Into<String>) -> Result<PathBuf, HepaWorktreeError> {
-        let metadata_path = self.worktree_path.join(".hepa-worktree.json");
+        let metadata_path = self.worktree_path.join(WORKTREE_METADATA_FILE);
         write_stable_json(&metadata_path, &self.metadata(created_at))?;
         Ok(metadata_path)
     }
 }
 
 pub const WORKTREE_METADATA_SCHEMA_VERSION: u32 = 1;
+pub const WORKTREE_METADATA_FILE: &str = ".hepa-worktree.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaWorktreeMetadata {
@@ -138,6 +233,17 @@ pub struct HepaWorktreeMetadata {
     pub base_commit: String,
     pub worktree_ref: String,
     pub cleanup: HepaWorktreeCleanupMetadata,
+}
+
+impl HepaWorktreeMetadata {
+    fn is_prunable_at(&self, now: &str) -> bool {
+        matches!(self.cleanup.status, HepaWorktreeCleanupStatus::Stale)
+            && self
+                .cleanup
+                .prune_after
+                .as_deref()
+                .is_some_and(|prune_after| prune_after <= now)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +260,15 @@ pub enum HepaWorktreeCleanupStatus {
     Active,
     Cleaned,
     Stale,
+    PreservedDirty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaWorktreeCleanupReport {
+    pub lane_id: String,
+    pub branch: String,
+    pub worktree_path: PathBuf,
+    pub status: HepaWorktreeCleanupStatus,
 }
 
 #[derive(Debug)]
@@ -222,6 +337,70 @@ where
     }
     fs::write(path, json)?;
     Ok(())
+}
+
+fn read_metadata(path: &Path) -> Result<HepaWorktreeMetadata, HepaWorktreeError> {
+    let metadata = serde_json::from_str(&fs::read_to_string(path)?)?;
+    Ok(metadata)
+}
+
+fn require_lane_metadata(
+    field: &str,
+    expected_lane_id: &str,
+    metadata: &HepaWorktreeMetadata,
+) -> Result<(), HepaWorktreeError> {
+    if metadata.schema_version != WORKTREE_METADATA_SCHEMA_VERSION {
+        return Err(HepaWorktreeError::new(
+            "schema_version",
+            format!("must be {WORKTREE_METADATA_SCHEMA_VERSION}"),
+        ));
+    }
+    if metadata.lane_id != expected_lane_id {
+        return Err(HepaWorktreeError::new(
+            field,
+            "metadata lane does not match requested lane",
+        ));
+    }
+    require_single_line("branch", &metadata.branch)?;
+    require_single_line("base_commit", &metadata.base_commit)?;
+    require_single_line("worktree_ref", &metadata.worktree_ref)?;
+    require_single_line("cleanup.created_at", &metadata.cleanup.created_at)?;
+    if let Some(cleaned_at) = &metadata.cleanup.cleaned_at {
+        require_single_line("cleanup.cleaned_at", cleaned_at)?;
+    }
+    if let Some(prune_after) = &metadata.cleanup.prune_after {
+        require_single_line("cleanup.prune_after", prune_after)?;
+    }
+    Ok(())
+}
+
+fn require_manager_branch(branch: &str) -> Result<(), HepaWorktreeError> {
+    if !branch.starts_with("hepa/manager/") {
+        return Err(HepaWorktreeError::new(
+            "branch",
+            "cleanup only manages HEPA manager-owned branches",
+        ));
+    }
+    Ok(())
+}
+
+fn worktree_is_clean_except_metadata(worktree_path: &Path) -> Result<bool, HepaWorktreeError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()?;
+    if !output.status.success() {
+        return Err(HepaWorktreeError::new(
+            "git",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let status = String::from_utf8_lossy(&output.stdout);
+    Ok(status.lines().all(|line| {
+        line.strip_prefix("?? ")
+            .is_some_and(|path| path == WORKTREE_METADATA_FILE)
+    }))
 }
 
 #[cfg(test)]
@@ -327,6 +506,104 @@ mod tests {
         remove_test_dir(root);
     }
 
+    #[test]
+    fn cleanup_lane_removes_worktree_and_manager_branch() {
+        let root = unique_test_dir("cleanup");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        init_repo(&repo);
+        let allocator = HepaWorktreeAllocator::new(&repo, &worktrees);
+        let allocation = allocator
+            .allocate_lane_with_metadata("lane-a", "2026-06-16T00:00:00Z")
+            .expect("allocation should succeed");
+
+        let report = allocator
+            .cleanup_lane("lane-a", "2026-06-16T00:00:01Z")
+            .expect("cleanup should succeed");
+
+        assert_eq!(report.status, HepaWorktreeCleanupStatus::Cleaned);
+        assert!(!allocation.worktree_path.exists());
+        assert!(!branch_exists(&repo, "hepa/manager/lane-a"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn cleanup_lane_preserves_dirty_worktree_changes() {
+        let root = unique_test_dir("cleanup-dirty");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        init_repo(&repo);
+        let allocator = HepaWorktreeAllocator::new(&repo, &worktrees);
+        let allocation = allocator
+            .allocate_lane_with_metadata("lane-a", "2026-06-16T00:00:00Z")
+            .expect("allocation should succeed");
+        fs::write(allocation.worktree_path.join("notes.md"), "human change\n")
+            .expect("dirty worktree file write");
+
+        let report = allocator
+            .cleanup_lane("lane-a", "2026-06-16T00:00:01Z")
+            .expect("cleanup should inspect dirty worktree");
+
+        assert_eq!(report.status, HepaWorktreeCleanupStatus::PreservedDirty);
+        assert!(allocation.worktree_path.exists());
+        assert!(branch_exists(&repo, "hepa/manager/lane-a"));
+        assert_eq!(
+            fs::read_to_string(allocation.worktree_path.join("notes.md"))
+                .expect("dirty worktree file remains"),
+            "human change\n"
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn stale_lease_pruning_removes_due_clean_worktrees_only() {
+        let root = unique_test_dir("prune");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        init_repo(&repo);
+        let allocator = HepaWorktreeAllocator::new(&repo, &worktrees);
+        let due = allocator
+            .allocate_lane_with_metadata("lane-due", "2026-06-16T00:00:00Z")
+            .expect("due allocation should succeed");
+        let future = allocator
+            .allocate_lane_with_metadata("lane-future", "2026-06-16T00:00:00Z")
+            .expect("future allocation should succeed");
+        let dirty = allocator
+            .allocate_lane_with_metadata("lane-dirty", "2026-06-16T00:00:00Z")
+            .expect("dirty allocation should succeed");
+        fs::write(dirty.worktree_path.join("notes.md"), "preserve me\n")
+            .expect("dirty worktree file write");
+        allocator
+            .mark_lane_stale("lane-due", "2026-06-16T00:00:01Z")
+            .expect("mark due stale");
+        allocator
+            .mark_lane_stale("lane-future", "2026-06-16T00:01:00Z")
+            .expect("mark future stale");
+        allocator
+            .mark_lane_stale("lane-dirty", "2026-06-16T00:00:01Z")
+            .expect("mark dirty stale");
+
+        let reports = allocator
+            .prune_stale_leases("2026-06-16T00:00:30Z", "2026-06-16T00:00:31Z")
+            .expect("prune should succeed");
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].lane_id, "lane-dirty");
+        assert_eq!(reports[0].status, HepaWorktreeCleanupStatus::PreservedDirty);
+        assert_eq!(reports[1].lane_id, "lane-due");
+        assert_eq!(reports[1].status, HepaWorktreeCleanupStatus::Cleaned);
+        assert!(!due.worktree_path.exists());
+        assert!(future.worktree_path.exists());
+        assert!(dirty.worktree_path.exists());
+        assert!(!branch_exists(&repo, "hepa/manager/lane-due"));
+        assert!(branch_exists(&repo, "hepa/manager/lane-future"));
+        assert!(branch_exists(&repo, "hepa/manager/lane-dirty"));
+
+        remove_test_dir(root);
+    }
+
     fn init_repo(repo: &Path) {
         fs::create_dir_all(repo).expect("repo dir");
         git(repo, ["init"]);
@@ -364,6 +641,17 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", branch])
+            .output()
+            .expect("git should run")
+            .status
+            .success()
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
