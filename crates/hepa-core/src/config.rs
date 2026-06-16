@@ -81,6 +81,29 @@ impl HepaConfig {
         self.hermes.validate()?;
         Ok(())
     }
+
+    pub fn redacted_diagnostics(&self) -> HepaConfigDiagnostics {
+        HepaConfigDiagnostics {
+            schema_version: self.schema_version,
+            control_root: "<CONTROL_ROOT>".to_string(),
+            worktree_root: "<WORKTREE_ROOT>".to_string(),
+            archive_root: "<ARCHIVE_ROOT>".to_string(),
+            max_total_rounds: self.max_total_rounds,
+            max_repair_rounds: self.max_repair_rounds,
+            notification: HepaNotificationDiagnostics {
+                terminal_enabled: self.notification.terminal_enabled,
+                command_configured: self.notification.command.is_some(),
+            },
+            default_adapter: self.default_adapter.clone(),
+            routing_file: "<ROUTING_FILE>".to_string(),
+            hermes: HepaHermesBridgeDiagnostics {
+                enabled: self.hermes.enabled,
+                endpoint_configured: self.hermes.endpoint.is_some(),
+                board_id_configured: self.hermes.board_id.is_some(),
+                sync_interval_seconds: self.hermes.sync_interval_seconds,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +160,34 @@ impl HepaHermesBridgeConfig {
         require_positive("hermes.sync_interval_seconds", self.sync_interval_seconds)?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaConfigDiagnostics {
+    pub schema_version: u32,
+    pub control_root: String,
+    pub worktree_root: String,
+    pub archive_root: String,
+    pub max_total_rounds: u32,
+    pub max_repair_rounds: u32,
+    pub notification: HepaNotificationDiagnostics,
+    pub default_adapter: String,
+    pub routing_file: String,
+    pub hermes: HepaHermesBridgeDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaNotificationDiagnostics {
+    pub terminal_enabled: bool,
+    pub command_configured: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaHermesBridgeDiagnostics {
+    pub enabled: bool,
+    pub endpoint_configured: bool,
+    pub board_id_configured: bool,
+    pub sync_interval_seconds: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -474,5 +525,41 @@ mod tests {
         assert_eq!(config.archive_root, "<TEMP_ROOT>/case-1/archive");
         assert_eq!(config.routing_file, "<TEMP_ROOT>/case-1/routing.yaml");
         assert_eq!(config.default_adapter, "fake");
+    }
+
+    #[test]
+    fn config_diagnostics_redact_paths_and_sensitive_settings() {
+        let config = HepaConfig {
+            control_root: "PRIVATE_ROOT/control".to_string(),
+            worktree_root: "PRIVATE_ROOT/worktrees".to_string(),
+            archive_root: "PRIVATE_ROOT/archive".to_string(),
+            notification: HepaNotificationConfig {
+                terminal_enabled: true,
+                command: Some("notify --target PRIVATE_DESTINATION".to_string()),
+            },
+            routing_file: "PRIVATE_ROOT/routing.yaml".to_string(),
+            hermes: HepaHermesBridgeConfig {
+                enabled: true,
+                endpoint: Some("https://hermes.invalid/team".to_string()),
+                board_id: Some("board-private".to_string()),
+                sync_interval_seconds: 15,
+            },
+            ..HepaConfig::default()
+        };
+
+        let diagnostics = config.redacted_diagnostics();
+        let json = serde_json::to_string(&diagnostics).expect("diagnostics should serialize");
+
+        assert_eq!(diagnostics.control_root, "<CONTROL_ROOT>");
+        assert_eq!(diagnostics.worktree_root, "<WORKTREE_ROOT>");
+        assert_eq!(diagnostics.archive_root, "<ARCHIVE_ROOT>");
+        assert_eq!(diagnostics.routing_file, "<ROUTING_FILE>");
+        assert!(diagnostics.notification.command_configured);
+        assert!(diagnostics.hermes.endpoint_configured);
+        assert!(diagnostics.hermes.board_id_configured);
+        assert!(!json.contains("PRIVATE_ROOT"));
+        assert!(!json.contains("PRIVATE_DESTINATION"));
+        assert!(!json.contains("hermes.invalid"));
+        assert!(!json.contains("board-private"));
     }
 }
