@@ -1,4 +1,6 @@
 use hepa_adapters::fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput};
+#[cfg(test)]
+use hepa_core::contracts::HepaProject;
 use hepa_core::{
     artifacts::{HepaArchiveOutcome, HepaArtifactLayout, HepaStateTransitionRecord},
     contracts::{
@@ -11,6 +13,11 @@ use hepa_core::{
     lane_state::{HepaLaneTransitionRequest, transition_lane},
 };
 use hepa_git::worktree::{HepaWorktreeAllocation, HepaWorktreeAllocator};
+#[cfg(test)]
+use hepa_kanban::{
+    card_mapping::HepaHermesCardMappingInput,
+    sync::{HepaHermesCardStore, HepaKanbanSyncEngine, HepaKanbanSyncSummary},
+};
 use serde::Serialize;
 use std::{
     fs, io,
@@ -189,6 +196,39 @@ pub fn run_fake_task(config: &HepaFakeRunConfig) -> Result<HepaFakeRunResult, St
     })
 }
 
+#[cfg(test)]
+fn sync_fake_run_to_hermes_fixture(
+    config: &HepaFakeRunConfig,
+    result: &HepaFakeRunResult,
+    store: &mut dyn HepaHermesCardStore,
+) -> Result<HepaKanbanSyncSummary, String> {
+    let validation = result.terminal_report.validation.clone();
+    let input = HepaHermesCardMappingInput {
+        project: HepaProject {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            project_id: "project-1".to_string(),
+            display_name: "HEPA Fixture Project".to_string(),
+            repo_ref: "<TARGET_REPO>".to_string(),
+            default_branch: "main".to_string(),
+            routing_policy_ref: None,
+            is_active: true,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:07Z".to_string(),
+        },
+        task_spec: task_spec(config),
+        task: completed_fleet_task(config),
+        lanes: vec![completed_lane(config)],
+        readiness: Some(readiness_result(config)),
+        validation,
+        review_signals: result.terminal_report.review_signals.clone(),
+        terminal_report: Some(result.terminal_report.clone()),
+        timing: Some(result.timing.clone()),
+        blocked_questions: Vec::new(),
+    };
+
+    HepaKanbanSyncEngine::new().sync_tasks(&[input], store)
+}
+
 fn validate_config(config: &HepaFakeRunConfig) -> Result<(), String> {
     for (field, value) in [
         ("run_id", &config.run_id),
@@ -240,6 +280,15 @@ fn fleet_task(config: &HepaFakeRunConfig) -> HepaFleetTask {
     }
 }
 
+#[cfg(test)]
+fn completed_fleet_task(config: &HepaFakeRunConfig) -> HepaFleetTask {
+    let mut task = fleet_task(config);
+    task.status = HepaTaskStatus::Completed;
+    task.completed_at = Some("2026-06-16T00:00:07Z".to_string());
+    task.updated_at = "2026-06-16T00:00:07Z".to_string();
+    task
+}
+
 fn initial_lane(config: &HepaFakeRunConfig, allocation: &HepaWorktreeAllocation) -> HepaLane {
     HepaLane {
         schema_version: CONTRACT_SCHEMA_VERSION,
@@ -255,6 +304,25 @@ fn initial_lane(config: &HepaFakeRunConfig, allocation: &HepaWorktreeAllocation)
         created_at: "2026-06-16T00:00:00Z".to_string(),
         updated_at: "2026-06-16T00:00:00Z".to_string(),
         completed_at: None,
+    }
+}
+
+#[cfg(test)]
+fn completed_lane(config: &HepaFakeRunConfig) -> HepaLane {
+    HepaLane {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        lane_id: config.lane_id.clone(),
+        project_id: "project-1".to_string(),
+        task_id: config.task_id.clone(),
+        adapter_id: "fake".to_string(),
+        state: HepaLaneState::Completed,
+        worktree_ref: format!("worktree:{}", config.lane_id),
+        branch: format!("hepa/manager/{}", config.lane_id),
+        run_dir_ref: format!("control:runs/{}", config.run_id),
+        attempt_count: 1,
+        created_at: "2026-06-16T00:00:00Z".to_string(),
+        updated_at: "2026-06-16T00:00:07Z".to_string(),
+        completed_at: Some("2026-06-16T00:00:07Z".to_string()),
     }
 }
 
@@ -404,6 +472,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hepa_kanban::{card_mapping::HepaHermesFieldValue, sync::HepaMemoryHermesCardStore};
     use std::{
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
@@ -468,6 +537,51 @@ mod tests {
                 .archive_root
                 .join("runs/run-1/manifest.json")
                 .exists()
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn fake_run_syncs_to_hermes_fixture_card() {
+        let root = unique_test_dir("fake-hermes-sync");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let config = HepaFakeRunConfig {
+            repo_path: repo,
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-1".to_string(),
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            task_text: "Update docs".to_string(),
+            timing: true,
+        };
+        let result = run_fake_task(&config).expect("fake run should complete");
+        let mut store = HepaMemoryHermesCardStore::default();
+
+        let summary = sync_fake_run_to_hermes_fixture(&config, &result, &mut store)
+            .expect("fixture sync should update cards");
+
+        assert_eq!(summary.created, 1);
+        assert_eq!(summary.updated, 0);
+        let card = store
+            .card("hermes-card-1")
+            .expect("created fixture card should be stored");
+        assert_eq!(
+            card.fields.get("task_id"),
+            Some(&HepaHermesFieldValue::Text("task-1".to_string()))
+        );
+        assert_eq!(
+            card.fields.get("lane_states"),
+            Some(&HepaHermesFieldValue::List(vec![
+                "lane-1:completed".to_string()
+            ]))
+        );
+        assert_eq!(
+            card.fields.get("agent_loops"),
+            Some(&HepaHermesFieldValue::Number(1))
         );
 
         remove_test_dir(root);
