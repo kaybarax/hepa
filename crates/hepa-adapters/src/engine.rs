@@ -144,11 +144,20 @@ fn filtered_environment(invocation: &HepaOneshotAdapterInvocation) -> BTreeMap<S
         role_name(&invocation.role).to_string(),
     );
     for key in &invocation.spec.required_env {
+        if is_manager_only_env_key(key) {
+            continue;
+        }
         if let Some(value) = invocation.environment.get(key) {
             env.insert(key.clone(), value.clone());
         }
     }
     env
+}
+
+fn is_manager_only_env_key(key: &str) -> bool {
+    key == ["GITHUB", "TOKEN"].join("_")
+        || key.starts_with("HEPA_MANAGER_")
+        || key.starts_with("MANAGER_")
 }
 
 fn role_name(role: &HepaAdapterRole) -> &'static str {
@@ -306,6 +315,76 @@ printf 'worker stderr' >&2
         assert!(error.message.contains("lane worktree"));
 
         remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_blocks_manager_credentials_for_worker_and_reviewer() {
+        for (role, label) in [
+            (HepaAdapterRole::Worker, "worker"),
+            (HepaAdapterRole::Reviewer, "reviewer"),
+        ] {
+            let root = unique_test_dir(label);
+            let worktree = root.join("lane-worktree");
+            let artifact_dir = root.join("artifacts");
+            fs::create_dir_all(&worktree).expect("worktree dir");
+            fs::create_dir_all(&artifact_dir).expect("artifact dir");
+            let script = root.join("fake-adapter");
+            write_executable(
+                &script,
+                r#"#!/bin/sh
+env | sort > "$2"
+"#,
+            );
+            let output_file = artifact_dir.join(format!("{label}-env.txt"));
+            let github_token_key = ["GITHUB", "TOKEN"].join("_");
+            let command = format!("{} --output {{output_file}}", script.display());
+            let invocation = HepaOneshotAdapterInvocation {
+                spec: adapter_spec(
+                    &format!("{label}-adapter"),
+                    vec![role.clone()],
+                    command.clone(),
+                    Some(command),
+                    vec![
+                        "ALLOWED_CONTEXT".to_string(),
+                        "MANAGER_ONLY_CONTEXT".to_string(),
+                        "HEPA_MANAGER_SESSION".to_string(),
+                    ],
+                ),
+                role: role.clone(),
+                context: template_context(&worktree, &artifact_dir, &output_file),
+                environment: BTreeMap::from([
+                    ("ALLOWED_CONTEXT".to_string(), "visible".to_string()),
+                    ("MANAGER_ONLY_CONTEXT".to_string(), "blocked".to_string()),
+                    ("HEPA_MANAGER_SESSION".to_string(), "blocked".to_string()),
+                    (github_token_key.clone(), "blocked".to_string()),
+                ]),
+            };
+
+            let result = HepaOneshotAdapterExecutor::new()
+                .run(&invocation)
+                .expect("adapter should run");
+            let env_capture = fs::read_to_string(output_file).expect("env capture");
+
+            assert_eq!(result.exit_code, Some(0));
+            assert!(env_capture.contains("ALLOWED_CONTEXT=visible"));
+            assert!(env_capture.contains(&format!("HEPA_ADAPTER_ROLE={label}")));
+            assert!(!env_capture.contains("MANAGER_ONLY_CONTEXT"));
+            assert!(!env_capture.contains("HEPA_MANAGER_SESSION"));
+            assert!(!env_capture.contains(github_token_key.as_str()));
+            assert!(
+                !result
+                    .allowed_env_keys
+                    .contains(&"MANAGER_ONLY_CONTEXT".to_string())
+            );
+            assert!(
+                !result
+                    .allowed_env_keys
+                    .contains(&"HEPA_MANAGER_SESSION".to_string())
+            );
+            assert!(!result.allowed_env_keys.contains(&github_token_key));
+
+            remove_test_dir(root);
+        }
     }
 
     fn adapter_spec(
