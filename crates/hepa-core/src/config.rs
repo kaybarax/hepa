@@ -562,4 +562,38 @@ mod tests {
         assert!(!json.contains("hermes.invalid"));
         assert!(!json.contains("board-private"));
     }
+
+    #[test]
+    fn dotenv_example_documents_conservative_defaults() {
+        let dotenv_example = include_str!("../../../.env.example");
+        for key in [
+            "HEPA_CONTROL_ROOT",
+            "HEPA_WORKTREE_ROOT",
+            "HEPA_ARCHIVE_ROOT",
+            "HEPA_MAX_TOTAL_ROUNDS",
+            "HEPA_MAX_REPAIR_ROUNDS",
+            "HEPA_NOTIFY_TERMINAL",
+            "HEPA_NOTIFY_COMMAND",
+            "HEPA_DEFAULT_ADAPTER",
+            "HEPA_ROUTING_FILE",
+            "HEPA_HERMES_ENABLED",
+            "HEPA_HERMES_ENDPOINT",
+            "HEPA_HERMES_BOARD_ID",
+            "HEPA_HERMES_SYNC_INTERVAL_SECONDS",
+        ] {
+            assert!(
+                dotenv_example.contains(&format!("{key}=")),
+                "{key} missing from .env.example"
+            );
+        }
+
+        let config = HepaConfig::load(
+            Some(dotenv_example),
+            &BTreeMap::new(),
+            HepaConfigOverrides::default(),
+        )
+        .expect(".env.example should parse");
+
+        assert_eq!(config, HepaConfig::default());
+    }
 }
