@@ -149,6 +149,7 @@ pub struct HepaFleetTask {
     pub readiness: HepaReadinessState,
     pub dependencies: Vec<String>,
     pub lane_ids: Vec<String>,
+    pub external_card_id: Option<String>,
     pub priority: u32,
     pub created_at: String,
     pub updated_at: String,
@@ -163,6 +164,10 @@ impl HepaValidate for HepaFleetTask {
         require_single_line("title", &self.title)?;
         require_dependency_links("dependencies", &self.task_id, &self.dependencies)?;
         require_string_list("lane_ids", &self.lane_ids)?;
+        if let Some(external_card_id) = &self.external_card_id {
+            require_single_line("external_card_id", external_card_id)?;
+            reject_secret_like_ref("external_card_id", external_card_id)?;
+        }
         if matches!(self.status, HepaTaskStatus::Completed) && self.completed_at.is_none() {
             return Err(HepaContractError::new(
                 "completed_at",
@@ -872,6 +877,56 @@ mod tests {
 
         assert_eq!(error.field, "dependencies");
         assert!(error.message.contains("itself"));
+    }
+
+    #[test]
+    fn fleet_task_records_stable_external_card_id() {
+        let task = HepaFleetTask {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Update docs".to_string(),
+            description: "Documentation task".to_string(),
+            status: HepaTaskStatus::Queued,
+            readiness: HepaReadinessState::NotReady,
+            dependencies: Vec::new(),
+            lane_ids: Vec::new(),
+            external_card_id: Some("hermes-card-1".to_string()),
+            priority: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+            completed_at: None,
+        };
+
+        task.validate().expect("stable card IDs should validate");
+
+        let json = serde_json::to_string(&task).expect("task should serialize");
+        assert!(json.contains("\"external_card_id\":\"hermes-card-1\""));
+    }
+
+    #[test]
+    fn fleet_task_rejects_secret_like_external_card_id() {
+        let task = HepaFleetTask {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Update docs".to_string(),
+            description: "Documentation task".to_string(),
+            status: HepaTaskStatus::Queued,
+            readiness: HepaReadinessState::NotReady,
+            dependencies: Vec::new(),
+            lane_ids: Vec::new(),
+            external_card_id: Some("card-secret-ref".to_string()),
+            priority: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+            completed_at: None,
+        };
+
+        let error = task.validate().expect_err("secret-like card IDs must fail");
+
+        assert_eq!(error.field, "external_card_id");
+        assert!(error.message.contains("secret-like"));
     }
 
     #[test]

@@ -149,6 +149,9 @@ pub fn map_task_to_hermes_card(
         "lane_ids".to_string(),
         HepaHermesFieldValue::List(input.task.lane_ids.clone()),
     );
+    if let Some(external_card_id) = &input.task.external_card_id {
+        insert_text(&mut fields, "external_card_id", external_card_id);
+    }
     fields.insert(
         "acceptance_criteria".to_string(),
         HepaHermesFieldValue::List(input.task_spec.acceptance_criteria.clone()),
@@ -426,6 +429,7 @@ mod tests {
             readiness: HepaReadinessState::Ready,
             dependencies: vec!["task-0".to_string()],
             lane_ids: vec!["lane-1".to_string()],
+            external_card_id: Some("hermes-card-1".to_string()),
             priority: 10,
             created_at: "2026-06-16T00:00:00Z".to_string(),
             updated_at: "2026-06-16T00:00:00Z".to_string(),
@@ -550,6 +554,10 @@ mod tests {
         assert_eq!(
             payload.fields.get("lane_ids"),
             Some(&HepaHermesFieldValue::List(vec!["lane-1".to_string()]))
+        );
+        assert_eq!(
+            payload.fields.get("external_card_id"),
+            Some(&HepaHermesFieldValue::Text("hermes-card-1".to_string()))
         );
         assert_eq!(
             payload.fields.get("validation_status"),
