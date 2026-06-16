@@ -106,6 +106,28 @@ impl HepaRunArtifactPaths {
             final_report: lane_dir.join("final-report.json"),
         })
     }
+
+    pub fn archive_on_exit(
+        &self,
+        archived_at: impl Into<String>,
+        outcome: HepaArchiveOutcome,
+    ) -> Result<HepaArchiveManifest, HepaArtifactWriteError> {
+        let archived_at = archived_at.into();
+        require_single_line_record("archived_at", Some(&archived_at))?;
+        fs::create_dir_all(&self.archive_dir)?;
+        copy_dir_contents(&self.run_dir, &self.archive_dir)?;
+        let manifest = HepaArchiveManifest {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            run_id: self.run_id.as_str().to_string(),
+            task_id: self.task_id.as_str().to_string(),
+            outcome,
+            control_ref: format!("control:runs/{}", self.run_id.as_str()),
+            archive_ref: format!("archive:runs/{}", self.run_id.as_str()),
+            archived_at,
+        };
+        write_stable_json(&self.archive_manifest, &manifest)?;
+        Ok(manifest)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +301,27 @@ pub struct HepaStateWriteReceipt {
     pub current_state_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaArchiveManifest {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub task_id: String,
+    pub outcome: HepaArchiveOutcome,
+    pub control_ref: String,
+    pub archive_ref: String,
+    pub archived_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HepaArchiveOutcome {
+    Completed,
+    Blocked,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HepaArtifactId(String);
 
@@ -429,6 +472,28 @@ where
     let temp_path = path.with_extension("tmp");
     fs::write(&temp_path, json)?;
     fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), HepaArtifactWriteError> {
+    if !source.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_contents(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source_path, destination_path)?;
+        }
+    }
     Ok(())
 }
 
@@ -611,6 +676,65 @@ mod tests {
             lane.write_transition_state(&record),
             Err(HepaArtifactWriteError::InvalidRecord { .. })
         ));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn archive_on_exit_copies_run_artifacts_with_portable_manifest() {
+        let root = unique_test_dir("archive");
+        let layout =
+            HepaArtifactLayout::new(root.join("control"), root.join("archive")).expect("valid");
+        let run = layout.run("run-1", "task-1").expect("valid run");
+        let lane = run.lane("lane-1").expect("valid lane");
+        let record = HepaStateTransitionRecord::lane(
+            "run-1",
+            "task-1",
+            "lane-1",
+            "001-completed",
+            Some("running"),
+            "completed",
+            "2026-06-16T00:00:02Z",
+        );
+        lane.write_transition_state(&record)
+            .expect("transition should write before archive");
+
+        let manifest = run
+            .archive_on_exit("2026-06-16T00:00:03Z", HepaArchiveOutcome::Completed)
+            .expect("archive should succeed");
+        let archived_state = run
+            .archive_dir
+            .join("tasks")
+            .join("task-1")
+            .join("lanes")
+            .join("lane-1")
+            .join("state")
+            .join("current.json");
+        let manifest_json =
+            fs::read_to_string(&run.archive_manifest).expect("manifest should be written");
+
+        assert_eq!(manifest.control_ref, "control:runs/run-1");
+        assert_eq!(manifest.archive_ref, "archive:runs/run-1");
+        assert!(archived_state.exists());
+        assert!(!manifest_json.contains(root.to_string_lossy().as_ref()));
+        assert!(manifest_json.contains("\"outcome\": \"completed\""));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn archive_on_exit_accepts_interrupted_runs_without_existing_artifacts() {
+        let root = unique_test_dir("archive-empty");
+        let layout =
+            HepaArtifactLayout::new(root.join("control"), root.join("archive")).expect("valid");
+        let run = layout.run("run-1", "task-1").expect("valid run");
+
+        let manifest = run
+            .archive_on_exit("2026-06-16T00:00:03Z", HepaArchiveOutcome::Interrupted)
+            .expect("empty interrupted run archive should still produce manifest");
+
+        assert_eq!(manifest.outcome, HepaArchiveOutcome::Interrupted);
+        assert!(run.archive_manifest.exists());
 
         remove_test_dir(root);
     }
