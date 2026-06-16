@@ -208,6 +208,14 @@ pub fn map_task_to_hermes_card(
             "manager_passes".to_string(),
             HepaHermesFieldValue::Number(timing.counters.manager_passes.into()),
         );
+        fields.insert(
+            "install_events".to_string(),
+            HepaHermesFieldValue::Number(timing.counters.install_events.into()),
+        );
+        fields.insert(
+            "container_count".to_string(),
+            HepaHermesFieldValue::Number(timing.counters.container_count.into()),
+        );
     }
 
     let mut comments = vec![HepaHermesCardComment {
@@ -342,10 +350,12 @@ fn timing_comment(
     Ok(HepaHermesCardComment {
         kind: HepaHermesCommentKind::Timing,
         body: format!(
-            "Timing run: {}\nAgent loops: {}\nManager passes: {}\nPhases: {}",
+            "Timing run: {}\nAgent loops: {}\nManager passes: {}\nInstall events: {}\nContainer count: {}\nPhases: {}",
             timing.run_id,
             timing.counters.agent_loops,
             timing.counters.manager_passes,
+            timing.counters.install_events,
+            timing.counters.container_count,
             timing.phases.len()
         ),
     })
@@ -688,6 +698,14 @@ mod tests {
         assert_eq!(
             payload.fields.get("agent_loops"),
             Some(&HepaHermesFieldValue::Number(1))
+        );
+        assert_eq!(
+            payload.fields.get("install_events"),
+            Some(&HepaHermesFieldValue::Number(0))
+        );
+        assert_eq!(
+            payload.fields.get("container_count"),
+            Some(&HepaHermesFieldValue::Number(0))
         );
         assert!(
             payload

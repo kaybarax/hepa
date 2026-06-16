@@ -1,3 +1,4 @@
+use hepa_core::contracts::HepaTimingRecord;
 use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
 use hepa_kanban::spec_import::import_markdown_spec;
 use hepa_kanban::sync::{
@@ -59,13 +60,53 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             ))
         }
         [command, ..] if command == "spec" => Err("unknown spec command".to_string()),
+        [command, subcommand, path] if command == "timing" && subcommand == "summary" => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("failed to read timing file: {error}"))?;
+            let timing: HepaTimingRecord = serde_json::from_str(&text)
+                .map_err(|error| format!("failed to parse timing file: {error}"))?;
+            Ok(format_timing_summary(&timing))
+        }
+        [command, ..] if command == "timing" => Err("unknown timing command".to_string()),
         _ => Err("unknown command".to_string()),
     }
+}
+
+fn format_timing_summary(timing: &HepaTimingRecord) -> String {
+    let phases = timing
+        .phases
+        .iter()
+        .map(|phase| {
+            format!(
+                "{}={:.3}s adapter={} routing={} sandbox={}",
+                phase.name,
+                phase.duration_seconds,
+                phase.adapter_id.as_deref().unwrap_or("none"),
+                phase.routing_reason.as_deref().unwrap_or("none"),
+                phase.sandbox_posture.as_deref().unwrap_or("none")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "HEPA timing: run={} agent_loops={} manager_passes={} install_events={} container_count={} phases=[{}]",
+        timing.run_id,
+        timing.counters.agent_loops,
+        timing.counters.manager_passes,
+        timing.counters.install_events,
+        timing.counters.container_count,
+        phases
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hepa_core::contracts::{
+        CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaPhaseStatus, HepaTimingCounters,
+        HepaTimingPhase,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -95,5 +136,59 @@ mod tests {
         let error = run_cli(&args(&["spec", "import"])).expect_err("path is required");
 
         assert_eq!(error, "unknown spec command");
+    }
+
+    #[test]
+    fn timing_summary_command_prints_phase_breakdown() {
+        let path = unique_test_file("timing-summary");
+        let timing = HepaTimingRecord {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            run_id: "run-1".to_string(),
+            phases: vec![HepaTimingPhase {
+                name: "worker_attempt".to_string(),
+                status: HepaPhaseStatus::Completed,
+                duration_seconds: 1.25,
+                round: Some(1),
+                role: Some(HepaAgentRole::Worker),
+                adapter_id: Some("fake".to_string()),
+                routing_reason: Some("default fake adapter".to_string()),
+                sandbox_posture: Some("host-worktree".to_string()),
+            }],
+            counters: HepaTimingCounters {
+                agent_loops: 1,
+                manager_passes: 1,
+                reviewer_passes: 0,
+                install_events: 0,
+                container_count: 0,
+            },
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&timing).expect("timing serializes"),
+        )
+        .expect("timing file writes");
+
+        let output = run_cli(&args(&[
+            "timing",
+            "summary",
+            path.to_str().expect("test path is UTF-8"),
+        ]))
+        .expect("timing summary should run");
+
+        assert!(output.contains("HEPA timing: run=run-1"));
+        assert!(output.contains("agent_loops=1"));
+        assert!(output.contains("worker_attempt=1.250s"));
+        assert!(output.contains("routing=default fake adapter"));
+        assert!(output.contains("sandbox=host-worktree"));
+
+        std::fs::remove_file(path).expect("cleanup timing file");
+    }
+
+    fn unique_test_file(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("hepa-cli-{label}-{nonce}.json"))
     }
 }

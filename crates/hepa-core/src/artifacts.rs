@@ -1,4 +1,5 @@
 use crate::config::HepaConfig;
+use crate::contracts::{HepaTimingRecord, HepaValidate};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -201,6 +202,21 @@ impl HepaLaneArtifactPaths {
             transition_path,
             current_state_path: self.current_state.clone(),
         })
+    }
+
+    pub fn write_timing_record(
+        &self,
+        timing: &HepaTimingRecord,
+    ) -> Result<PathBuf, HepaArtifactWriteError> {
+        timing
+            .validate()
+            .map_err(|error| HepaArtifactWriteError::InvalidRecord {
+                field: error.field,
+                message: error.message,
+            })?;
+        require_matching_id("run_id", &self.run_id, &timing.run_id)?;
+        write_stable_json(&self.timing_record, timing)?;
+        Ok(self.timing_record.clone())
     }
 
     fn require_record_matches(
@@ -500,6 +516,10 @@ fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), HepaArtifa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::{
+        CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaPhaseStatus, HepaTimingCounters,
+        HepaTimingPhase,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -735,6 +755,50 @@ mod tests {
 
         assert_eq!(manifest.outcome, HepaArchiveOutcome::Interrupted);
         assert!(run.archive_manifest.exists());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn timing_records_write_to_lane_artifacts() {
+        let root = unique_test_dir("timing");
+        let layout =
+            HepaArtifactLayout::new(root.join("control"), root.join("archive")).expect("valid");
+        let lane = layout
+            .run("run-1", "task-1")
+            .expect("valid run")
+            .lane("lane-1")
+            .expect("valid lane");
+        let timing = HepaTimingRecord {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            run_id: "run-1".to_string(),
+            phases: vec![HepaTimingPhase {
+                name: "worker_attempt".to_string(),
+                status: HepaPhaseStatus::Completed,
+                duration_seconds: 1.25,
+                round: Some(1),
+                role: Some(HepaAgentRole::Worker),
+                adapter_id: Some("fake".to_string()),
+                routing_reason: Some("default fake adapter".to_string()),
+                sandbox_posture: Some("host-worktree".to_string()),
+            }],
+            counters: HepaTimingCounters {
+                agent_loops: 1,
+                manager_passes: 1,
+                reviewer_passes: 0,
+                install_events: 0,
+                container_count: 0,
+            },
+        };
+
+        let timing_path = lane
+            .write_timing_record(&timing)
+            .expect("timing should write");
+        let timing_json = fs::read_to_string(timing_path).expect("timing artifact exists");
+
+        assert!(timing_json.contains("\"run_id\": \"run-1\""));
+        assert!(timing_json.contains("\"routing_reason\": \"default fake adapter\""));
+        assert!(timing_json.contains("\"sandbox_posture\": \"host-worktree\""));
 
         remove_test_dir(root);
     }
