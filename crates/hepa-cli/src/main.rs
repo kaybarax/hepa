@@ -1,4 +1,5 @@
 use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
+use hepa_kanban::spec_import::import_markdown_spec;
 use hepa_kanban::sync::{
     HepaKanbanSyncEngine, HepaKanbanSyncStatus, HepaUnavailableHermesCardStore,
 };
@@ -48,6 +49,16 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             Ok(report.to_redacted_summary())
         }
         [command, ..] if command == "kanban" => Err("unknown kanban command".to_string()),
+        [command, subcommand, path] if command == "spec" && subcommand == "import" => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("failed to read spec file: {error}"))?;
+            let imported = import_markdown_spec(&text).map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA spec import completed: tasks={}",
+                imported.tasks.len()
+            ))
+        }
+        [command, ..] if command == "spec" => Err("unknown spec command".to_string()),
         _ => Err("unknown command".to_string()),
     }
 }
@@ -77,5 +88,12 @@ mod tests {
         assert!(output.contains("HEPA kanban doctor: degraded"));
         assert!(output.contains("cli=missing"));
         assert!(output.contains("board=missing"));
+    }
+
+    #[test]
+    fn spec_import_command_reports_usage_for_missing_path() {
+        let error = run_cli(&args(&["spec", "import"])).expect_err("path is required");
+
+        assert_eq!(error, "unknown spec command");
     }
 }
