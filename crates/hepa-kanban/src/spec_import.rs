@@ -392,4 +392,30 @@ Dependencies:
         assert_eq!(cards[1].title, "Review docs");
         assert_eq!(imported.tasks[1].task_spec.dependencies, vec!["task-1"]);
     }
+
+    #[test]
+    fn dependency_ordering_is_preserved() {
+        let imported = import_markdown_spec(
+            r#"
+Project: project-1
+## Task: task-3: Combine work
+Acceptance:
+- Combined work is ready.
+Dependencies:
+- task-1
+- task-2
+- task-0
+"#,
+        )
+        .expect("spec should import");
+
+        assert_eq!(
+            imported.tasks[0].task_spec.dependencies,
+            vec!["task-1", "task-2", "task-0"]
+        );
+        assert_eq!(
+            imported.tasks[0].fleet_task.dependencies,
+            vec!["task-1", "task-2", "task-0"]
+        );
+    }
 }
