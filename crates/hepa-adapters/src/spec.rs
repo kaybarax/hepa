@@ -36,15 +36,20 @@ impl HepaAdapterSpec {
             ));
         }
         require_non_empty("command", &self.command)?;
+        reject_secret_like("command", &self.command)?;
         validate_template_placeholders("command", &self.command)?;
         if let Some(review_command) = &self.review_command {
             require_non_empty("review_command", review_command)?;
+            reject_secret_like("review_command", review_command)?;
             validate_template_placeholders("review_command", review_command)?;
         }
         require_non_empty("workdir", &self.workdir)?;
+        reject_secret_like("workdir", &self.workdir)?;
         validate_template_placeholders("workdir", &self.workdir)?;
         require_string_list("required_commands", &self.required_commands)?;
+        reject_secret_like_list("required_commands", &self.required_commands)?;
         require_string_list("required_env", &self.required_env)?;
+        reject_secret_like_list("required_env", &self.required_env)?;
         require_string_list("capabilities", &self.capabilities)?;
         if self.resource_weight == 0 {
             return Err(HepaAdapterSpecError::new(
@@ -232,6 +237,40 @@ fn require_string_list(field: &str, values: &[String]) -> Result<(), HepaAdapter
         require_single_line(format!("{field}[{index}]"), value)?;
     }
     Ok(())
+}
+
+fn reject_secret_like_list(field: &str, values: &[String]) -> Result<(), HepaAdapterSpecError> {
+    for (index, value) in values.iter().enumerate() {
+        reject_secret_like(format!("{field}[{index}]"), value)?;
+    }
+    Ok(())
+}
+
+fn reject_secret_like(field: impl Into<String>, value: &str) -> Result<(), HepaAdapterSpecError> {
+    let lowered = value.to_ascii_lowercase();
+    let github_token_prefix = ["ghp", "_"].concat();
+    let secret_like = lowered.contains(&github_token_prefix)
+        || [
+            ".env",
+            "api_key",
+            "apikey",
+            "credential",
+            "id_rsa",
+            "password",
+            "private_key",
+            "secret",
+            "token",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+    if secret_like {
+        Err(HepaAdapterSpecError::new(
+            field,
+            "must not contain secret-like values",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,5 +489,36 @@ mod tests {
 
         assert_eq!(error.field, "command");
         assert!(error.message.contains("missing_placeholder"));
+    }
+
+    #[test]
+    fn secret_like_adapter_spec_values_are_rejected() {
+        let secret_env_name = ["GITHUB", "TOKEN"].join("_");
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "worker-primary".to_string(),
+            display_name: "Primary Worker Adapter".to_string(),
+            roles: vec![HepaAdapterRole::Worker],
+            mode: HepaAdapterMode::Oneshot,
+            command: "agent --prompt-file {prompt_file}".to_string(),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: vec!["agent".to_string()],
+            required_env: vec![secret_env_name],
+            sandbox: HepaAdapterSandbox::AgentNative,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec!["docs".to_string()],
+            cost_class: HepaAdapterCostClass::PaidCloud,
+            resource_weight: 1,
+            max_concurrency: 2,
+        };
+
+        let error = spec
+            .validate()
+            .expect_err("secret-like env names must fail");
+
+        assert_eq!(error.field, "required_env[0]");
+        assert!(error.message.contains("secret-like"));
     }
 }
