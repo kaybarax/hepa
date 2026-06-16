@@ -19,6 +19,7 @@ pub struct HepaImportedSpec {
 pub struct HepaImportedTask {
     pub task_spec: HepaTaskSpec,
     pub fleet_task: HepaFleetTask,
+    pub blocked_questions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +80,10 @@ pub fn import_markdown_spec(markdown: &str) -> Result<HepaImportedSpec, HepaSpec
             section = TaskSection::Dependencies;
             continue;
         }
+        if line.eq_ignore_ascii_case("Questions:") {
+            section = TaskSection::Questions;
+            continue;
+        }
 
         let Some(task) = current.as_mut() else {
             continue;
@@ -97,6 +102,10 @@ pub fn import_markdown_spec(markdown: &str) -> Result<HepaImportedSpec, HepaSpec
             }
             TaskSection::Dependencies => {
                 task.dependencies.push(strip_list_marker(line).to_string());
+            }
+            TaskSection::Questions => {
+                task.blocked_questions
+                    .push(strip_list_marker(line).to_string());
             }
         }
     }
@@ -136,7 +145,7 @@ pub fn imported_spec_to_draft_cards(
                 review_signals: Vec::new(),
                 terminal_report: None,
                 timing: None,
-                blocked_questions: Vec::new(),
+                blocked_questions: task.blocked_questions.clone(),
             };
             map_task_to_hermes_card(&input)
                 .map_err(|error| HepaSpecImportError::new("card_mapping", error.to_string()))
@@ -150,6 +159,7 @@ enum TaskSection {
     Acceptance,
     Validation,
     Dependencies,
+    Questions,
 }
 
 #[derive(Debug)]
@@ -160,6 +170,7 @@ struct TaskBuilder {
     acceptance_criteria: Vec<String>,
     validation_commands: Vec<String>,
     dependencies: Vec<String>,
+    blocked_questions: Vec<String>,
 }
 
 impl TaskBuilder {
@@ -171,11 +182,12 @@ impl TaskBuilder {
             acceptance_criteria: Vec::new(),
             validation_commands: Vec::new(),
             dependencies: Vec::new(),
+            blocked_questions: Vec::new(),
         }
     }
 
     fn finish(self, project_id: &str) -> Result<HepaImportedTask, HepaSpecImportError> {
-        if self.acceptance_criteria.is_empty() {
+        if self.acceptance_criteria.is_empty() && self.blocked_questions.is_empty() {
             return Err(HepaSpecImportError::new(
                 format!("{}.acceptance_criteria", self.task_id),
                 "task must include acceptance criteria",
@@ -209,7 +221,11 @@ impl TaskBuilder {
             title: self.title,
             description: goal,
             status: HepaTaskStatus::Draft,
-            readiness: HepaReadinessState::NotReady,
+            readiness: if self.blocked_questions.is_empty() {
+                HepaReadinessState::NotReady
+            } else {
+                HepaReadinessState::Blocked
+            },
             dependencies: self.dependencies,
             lane_ids: Vec::new(),
             external_card_id: None,
@@ -221,6 +237,7 @@ impl TaskBuilder {
         Ok(HepaImportedTask {
             task_spec,
             fleet_task,
+            blocked_questions: self.blocked_questions,
         })
     }
 }
@@ -416,6 +433,36 @@ Dependencies:
         assert_eq!(
             imported.tasks[0].fleet_task.dependencies,
             vec!["task-1", "task-2", "task-0"]
+        );
+    }
+
+    #[test]
+    fn ambiguous_tasks_block_with_questions_instead_of_launching() {
+        let imported = import_markdown_spec(
+            r#"
+Project: project-1
+## Task: task-1: Clarify feature
+Questions:
+- Which user flow should this cover?
+"#,
+        )
+        .expect("ambiguous task with questions should import");
+        let cards = imported_spec_to_draft_cards(project(), &imported)
+            .expect("ambiguous imported task should create card");
+        let task = &imported.tasks[0];
+
+        assert_eq!(task.fleet_task.status, HepaTaskStatus::Draft);
+        assert_eq!(task.fleet_task.readiness, HepaReadinessState::Blocked);
+        assert!(task.fleet_task.lane_ids.is_empty());
+        assert_eq!(
+            task.blocked_questions,
+            vec!["Which user flow should this cover?"]
+        );
+        assert!(
+            cards[0]
+                .comments
+                .iter()
+                .any(|comment| comment.body.contains("Which user flow"))
         );
     }
 }
