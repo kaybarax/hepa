@@ -689,6 +689,21 @@ mod tests {
     }
 
     #[test]
+    fn card_mapping_round_trips_through_fixture_payload() {
+        let payload = map_task_to_hermes_card(&sample_input()).expect("mapping should succeed");
+        let fixture_json =
+            serde_json::to_string_pretty(&payload).expect("fixture payload should serialize");
+        let round_trip: HepaHermesCardPayload =
+            serde_json::from_str(&fixture_json).expect("fixture payload should deserialize");
+
+        assert_eq!(round_trip, payload);
+        assert_eq!(
+            round_trip.fields.keys().next().map(String::as_str),
+            Some("acceptance_criteria")
+        );
+    }
+
+    #[test]
     fn card_mapping_rejects_mismatched_lane_task() {
         let mut input = sample_input();
         input.lanes[0].task_id = "other-task".to_string();
