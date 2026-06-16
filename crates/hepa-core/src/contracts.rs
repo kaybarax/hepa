@@ -1,6 +1,43 @@
 use serde::{Deserialize, Serialize};
+use std::{error::Error, fmt};
 
 pub const CONTRACT_SCHEMA_VERSION: u32 = 1;
+
+pub type HepaContractResult = Result<(), HepaContractError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaContractError {
+    pub field: String,
+    pub message: String,
+}
+
+impl HepaContractError {
+    fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for HepaContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.field, self.message)
+    }
+}
+
+impl Error for HepaContractError {}
+
+pub trait HepaValidate {
+    fn validate(&self) -> HepaContractResult;
+}
+
+pub fn validate_contract<T>(value: &T) -> HepaContractResult
+where
+    T: HepaValidate,
+{
+    value.validate()
+}
 
 pub fn to_stable_json<T>(value: &T) -> Result<String, serde_json::Error>
 where
@@ -36,6 +73,22 @@ pub struct HepaProject {
     pub updated_at: String,
 }
 
+impl HepaValidate for HepaProject {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("project_id", &self.project_id)?;
+        require_non_empty("display_name", &self.display_name)?;
+        require_single_line("repo_ref", &self.repo_ref)?;
+        reject_secret_like_ref("repo_ref", &self.repo_ref)?;
+        require_single_line("default_branch", &self.default_branch)?;
+        if let Some(routing_policy_ref) = &self.routing_policy_ref {
+            require_single_line("routing_policy_ref", routing_policy_ref)?;
+            reject_secret_like_ref("routing_policy_ref", routing_policy_ref)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaTaskSpec {
     pub schema_version: u32,
@@ -51,6 +104,30 @@ pub struct HepaTaskSpec {
     pub risk_level: HepaRiskLevel,
     pub max_total_rounds: u32,
     pub created_at: String,
+}
+
+impl HepaValidate for HepaTaskSpec {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("project_id", &self.project_id)?;
+        require_non_empty("goal", &self.goal)?;
+        require_string_list("non_goals", &self.non_goals)?;
+        require_string_list("expected_areas", &self.expected_areas)?;
+        require_string_list("acceptance_criteria", &self.acceptance_criteria)?;
+        require_string_list("validation_commands", &self.validation_commands)?;
+        require_dependency_links("dependencies", &self.task_id, &self.dependencies)?;
+        if let Some(target_branch) = &self.target_branch {
+            require_single_line("target_branch", target_branch)?;
+        }
+        if self.max_total_rounds == 0 {
+            return Err(HepaContractError::new(
+                "max_total_rounds",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +155,24 @@ pub struct HepaFleetTask {
     pub completed_at: Option<String>,
 }
 
+impl HepaValidate for HepaFleetTask {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("project_id", &self.project_id)?;
+        require_single_line("title", &self.title)?;
+        require_dependency_links("dependencies", &self.task_id, &self.dependencies)?;
+        require_string_list("lane_ids", &self.lane_ids)?;
+        if matches!(self.status, HepaTaskStatus::Completed) && self.completed_at.is_none() {
+            return Err(HepaContractError::new(
+                "completed_at",
+                "completed tasks must record completion time",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaTaskStatus {
@@ -88,6 +183,20 @@ pub enum HepaTaskStatus {
     Blocked,
     Cancelled,
     Completed,
+}
+
+impl HepaTaskStatus {
+    pub fn can_transition_to(&self, next: &Self) -> bool {
+        use HepaTaskStatus::*;
+        matches!(
+            (self, next),
+            (Draft, Queued | Blocked | Cancelled)
+                | (Queued, Ready | Blocked | Cancelled)
+                | (Ready, Running | Blocked | Cancelled)
+                | (Running, Blocked | Completed | Cancelled)
+                | (Blocked, Queued | Ready | Cancelled)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +225,32 @@ pub struct HepaLane {
     pub completed_at: Option<String>,
 }
 
+impl HepaValidate for HepaLane {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("project_id", &self.project_id)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("adapter_id", &self.adapter_id)?;
+        require_single_line("worktree_ref", &self.worktree_ref)?;
+        reject_secret_like_ref("worktree_ref", &self.worktree_ref)?;
+        require_single_line("branch", &self.branch)?;
+        require_single_line("run_dir_ref", &self.run_dir_ref)?;
+        reject_secret_like_ref("run_dir_ref", &self.run_dir_ref)?;
+        if matches!(
+            self.state,
+            HepaLaneState::Completed | HepaLaneState::Cleaned
+        ) && self.completed_at.is_none()
+        {
+            return Err(HepaContractError::new(
+                "completed_at",
+                "terminal lanes must record completion time",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaLaneState {
@@ -134,6 +269,36 @@ pub enum HepaLaneState {
     Completed,
 }
 
+impl HepaLaneState {
+    pub fn can_transition_to(&self, next: &Self) -> bool {
+        use HepaLaneState::*;
+        matches!(
+            (self, next),
+            (Allocated, Starting | Blocked | Failed | Cleaned)
+                | (Starting, Running | Blocked | Failed | Cleaned)
+                | (Running, Validating | Blocked | Failed | Cleaned)
+                | (
+                    Validating,
+                    Reviewing | Repairing | Blocked | Failed | Cleaned
+                )
+                | (
+                    Reviewing,
+                    Repairing | NeedsHumanStaging | Blocked | Failed | Cleaned
+                )
+                | (Repairing, Running | Validating | Blocked | Failed | Cleaned)
+                | (NeedsHumanStaging, PrReady | Blocked | Failed | Cleaned)
+                | (
+                    PrReady,
+                    ReadyForHuman | Completed | Blocked | Failed | Cleaned
+                )
+                | (ReadyForHuman, Completed | Blocked | Failed | Cleaned)
+                | (Blocked, Running | Repairing | Cleaned)
+                | (Failed, Repairing | Cleaned)
+                | (Completed, Cleaned)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaAttemptReport {
     pub schema_version: u32,
@@ -150,6 +315,32 @@ pub struct HepaAttemptReport {
     pub blocked_reason: Option<String>,
     pub started_at: String,
     pub completed_at: Option<String>,
+}
+
+impl HepaValidate for HepaAttemptReport {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("attempt_id", &self.attempt_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("adapter_id", &self.adapter_id)?;
+        require_string_list("commands_run", &self.commands_run)?;
+        require_string_list("changed_files", &self.changed_files)?;
+        for changed_file in &self.changed_files {
+            reject_secret_like_ref("changed_files", changed_file)?;
+        }
+        if matches!(
+            self.status,
+            HepaAttemptStatus::Blocked | HepaAttemptStatus::Failed
+        ) && self.blocked_reason.is_none()
+        {
+            return Err(HepaContractError::new(
+                "blocked_reason",
+                "blocked or failed attempts must record a reason",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +367,22 @@ pub struct HepaValidationSummary {
     pub no_tests_detected: bool,
     pub failure_type: Option<String>,
     pub summary: Vec<String>,
+}
+
+impl HepaValidate for HepaValidationSummary {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        for (index, command) in self.commands.iter().enumerate() {
+            require_single_line(format!("commands[{index}].command"), &command.command)?;
+        }
+        if matches!(self.status, HepaValidationStatus::NoTestsDetected) && !self.no_tests_detected {
+            return Err(HepaContractError::new(
+                "no_tests_detected",
+                "must be true when status is no_tests_detected",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +413,19 @@ pub struct HepaReviewSignal {
     pub completed_at: String,
 }
 
+impl HepaValidate for HepaReviewSignal {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("review_id", &self.review_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("adapter_id", &self.adapter_id)?;
+        for finding in &self.findings {
+            finding.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaReviewStatus {
@@ -223,6 +443,18 @@ pub struct HepaReviewFinding {
     pub line: Option<u32>,
     pub message: String,
     pub accepted: bool,
+}
+
+impl HepaValidate for HepaReviewFinding {
+    fn validate(&self) -> HepaContractResult {
+        require_single_line("finding_id", &self.finding_id)?;
+        if let Some(file_ref) = &self.file_ref {
+            require_single_line("file_ref", file_ref)?;
+            reject_secret_like_ref("file_ref", file_ref)?;
+        }
+        require_non_empty("message", &self.message)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +476,27 @@ pub struct HepaReadinessResult {
     pub checked_at: String,
 }
 
+impl HepaValidate for HepaReadinessResult {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_string_list("blockers", &self.blockers)?;
+        require_string_list("questions", &self.questions)?;
+        if matches!(
+            self.status,
+            HepaReadinessStatus::NeedsClarification | HepaReadinessStatus::Blocked
+        ) && self.blockers.is_empty()
+            && self.questions.is_empty()
+        {
+            return Err(HepaContractError::new(
+                "status",
+                "not-ready readiness results must include a blocker or question",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaReadinessStatus {
@@ -260,6 +513,17 @@ pub struct HepaTimingRecord {
     pub counters: HepaTimingCounters,
 }
 
+impl HepaValidate for HepaTimingRecord {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("run_id", &self.run_id)?;
+        for phase in &self.phases {
+            phase.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HepaTimingPhase {
     pub name: String,
@@ -268,6 +532,22 @@ pub struct HepaTimingPhase {
     pub round: Option<u32>,
     pub role: Option<HepaAgentRole>,
     pub adapter_id: Option<String>,
+}
+
+impl HepaValidate for HepaTimingPhase {
+    fn validate(&self) -> HepaContractResult {
+        require_single_line("name", &self.name)?;
+        if self.duration_seconds < 0.0 {
+            return Err(HepaContractError::new(
+                "duration_seconds",
+                "must not be negative",
+            ));
+        }
+        if let Some(adapter_id) = &self.adapter_id {
+            require_single_line("adapter_id", adapter_id)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +583,34 @@ pub struct HepaTerminalTaskReport {
     pub completed_at: String,
 }
 
+impl HepaValidate for HepaTerminalTaskReport {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        if let Some(validation) = &self.validation {
+            validation.validate()?;
+        }
+        for review_signal in &self.review_signals {
+            review_signal.validate()?;
+        }
+        if let Some(timing) = &self.timing {
+            timing.validate()?;
+        }
+        if matches!(
+            self.status,
+            HepaTerminalStatus::Blocked | HepaTerminalStatus::Failed
+        ) && !self.human_attention_required
+        {
+            return Err(HepaContractError::new(
+                "human_attention_required",
+                "blocked or failed terminal reports must request attention",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaTerminalStatus {
@@ -310,6 +618,84 @@ pub enum HepaTerminalStatus {
     Blocked,
     Failed,
     Cancelled,
+}
+
+fn require_schema(schema_version: u32) -> HepaContractResult {
+    if schema_version == CONTRACT_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(HepaContractError::new(
+            "schema_version",
+            format!("must be {CONTRACT_SCHEMA_VERSION}"),
+        ))
+    }
+}
+
+fn require_non_empty(field: impl Into<String>, value: &str) -> HepaContractResult {
+    let field = field.into();
+    if value.trim().is_empty() {
+        return Err(HepaContractError::new(field, "must not be empty"));
+    }
+    Ok(())
+}
+
+fn require_single_line(field: impl Into<String>, value: &str) -> HepaContractResult {
+    let field = field.into();
+    require_non_empty(field.clone(), value)?;
+    if value.contains('\n') || value.contains('\r') {
+        return Err(HepaContractError::new(field, "must be a single line"));
+    }
+    Ok(())
+}
+
+fn require_string_list(field: &str, values: &[String]) -> HepaContractResult {
+    for (index, value) in values.iter().enumerate() {
+        require_single_line(format!("{field}[{index}]"), value)?;
+    }
+    Ok(())
+}
+
+fn require_dependency_links(
+    field: &str,
+    owner_id: &str,
+    dependencies: &[String],
+) -> HepaContractResult {
+    require_string_list(field, dependencies)?;
+    for dependency in dependencies {
+        if dependency == owner_id {
+            return Err(HepaContractError::new(field, "must not reference itself"));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for dependency in dependencies {
+        if !seen.insert(dependency) {
+            return Err(HepaContractError::new(field, "must not contain duplicates"));
+        }
+    }
+    Ok(())
+}
+
+fn reject_secret_like_ref(field: impl Into<String>, value: &str) -> HepaContractResult {
+    let lowered = value.to_ascii_lowercase();
+    let secret_like = [
+        ".env",
+        "credential",
+        "id_rsa",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    if secret_like {
+        Err(HepaContractError::new(
+            field,
+            "must not contain secret-like path or value fragments",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -462,5 +848,63 @@ mod tests {
                 .expect("deserialize report");
 
         assert_eq!(round_trip, report);
+    }
+
+    #[test]
+    fn invalid_contracts_fail_with_clear_field_errors() {
+        let spec = HepaTaskSpec {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            goal: "Update docs".to_string(),
+            non_goals: Vec::new(),
+            expected_areas: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            validation_commands: Vec::new(),
+            dependencies: vec!["task-1".to_string()],
+            target_branch: None,
+            risk_level: HepaRiskLevel::Low,
+            max_total_rounds: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+        };
+
+        let error = spec.validate().expect_err("self-dependency must fail");
+
+        assert_eq!(error.field, "dependencies");
+        assert!(error.message.contains("itself"));
+    }
+
+    #[test]
+    fn secret_like_refs_are_rejected() {
+        let lane = HepaLane {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: "lane-1".to_string(),
+            project_id: "project-1".to_string(),
+            task_id: "task-1".to_string(),
+            adapter_id: "fake".to_string(),
+            state: HepaLaneState::Running,
+            worktree_ref: "safe-worktree".to_string(),
+            branch: "task-branch".to_string(),
+            run_dir_ref: "run-token-cache".to_string(),
+            attempt_count: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:01Z".to_string(),
+            completed_at: None,
+        };
+
+        let error = lane
+            .validate()
+            .expect_err("secret-like run dir refs must fail");
+
+        assert_eq!(error.field, "run_dir_ref");
+        assert!(error.message.contains("secret-like"));
+    }
+
+    #[test]
+    fn status_transitions_reject_terminal_regression() {
+        assert!(HepaLaneState::Allocated.can_transition_to(&HepaLaneState::Starting));
+        assert!(!HepaLaneState::Completed.can_transition_to(&HepaLaneState::Running));
+        assert!(HepaTaskStatus::Running.can_transition_to(&HepaTaskStatus::Completed));
+        assert!(!HepaTaskStatus::Completed.can_transition_to(&HepaTaskStatus::Running));
     }
 }
