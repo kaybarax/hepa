@@ -2,6 +2,27 @@ use serde::{Deserialize, Serialize};
 
 pub const CONTRACT_SCHEMA_VERSION: u32 = 1;
 
+pub fn to_stable_json<T>(value: &T) -> Result<String, serde_json::Error>
+where
+    T: Serialize,
+{
+    serde_json::to_string_pretty(value).map(ensure_trailing_newline)
+}
+
+pub fn to_stable_yaml<T>(value: &T) -> Result<String, serde_yaml::Error>
+where
+    T: Serialize,
+{
+    serde_yaml::to_string(value).map(ensure_trailing_newline)
+}
+
+fn ensure_trailing_newline(mut value: String) -> String {
+    if !value.ends_with('\n') {
+        value.push('\n');
+    }
+    value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaProject {
     pub schema_version: u32,
@@ -317,6 +338,82 @@ mod tests {
 
         assert!(json.contains("\"risk_level\":\"low\""));
         assert!(json.contains("\"validation_commands\""));
+    }
+
+    #[test]
+    fn task_spec_has_stable_json_and_yaml_field_names() {
+        let spec = HepaTaskSpec {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            goal: "Update docs".to_string(),
+            non_goals: vec!["No code changes".to_string()],
+            expected_areas: vec!["README.md".to_string()],
+            acceptance_criteria: vec!["README.md updated".to_string()],
+            validation_commands: vec!["git diff --check".to_string()],
+            dependencies: vec!["task-0".to_string()],
+            target_branch: Some("main".to_string()),
+            risk_level: HepaRiskLevel::Low,
+            max_total_rounds: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+        };
+
+        let json = to_stable_json(&spec).expect("stable JSON should serialize");
+        let yaml = to_stable_yaml(&spec).expect("stable YAML should serialize");
+
+        assert_eq!(
+            json,
+            concat!(
+                "{\n",
+                "  \"schema_version\": 1,\n",
+                "  \"task_id\": \"task-1\",\n",
+                "  \"project_id\": \"project-1\",\n",
+                "  \"goal\": \"Update docs\",\n",
+                "  \"non_goals\": [\n",
+                "    \"No code changes\"\n",
+                "  ],\n",
+                "  \"expected_areas\": [\n",
+                "    \"README.md\"\n",
+                "  ],\n",
+                "  \"acceptance_criteria\": [\n",
+                "    \"README.md updated\"\n",
+                "  ],\n",
+                "  \"validation_commands\": [\n",
+                "    \"git diff --check\"\n",
+                "  ],\n",
+                "  \"dependencies\": [\n",
+                "    \"task-0\"\n",
+                "  ],\n",
+                "  \"target_branch\": \"main\",\n",
+                "  \"risk_level\": \"low\",\n",
+                "  \"max_total_rounds\": 1,\n",
+                "  \"created_at\": \"2026-06-16T00:00:00Z\"\n",
+                "}\n"
+            )
+        );
+        assert_eq!(
+            yaml,
+            concat!(
+                "schema_version: 1\n",
+                "task_id: task-1\n",
+                "project_id: project-1\n",
+                "goal: Update docs\n",
+                "non_goals:\n",
+                "- No code changes\n",
+                "expected_areas:\n",
+                "- README.md\n",
+                "acceptance_criteria:\n",
+                "- README.md updated\n",
+                "validation_commands:\n",
+                "- git diff --check\n",
+                "dependencies:\n",
+                "- task-0\n",
+                "target_branch: main\n",
+                "risk_level: low\n",
+                "max_total_rounds: 1\n",
+                "created_at: 2026-06-16T00:00:00Z\n"
+            )
+        );
     }
 
     #[test]
