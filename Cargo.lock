@@ -45,6 +45,11 @@ version = "0.1.0"
 [[package]]
 name = "hepa-kanban"
 version = "0.1.0"
+dependencies = [
+ "hepa-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hepa-memory"
