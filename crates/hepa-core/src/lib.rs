@@ -1,11 +1,13 @@
 pub mod artifacts;
 pub mod config;
+pub mod conflict_planner;
 pub mod contracts;
 pub mod fleet_registry;
 pub mod lane_state;
 pub mod monitor;
 pub mod notifications;
 pub mod readiness;
+pub mod resource_governor;
 pub mod scheduler;
 
 pub const CRATE_NAME: &str = "hepa-core";

@@ -22,12 +22,16 @@ pub struct HepaActiveLaneSummary {
     pub task_id: String,
 }
 
-/// Why a ready task cannot be claimed this tick. Extended with conflict/cost
-/// reasons in later checkboxes.
+/// Why a ready task cannot be claimed this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HepaWaitReason {
     DependencyPending { dependency: String },
     CapacityFull,
+    PaidLaneCapReached,
+    AdapterCapReached { adapter_id: String },
+    FileAreaReserved { area: String },
+    ConflictGroupBusy { group: String },
+    LockfileSerialized,
 }
 
 impl HepaWaitReason {
@@ -38,6 +42,19 @@ impl HepaWaitReason {
                 format!("waiting on dependency {dependency}")
             }
             HepaWaitReason::CapacityFull => "waiting for lane capacity".to_string(),
+            HepaWaitReason::PaidLaneCapReached => "waiting for a paid-cloud lane slot".to_string(),
+            HepaWaitReason::AdapterCapReached { adapter_id } => {
+                format!("waiting for an open slot on adapter {adapter_id}")
+            }
+            HepaWaitReason::FileAreaReserved { area } => {
+                format!("waiting: file area {area} is reserved by an active lane")
+            }
+            HepaWaitReason::ConflictGroupBusy { group } => {
+                format!("waiting: conflict group {group} is busy")
+            }
+            HepaWaitReason::LockfileSerialized => {
+                "waiting: lockfile changes are serialized with an active lane".to_string()
+            }
         }
     }
 }
