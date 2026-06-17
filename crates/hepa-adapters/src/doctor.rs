@@ -59,10 +59,32 @@ impl HepaAdapterDoctorReport {
             .map(|check| format!("{}: {}", check.adapter_id, redact_detail(&check.action)))
             .collect::<Vec<_>>()
             .join("; ");
+        let diagnostics = self
+            .checks
+            .iter()
+            .filter(|check| check.status != HepaAdapterCheckStatus::Ok)
+            .map(|check| {
+                format!(
+                    "{}: command={} auth={} version={} template={} sandbox={} max_concurrency={}",
+                    check.adapter_id,
+                    redact_detail(&check.command_presence),
+                    redact_detail(&check.auth_state),
+                    redact_detail(&check.version_state),
+                    redact_detail(&check.invocation_template),
+                    check.sandbox_posture,
+                    check.concurrency_cap
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         if actions.is_empty() {
             format!("HEPA adapter doctor: {status} {checks}")
-        } else {
+        } else if diagnostics.is_empty() {
             format!("HEPA adapter doctor: {status} {checks}; actions: {actions}")
+        } else {
+            format!(
+                "HEPA adapter doctor: {status} {checks}; diagnostics: {diagnostics}; actions: {actions}"
+            )
         }
     }
 }
@@ -548,6 +570,39 @@ mod tests {
         assert_eq!(report.checks[0].status, HepaAdapterCheckStatus::Failed);
         assert!(report.checks[0].version_state.contains("drift"));
         assert!(report.checks[0].action.contains("known-good 0.1.x"));
+    }
+
+    #[test]
+    fn doctor_summary_includes_actionable_command_auth_and_version_diagnostics() {
+        let mut probe = FakeProbe::default();
+        probe.commands.insert("hepa-shell-adapter".to_string());
+        probe.versions.insert(
+            "hepa-shell-adapter".to_string(),
+            "hepa-shell-adapter 9.9.0".to_string(),
+        );
+        let mut missing_auth = builtin_adapter_specs()
+            .remove("custom")
+            .expect("custom spec");
+        missing_auth.required_env = vec!["HEPA_ADAPTER_PROFILE".to_string()];
+        let drifted_version = builtin_adapter_specs()
+            .remove("shell-command")
+            .expect("shell-command spec");
+
+        let report = HepaAdapterDoctorReport::from_specs([&missing_auth, &drifted_version], &probe);
+        let summary = report.to_redacted_summary();
+
+        assert!(summary.contains("diagnostics:"));
+        assert!(summary.contains("custom: command=missing:hepa-custom-adapter"));
+        assert!(summary.contains("auth=missing_env:HEPA_ADAPTER_PROFILE"));
+        assert!(summary.contains("shell-command: command=ok"));
+        assert!(summary.contains("version=hepa-shell-adapter=drift"));
+        assert!(summary.contains("actions:"));
+        assert!(summary.contains("install or configure required command(s): hepa-custom-adapter"));
+        assert!(
+            summary
+                .contains("configure required adapter environment value(s): HEPA_ADAPTER_PROFILE")
+        );
+        assert!(summary.contains("verify hepa-shell-adapter version against the known-good 0.1.x"));
     }
 
     #[test]
