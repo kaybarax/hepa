@@ -18,6 +18,7 @@ use hepa_core::{
         HepaTimingRecord, HepaValidate, HepaValidationCommandResult, HepaValidationStatus,
         HepaValidationSummary,
     },
+    hard_blockers::block_from_monitor_stop,
     lane_state::{HepaLaneTransitionRequest, transition_lane},
     monitor::HepaMonitorPolicy,
 };
@@ -347,6 +348,42 @@ pub fn run_live_task(
     }
     let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
     write_json(&lane_paths.validation_summary, &validation).map_err(|error| error.to_string())?;
+    if live_force_git_lifecycle_violation() {
+        let blocked = controlled_git_lifecycle_block()?;
+        transition_and_record(
+            &lane_paths,
+            &mut lane,
+            4,
+            HepaLaneState::Blocked,
+            "adapter git lifecycle command blocked",
+            "2026-06-16T00:00:04Z",
+        )?;
+        return finish_blocked_live_run(FinishBlockedInput {
+            config,
+            task,
+            run_paths: &run_paths,
+            lane_paths: &lane_paths,
+            allocator: &allocator,
+            lane: &mut lane,
+            validation,
+            review_signals: Vec::new(),
+            arbitration: None,
+            timing: live_timing_record(LiveTimingInput {
+                config,
+                adapter_id,
+                worker_duration_seconds: attempt_outcome.duration_seconds,
+                validation_duration_seconds,
+                review_duration_seconds: 0.0,
+                reviewer_passes: 0,
+                terminal_phase: LivePipelinePhase::SafetyBlocked,
+                repair_timing: None,
+            }),
+            reason: format!(
+                "Adapter Git lifecycle hard block before review/staging: reason={} evidence={}",
+                blocked.reason, blocked.evidence
+            ),
+        });
+    }
     if let Some(secret_path) = first_secret_like_changed_path(&attempt_outcome.changed_files) {
         transition_and_record(
             &lane_paths,
@@ -1343,6 +1380,22 @@ fn live_force_secret_path_change() -> bool {
             .as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES")
     )
+}
+
+fn live_force_git_lifecycle_violation() -> bool {
+    matches!(
+        std::env::var("HEPA_LIVE_FORCE_GIT_LIFECYCLE_VIOLATION")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn controlled_git_lifecycle_block() -> Result<hepa_core::hard_blockers::HepaBlockedStatus, String> {
+    let stop = HepaMonitorPolicy::default()
+        .check_command("adapter && git commit -m rs-5-2-violation")
+        .expect_err("controlled git lifecycle command must be blocked");
+    Ok(block_from_monitor_stop(&stop))
 }
 
 fn first_secret_like_changed_path(changed_files: &[String]) -> Option<String> {
@@ -2689,6 +2742,16 @@ mod tests {
             redact_secret_like_path_for_report(&secret_path),
             "<secret-like-path>"
         );
+    }
+
+    #[test]
+    fn live_controlled_git_lifecycle_block_uses_monitor_policy() {
+        let blocked = controlled_git_lifecycle_block().expect("controlled block");
+
+        assert_eq!(blocked.reason, "command_policy");
+        assert_eq!(blocked.card_status, "blocked");
+        assert!(blocked.human_attention_required);
+        assert!(blocked.evidence.contains("git commit"));
     }
 
     #[test]
