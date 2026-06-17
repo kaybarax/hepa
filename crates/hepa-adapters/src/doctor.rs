@@ -41,6 +41,38 @@ impl HepaAdapterDoctorReport {
         Self { status, checks }
     }
 
+    pub fn from_registry_with_default(
+        registry: &HepaAdapterRegistry,
+        probe: &impl HepaAdapterDoctorProbe,
+        default_adapter: &str,
+    ) -> Self {
+        Self::from_specs_with_default(registry.list(), probe, default_adapter)
+    }
+
+    pub fn from_specs_with_default<'a>(
+        specs: impl IntoIterator<Item = &'a HepaAdapterSpec>,
+        probe: &impl HepaAdapterDoctorProbe,
+        default_adapter: &str,
+    ) -> Self {
+        let checks = specs
+            .into_iter()
+            .map(|spec| {
+                let is_required = spec.id == default_adapter || spec.id == "fake";
+                let mut check = check_adapter(spec, probe);
+                if !is_required && check.status == HepaAdapterCheckStatus::Missing {
+                    check.status = HepaAdapterCheckStatus::Skipped;
+                    check.action = format!(
+                        "documented non-blocking skip: optional adapter route `{}` is not configured; install/configure it only when selecting this route",
+                        spec.id
+                    );
+                }
+                check
+            })
+            .collect::<Vec<_>>();
+        let status = aggregate_status(&checks);
+        Self { status, checks }
+    }
+
     pub fn to_redacted_summary(&self) -> String {
         let status = match self.status {
             HepaAdapterDoctorStatus::Ok => "ok",
@@ -125,6 +157,7 @@ pub struct HepaAdapterDoctorCheck {
 #[serde(rename_all = "snake_case")]
 pub enum HepaAdapterCheckStatus {
     Ok,
+    Skipped,
     Missing,
     Failed,
 }
@@ -133,6 +166,7 @@ impl HepaAdapterCheckStatus {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::Skipped => "skipped",
             Self::Missing => "missing",
             Self::Failed => "failed",
         }
@@ -199,6 +233,19 @@ pub fn format_adapter_list(registry: &HepaAdapterRegistry) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("HEPA adapter list:\n{rows}")
+}
+
+fn aggregate_status(checks: &[HepaAdapterDoctorCheck]) -> HepaAdapterDoctorStatus {
+    if checks.iter().all(|check| {
+        matches!(
+            check.status,
+            HepaAdapterCheckStatus::Ok | HepaAdapterCheckStatus::Skipped
+        )
+    }) {
+        HepaAdapterDoctorStatus::Ok
+    } else {
+        HepaAdapterDoctorStatus::Degraded
+    }
 }
 
 fn check_adapter(
@@ -575,6 +622,63 @@ mod tests {
             .find(|check| check.adapter_id == "fake")
             .expect("fake check");
         assert_eq!(fake.status, HepaAdapterCheckStatus::Ok);
+    }
+
+    #[test]
+    fn doctor_skips_optional_builtin_routes_when_default_is_available() {
+        let mut probe = FakeProbe::default();
+        probe.env.insert("DEEPSEEK_API_KEY".to_string());
+        probe.commands.insert("pi".to_string());
+        probe
+            .versions
+            .insert("pi".to_string(), "0.79.6".to_string());
+        let specs = builtin_adapter_specs();
+        let report = HepaAdapterDoctorReport::from_specs_with_default(specs.values(), &probe, "pi");
+
+        assert_eq!(report.status, HepaAdapterDoctorStatus::Ok);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.adapter_id == "pi")
+                .expect("pi check")
+                .status,
+            HepaAdapterCheckStatus::Ok
+        );
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.adapter_id == "shell-command")
+                .expect("shell command check")
+                .status,
+            HepaAdapterCheckStatus::Skipped
+        );
+        let summary = report.to_redacted_summary();
+        assert!(summary.contains("HEPA adapter doctor: ok"));
+        assert!(summary.contains("shell-command=skipped"));
+        assert!(summary.contains("documented non-blocking skip"));
+    }
+
+    #[test]
+    fn doctor_keeps_default_adapter_missing_as_blocking() {
+        let specs = builtin_adapter_specs();
+        let report = HepaAdapterDoctorReport::from_specs_with_default(
+            specs.values(),
+            &FakeProbe::default(),
+            "pi",
+        );
+
+        assert_eq!(report.status, HepaAdapterDoctorStatus::Degraded);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.adapter_id == "pi")
+                .expect("pi check")
+                .status,
+            HepaAdapterCheckStatus::Missing
+        );
     }
 
     #[test]

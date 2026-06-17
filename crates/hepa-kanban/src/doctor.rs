@@ -1,4 +1,6 @@
+use hepa_core::config::HepaHermesBridgeConfig;
 use serde::{Deserialize, Serialize};
+use std::{env, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaKanbanDoctorReport {
@@ -9,10 +11,12 @@ pub struct HepaKanbanDoctorReport {
 impl HepaKanbanDoctorReport {
     pub fn from_checks(checks: impl IntoIterator<Item = HepaKanbanDoctorCheck>) -> Self {
         let checks = checks.into_iter().collect::<Vec<_>>();
-        let status = if checks
-            .iter()
-            .all(|check| check.status == HepaKanbanCheckStatus::Ok)
-        {
+        let status = if checks.iter().all(|check| {
+            matches!(
+                check.status,
+                HepaKanbanCheckStatus::Ok | HepaKanbanCheckStatus::Skipped
+            )
+        }) {
             HepaKanbanDoctorStatus::Ok
         } else {
             HepaKanbanDoctorStatus::Degraded
@@ -31,6 +35,7 @@ impl HepaKanbanDoctorReport {
             .map(|check| {
                 let check_status = match check.status {
                     HepaKanbanCheckStatus::Ok => "ok",
+                    HepaKanbanCheckStatus::Skipped => "skipped",
                     HepaKanbanCheckStatus::Missing => "missing",
                     HepaKanbanCheckStatus::Failed => "failed",
                 };
@@ -87,6 +92,19 @@ impl HepaKanbanDoctorCheck {
         }
     }
 
+    pub fn skipped(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: HepaKanbanCheckStatus::Skipped,
+            detail: redact_detail(&detail.into()),
+            action: redact_detail(&action.into()),
+        }
+    }
+
     pub fn failed(
         name: impl Into<String>,
         detail: impl Into<String>,
@@ -105,8 +123,156 @@ impl HepaKanbanDoctorCheck {
 #[serde(rename_all = "snake_case")]
 pub enum HepaKanbanCheckStatus {
     Ok,
+    Skipped,
     Missing,
     Failed,
+}
+
+pub trait HepaKanbanDoctorProbe {
+    fn command_present(&self, command: &str) -> bool;
+    fn command_version(&self, command: &str) -> Option<String>;
+    fn env_present(&self, name: &str) -> bool;
+}
+
+#[derive(Debug, Default)]
+pub struct HepaSystemKanbanDoctorProbe;
+
+impl HepaKanbanDoctorProbe for HepaSystemKanbanDoctorProbe {
+    fn command_present(&self, command: &str) -> bool {
+        command_exists_on_path(command)
+    }
+
+    fn command_version(&self, command: &str) -> Option<String> {
+        let output = Command::new(command).arg("--version").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            None
+        } else {
+            Some(stdout)
+        }
+    }
+
+    fn env_present(&self, name: &str) -> bool {
+        env::var_os(name).is_some()
+    }
+}
+
+pub fn system_kanban_doctor_report(config: &HepaHermesBridgeConfig) -> HepaKanbanDoctorReport {
+    kanban_doctor_report(config, &HepaSystemKanbanDoctorProbe)
+}
+
+pub fn kanban_doctor_report(
+    config: &HepaHermesBridgeConfig,
+    probe: &impl HepaKanbanDoctorProbe,
+) -> HepaKanbanDoctorReport {
+    if !config.enabled {
+        return HepaKanbanDoctorReport::from_checks([
+            HepaKanbanDoctorCheck::skipped(
+                "cli",
+                "Hermes bridge disabled by configuration.",
+                "Documented non-blocking skip: enable HEPA_HERMES_ENABLED for live board sync.",
+            ),
+            HepaKanbanDoctorCheck::skipped(
+                "api",
+                "Hermes bridge disabled by configuration.",
+                "Documented non-blocking skip: configure Hermes endpoint and board when live sync is required.",
+            ),
+            HepaKanbanDoctorCheck::skipped(
+                "auth",
+                "Hermes bridge disabled by configuration.",
+                "Documented non-blocking skip: authenticate Hermes when live sync is required.",
+            ),
+            HepaKanbanDoctorCheck::skipped(
+                "workspace",
+                "Hermes bridge disabled by configuration.",
+                "Documented non-blocking skip: select a workspace when live sync is required.",
+            ),
+            HepaKanbanDoctorCheck::skipped(
+                "board",
+                "Hermes bridge disabled by configuration.",
+                "Documented non-blocking skip: select a board when live sync is required.",
+            ),
+        ]);
+    }
+
+    let cli = if probe.command_present("hermes") {
+        HepaKanbanDoctorCheck::ok(
+            "cli",
+            probe
+                .command_version("hermes")
+                .unwrap_or_else(|| "Hermes CLI detected.".to_string()),
+        )
+    } else {
+        HepaKanbanDoctorCheck::missing("cli", "Install or configure the Hermes CLI/API.")
+    };
+    let api = match config.endpoint.as_deref() {
+        Some(endpoint) if !endpoint.trim().is_empty() => {
+            HepaKanbanDoctorCheck::ok("api", "Hermes endpoint configured.")
+        }
+        _ => HepaKanbanDoctorCheck::skipped(
+            "api",
+            "No Hermes endpoint configured; headless/degraded sync remains available.",
+            "Documented non-blocking skip: set HEPA_HERMES_ENDPOINT for live board sync.",
+        ),
+    };
+    let auth = if probe.env_present("HERMES_API_KEY")
+        || probe.env_present("HERMES_TOKEN")
+        || probe.env_present("HERMES_AUTH_TOKEN")
+    {
+        HepaKanbanDoctorCheck::ok("auth", "Hermes auth environment detected.")
+    } else {
+        HepaKanbanDoctorCheck::skipped(
+            "auth",
+            "No Hermes auth environment detected; headless/degraded sync remains available.",
+            "Documented non-blocking skip: authenticate Hermes for live board sync.",
+        )
+    };
+    let workspace = if config
+        .endpoint
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        HepaKanbanDoctorCheck::ok("workspace", "Hermes workspace endpoint configured.")
+    } else {
+        HepaKanbanDoctorCheck::skipped(
+            "workspace",
+            "No Hermes workspace configured; headless/degraded sync remains available.",
+            "Documented non-blocking skip: configure a Hermes workspace for live board sync.",
+        )
+    };
+    let board = match config.board_id.as_deref() {
+        Some(board_id) if !board_id.trim().is_empty() => {
+            HepaKanbanDoctorCheck::ok("board", "Hermes board configured.")
+        }
+        _ => HepaKanbanDoctorCheck::skipped(
+            "board",
+            "No Hermes board configured; card projection evidence remains local.",
+            "Documented non-blocking skip: set HEPA_HERMES_BOARD_ID for live board sync.",
+        ),
+    };
+
+    HepaKanbanDoctorReport::from_checks([cli, api, auth, workspace, board])
+}
+
+fn command_exists_on_path(command: &str) -> bool {
+    let command_path = PathBuf::from(command);
+    if command_path.components().count() > 1 {
+        return command_path.is_file();
+    }
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| {
+        fs_metadata_is_file(dir.join(command))
+            || (cfg!(windows) && fs_metadata_is_file(dir.join(format!("{command}.exe"))))
+    })
+}
+
+fn fs_metadata_is_file(path: PathBuf) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 fn redact_detail(value: &str) -> String {
@@ -144,6 +310,28 @@ fn is_account_like(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Default)]
+    struct FakeProbe {
+        commands: BTreeSet<String>,
+        versions: BTreeMap<String, String>,
+        env: BTreeSet<String>,
+    }
+
+    impl HepaKanbanDoctorProbe for FakeProbe {
+        fn command_present(&self, command: &str) -> bool {
+            self.commands.contains(command)
+        }
+
+        fn command_version(&self, command: &str) -> Option<String> {
+            self.versions.get(command).cloned()
+        }
+
+        fn env_present(&self, name: &str) -> bool {
+            self.env.contains(name)
+        }
+    }
 
     #[test]
     fn doctor_reports_cli_api_auth_workspace_and_board_checks() {
@@ -163,6 +351,35 @@ mod tests {
         assert!(summary.contains("auth=missing"));
         assert!(summary.contains("workspace=missing"));
         assert!(summary.contains("board=missing"));
+    }
+
+    #[test]
+    fn doctor_reports_skipped_external_board_config_as_non_blocking() {
+        let mut probe = FakeProbe::default();
+        probe.commands.insert("hermes".to_string());
+        probe
+            .versions
+            .insert("hermes".to_string(), "Hermes Agent v0.16.0".to_string());
+        let report = kanban_doctor_report(&HepaHermesBridgeConfig::default(), &probe);
+
+        assert_eq!(report.status, HepaKanbanDoctorStatus::Ok);
+        let summary = report.to_redacted_summary();
+        assert!(summary.contains("HEPA kanban doctor: ok"));
+        assert!(summary.contains("cli=ok"));
+        assert!(summary.contains("api=skipped"));
+        assert!(summary.contains("auth=skipped"));
+        assert!(summary.contains("workspace=skipped"));
+        assert!(summary.contains("board=skipped"));
+        assert!(summary.contains("Documented non-blocking skip"));
+    }
+
+    #[test]
+    fn doctor_degrades_when_hermes_cli_is_missing() {
+        let report =
+            kanban_doctor_report(&HepaHermesBridgeConfig::default(), &FakeProbe::default());
+
+        assert_eq!(report.status, HepaKanbanDoctorStatus::Degraded);
+        assert!(report.to_redacted_summary().contains("cli=missing"));
     }
 
     #[test]

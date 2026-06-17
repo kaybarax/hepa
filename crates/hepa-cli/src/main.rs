@@ -13,7 +13,7 @@ use hepa_adapters::{
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::{HepaLaneState, HepaTimingRecord};
 use hepa_git::worktree::HepaWorktreeAllocator;
-use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
+use hepa_kanban::doctor::system_kanban_doctor_report;
 use hepa_kanban::spec_import::import_markdown_spec;
 use hepa_kanban::sync::{
     HepaKanbanSyncEngine, HepaKanbanSyncStatus, HepaUnavailableHermesCardStore,
@@ -103,13 +103,8 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             }
         }
         [command, subcommand] if command == "kanban" && subcommand == "doctor" => {
-            let report = HepaKanbanDoctorReport::from_checks([
-                HepaKanbanDoctorCheck::missing("cli", "Install or configure the Hermes CLI/API."),
-                HepaKanbanDoctorCheck::missing("api", "Configure Hermes API access."),
-                HepaKanbanDoctorCheck::missing("auth", "Authenticate the Hermes integration."),
-                HepaKanbanDoctorCheck::missing("workspace", "Select a Hermes workspace."),
-                HepaKanbanDoctorCheck::missing("board", "Select a reachable Hermes board."),
-            ]);
+            let config = load_cli_config()?;
+            let report = system_kanban_doctor_report(&config.hermes);
             Ok(report.to_redacted_summary())
         }
         [command, ..] if command == "kanban" => Err("unknown kanban command".to_string()),
@@ -123,8 +118,11 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             let config = load_cli_config()?;
             let registry = HepaAdapterRegistry::load_from_config(&config)
                 .map_err(|error| format!("failed to load adapter registry: {error}"))?;
-            let report =
-                HepaAdapterDoctorReport::from_registry(&registry, &HepaSystemAdapterDoctorProbe);
+            let report = HepaAdapterDoctorReport::from_registry_with_default(
+                &registry,
+                &HepaSystemAdapterDoctorProbe,
+                &config.default_adapter,
+            );
             Ok(report.to_redacted_summary())
         }
         [command, subcommand, adapter_id] if command == "adapter" && subcommand == "install" => {
@@ -157,12 +155,12 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             let config = load_cli_config()?;
             let registry = HepaAdapterRegistry::load_from_config(&config)
                 .map_err(|error| format!("failed to load adapter registry: {error}"))?;
-            let adapter_report =
-                HepaAdapterDoctorReport::from_registry(&registry, &HepaSystemAdapterDoctorProbe);
-            let kanban_report = HepaKanbanDoctorReport::from_checks([
-                HepaKanbanDoctorCheck::missing("cli", "Install or configure the Hermes CLI/API."),
-                HepaKanbanDoctorCheck::missing("api", "Configure Hermes API access."),
-            ]);
+            let adapter_report = HepaAdapterDoctorReport::from_registry_with_default(
+                &registry,
+                &HepaSystemAdapterDoctorProbe,
+                &config.default_adapter,
+            );
+            let kanban_report = system_kanban_doctor_report(&config.hermes);
             Ok(format!(
                 "HEPA doctor:\n[adapters]\n{}\n[kanban]\n{}",
                 adapter_report.to_redacted_summary(),
@@ -730,9 +728,12 @@ mod tests {
     fn kanban_doctor_command_reports_degraded_status() {
         let output = run_cli(&args(&["kanban", "doctor"])).expect("doctor should run");
 
-        assert!(output.contains("HEPA kanban doctor: degraded"));
-        assert!(output.contains("cli=missing"));
-        assert!(output.contains("board=missing"));
+        assert!(output.contains("HEPA kanban doctor:"));
+        assert!(output.contains("cli="));
+        assert!(
+            output.contains("board=skipped") || output.contains("board=missing"),
+            "board should be reported as either a configured-environment skip or a missing dependency"
+        );
     }
 
     #[test]
@@ -752,7 +753,7 @@ mod tests {
 
         assert!(output.contains("HEPA adapter doctor:"));
         assert!(output.contains("fake=ok"));
-        assert!(output.contains("shell-command="));
+        assert!(output.contains("shell-command=skipped"));
     }
 
     #[test]
