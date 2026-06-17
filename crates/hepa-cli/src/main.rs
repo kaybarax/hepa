@@ -303,18 +303,33 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             } else {
                 run::run_live_task(&run_config, &options.agent)?
             };
-            if options.timing {
-                Ok(format_timing_summary(&result.timing))
-            } else {
-                Ok(format!(
-                    "HEPA run completed: agent={} run={} lane={} status={} \
-                     (safe defaults: worktree sandbox, manager-owned git, auto-merge off)",
-                    options.agent, result.run_id, result.lane_id, result.status
-                ))
-            }
+            format_run_result(&options, &result)
         }
         [command, ..] if command == "run" => Err("unknown run command".to_string()),
         _ => Err("unknown command".to_string()),
+    }
+}
+
+fn format_run_result(
+    options: &HepaRunOptions,
+    result: &run::HepaFakeRunResult,
+) -> Result<String, String> {
+    let summary = if options.timing {
+        format_timing_summary(&result.timing)
+    } else {
+        format!(
+            "HEPA run completed: agent={} run={} lane={} status={} \
+             (safe defaults: worktree sandbox, manager-owned git, auto-merge off)",
+            options.agent, result.run_id, result.lane_id, result.status
+        )
+    };
+    if result.status == "completed" {
+        Ok(summary)
+    } else {
+        Err(format!(
+            "HEPA run ended with status={}: run={} lane={}\n{}",
+            result.status, result.run_id, result.lane_id, summary
+        ))
     }
 }
 
@@ -652,8 +667,8 @@ fn format_timing_trend_report(report: &HepaTimingTrendReport) -> String {
 mod tests {
     use super::*;
     use hepa_core::contracts::{
-        CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaPhaseStatus, HepaTimingCounters,
-        HepaTimingPhase,
+        CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaPhaseStatus, HepaTerminalStatus,
+        HepaTerminalTaskReport, HepaTimingCounters, HepaTimingPhase,
     };
     use std::{
         fs,
@@ -1047,6 +1062,63 @@ mod tests {
         assert!(output.contains("fake_review=1.000s"));
 
         remove_test_dir(root);
+    }
+
+    #[test]
+    fn blocked_run_result_is_error_even_with_timing_summary() {
+        let timing = HepaTimingRecord {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            run_id: "run-blocked".to_string(),
+            phases: vec![HepaTimingPhase {
+                name: "live_staging_commit_pr".to_string(),
+                status: HepaPhaseStatus::Blocked,
+                duration_seconds: 0.0,
+                round: Some(1),
+                role: Some(HepaAgentRole::Manager),
+                adapter_id: None,
+                routing_reason: Some("manager-owned git lifecycle".to_string()),
+                sandbox_posture: Some("host-worktree".to_string()),
+            }],
+            counters: HepaTimingCounters {
+                agent_loops: 1,
+                manager_passes: 1,
+                worker_profile_llm_calls: 0,
+                reviewer_passes: 1,
+                install_events: 0,
+                container_count: 0,
+            },
+        };
+        let result = run::HepaFakeRunResult {
+            run_id: "run-blocked".to_string(),
+            lane_id: "lane-blocked".to_string(),
+            status: "blocked".to_string(),
+            timing: timing.clone(),
+            terminal_report: HepaTerminalTaskReport {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "task-blocked".to_string(),
+                lane_id: "lane-blocked".to_string(),
+                status: HepaTerminalStatus::Blocked,
+                pr_url: None,
+                validation: None,
+                review_signals: Vec::new(),
+                arbitration: None,
+                timing: Some(timing),
+                summary: vec!["blocked before PR creation".to_string()],
+                human_attention_required: true,
+                completed_at: "2026-06-16T00:00:04Z".to_string(),
+            },
+            cleanup_performed: false,
+        };
+        let options = HepaRunOptions {
+            agent: "pi".to_string(),
+            timing: true,
+        };
+
+        let error = format_run_result(&options, &result).expect_err("blocked run must error");
+
+        assert!(error.contains("status=blocked"));
+        assert!(error.contains("HEPA timing: run=run-blocked"));
+        assert!(error.contains("live_staging_commit_pr=0.000s"));
     }
 
     #[test]
