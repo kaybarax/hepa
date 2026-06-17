@@ -177,6 +177,44 @@ fn review_fanout_with_two_reviewers_and_arbitration() {
 }
 
 #[test]
+fn done_gate_fixture_with_fake_gh_checks_and_screenshot_policy() {
+    // CI status here stands in for a fake `gh pr checks` result; the screenshot
+    // policy applies when UI files changed.
+
+    // Happy path: CI green and screenshots attached for UI changes -> ready.
+    let ready = evaluate_done_gate(&HepaDoneGateInput {
+        pr_exists: true,
+        ci_present: true,
+        ci_passing: true,
+        ui_files_changed: true,
+        screenshots_attached: true,
+        ..HepaDoneGateInput::default()
+    });
+    assert!(ready.is_ready());
+    assert!(ready.card_may_show_done());
+
+    // Fake gh reports failing checks -> not ready, and the card cannot show done.
+    let ci_failed = evaluate_done_gate(&HepaDoneGateInput {
+        pr_exists: true,
+        ci_present: true,
+        ci_passing: false,
+        ..HepaDoneGateInput::default()
+    });
+    assert!(!ci_failed.is_ready());
+    assert!(!ci_failed.card_may_show_done());
+
+    // UI files changed but no screenshot -> not ready (screenshot policy).
+    let missing_screenshot = evaluate_done_gate(&HepaDoneGateInput {
+        pr_exists: true,
+        ui_files_changed: true,
+        screenshots_attached: false,
+        ..HepaDoneGateInput::default()
+    });
+    assert!(!missing_screenshot.is_ready());
+    assert!(!missing_screenshot.card_may_show_done());
+}
+
+#[test]
 fn repair_loop_forces_a_failure_aware_round_two_rewrite() {
     use hepa_core::contracts::HepaValidationCommandResult;
     use hepa_review::repair::{
