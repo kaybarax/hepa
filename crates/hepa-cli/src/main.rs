@@ -2,6 +2,7 @@ mod run;
 
 use hepa_adapters::{
     doctor::{HepaAdapterDoctorReport, HepaSystemAdapterDoctorProbe, format_adapter_list},
+    interactive::{HepaLaneSteeringRequest, HepaSystemTmux, HepaTmux, HepaTmuxInteractiveLauncher},
     registry::HepaAdapterRegistry,
 };
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
@@ -24,11 +25,32 @@ fn main() {
 }
 
 fn run_cli(args: &[String]) -> Result<String, String> {
+    let mut tmux = HepaSystemTmux;
+    run_cli_with_tmux(args, &mut tmux)
+}
+
+fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String, String> {
     match args {
         [] => Ok(format!(
             "HEPA workspace initialized ({})",
             hepa_core::crate_name()
         )),
+        [command, subcommand, lane_id, message] if command == "lane" && subcommand == "send" => {
+            let receipt = HepaTmuxInteractiveLauncher
+                .send(
+                    &HepaLaneSteeringRequest {
+                        lane_id: lane_id.clone(),
+                        message: message.clone(),
+                    },
+                    tmux,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA lane send queued: lane={} session={}",
+                receipt.lane_id, receipt.session_id
+            ))
+        }
+        [command, ..] if command == "lane" => Err("unknown lane command".to_string()),
         [command, subcommand] if command == "kanban" && subcommand == "sync" => {
             let mut store = HepaUnavailableHermesCardStore::new("Hermes CLI/API unavailable");
             let summary = HepaKanbanSyncEngine::new().sync_tasks(&[], &mut store)?;
@@ -178,6 +200,39 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    #[derive(Default)]
+    struct FakeTmux {
+        sent: Vec<(String, String)>,
+    }
+
+    impl HepaTmux for FakeTmux {
+        fn new_session(
+            &mut self,
+            _session_id: &str,
+            _command: &str,
+            _workdir: &Path,
+        ) -> Result<(), hepa_adapters::interactive::HepaInteractiveSessionError> {
+            Ok(())
+        }
+
+        fn capture_pane(
+            &mut self,
+            _session_id: &str,
+        ) -> Result<String, hepa_adapters::interactive::HepaInteractiveSessionError> {
+            Ok(String::new())
+        }
+
+        fn send_keys(
+            &mut self,
+            session_id: &str,
+            message: &str,
+        ) -> Result<(), hepa_adapters::interactive::HepaInteractiveSessionError> {
+            self.sent
+                .push((session_id.to_string(), message.to_string()));
+            Ok(())
+        }
+    }
+
     #[test]
     fn kanban_sync_command_runs_empty_sync() {
         let output = run_cli(&args(&["kanban", "sync"])).expect("sync should run");
@@ -185,6 +240,30 @@ mod tests {
         assert_eq!(
             output,
             "HEPA kanban sync degraded: reason=Hermes CLI/API unavailable skipped=0"
+        );
+    }
+
+    #[test]
+    fn lane_send_command_is_the_steering_primitive() {
+        let mut tmux = FakeTmux::default();
+        let output = run_cli_with_tmux(
+            &args(&["lane", "send", "lane-1", "continue with tests"]),
+            &mut tmux,
+        )
+        .expect("lane send should run");
+
+        assert_eq!(
+            output,
+            "HEPA lane send queued: lane=lane-1 session=hepa-lane-1"
+        );
+        assert_eq!(
+            tmux.sent,
+            vec![("hepa-lane-1".to_string(), "continue with tests".to_string())]
+        );
+        assert_eq!(
+            run_cli_with_tmux(&args(&["lane", "nudge", "lane-1", "msg"]), &mut tmux)
+                .expect_err("other steering commands must not exist"),
+            "unknown lane command"
         );
     }
 

@@ -35,6 +35,18 @@ pub struct HepaInteractiveSessionReceipt {
     pub full_log_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaLaneSteeringRequest {
+    pub lane_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaLaneSteeringReceipt {
+    pub lane_id: String,
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HepaTmuxInteractiveLauncher;
 
@@ -48,7 +60,7 @@ impl HepaTmuxInteractiveLauncher {
         fs::create_dir_all(&request.artifact_dir).map_err(|error| {
             HepaInteractiveSessionError::new("artifact_dir", format!("failed to create: {error}"))
         })?;
-        let session_id = session_id(&request.lane_id, &request.adapter_id);
+        let session_id = interactive_session_id(&request.lane_id);
         tmux.new_session(&session_id, &request.command, &request.workdir)?;
         let full_log = tmux.capture_pane(&session_id)?;
         let full_log_path = request.artifact_dir.join("interactive-full.log");
@@ -72,6 +84,20 @@ impl HepaTmuxInteractiveLauncher {
             full_log_path,
         })
     }
+
+    pub fn send(
+        &self,
+        request: &HepaLaneSteeringRequest,
+        tmux: &mut impl HepaTmux,
+    ) -> Result<HepaLaneSteeringReceipt, HepaInteractiveSessionError> {
+        request.validate()?;
+        let session_id = interactive_session_id(&request.lane_id);
+        tmux.send_keys(&session_id, &request.message)?;
+        Ok(HepaLaneSteeringReceipt {
+            lane_id: request.lane_id.clone(),
+            session_id,
+        })
+    }
 }
 
 pub trait HepaTmux {
@@ -83,6 +109,12 @@ pub trait HepaTmux {
     ) -> Result<(), HepaInteractiveSessionError>;
 
     fn capture_pane(&mut self, session_id: &str) -> Result<String, HepaInteractiveSessionError>;
+
+    fn send_keys(
+        &mut self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<(), HepaInteractiveSessionError>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -121,6 +153,25 @@ impl HepaTmux for HepaSystemTmux {
             Err(HepaInteractiveSessionError::new(
                 "tmux",
                 format!("capture-pane exited with {}", output.status),
+            ))
+        }
+    }
+
+    fn send_keys(
+        &mut self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<(), HepaInteractiveSessionError> {
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", session_id, message, "Enter"])
+            .status()
+            .map_err(|error| HepaInteractiveSessionError::tmux("send-keys", error))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(HepaInteractiveSessionError::new(
+                "tmux",
+                format!("send-keys exited with {status}"),
             ))
         }
     }
@@ -168,8 +219,15 @@ impl HepaInteractiveSessionRequest {
     }
 }
 
-fn session_id(lane_id: &str, adapter_id: &str) -> String {
-    format!("hepa-{lane_id}-{adapter_id}")
+impl HepaLaneSteeringRequest {
+    fn validate(&self) -> Result<(), HepaInteractiveSessionError> {
+        require_artifact_id("lane_id", &self.lane_id)?;
+        require_single_line("message", &self.message)
+    }
+}
+
+pub fn interactive_session_id(lane_id: &str) -> String {
+    format!("hepa-{lane_id}")
 }
 
 fn require_artifact_id(field: &str, value: &str) -> Result<(), HepaInteractiveSessionError> {
@@ -245,6 +303,14 @@ mod tests {
             self.captured.push(session_id.to_string());
             Ok(self.capture_output.clone())
         }
+
+        fn send_keys(
+            &mut self,
+            _session_id: &str,
+            _message: &str,
+        ) -> Result<(), HepaInteractiveSessionError> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -269,22 +335,22 @@ mod tests {
             .launch(&request, &mut tmux)
             .expect("interactive launch should record artifacts");
 
-        assert_eq!(receipt.record.session_id, "hepa-lane_1-user-worker");
+        assert_eq!(receipt.record.session_id, "hepa-lane_1");
         assert_eq!(
             tmux.launched,
             vec![(
-                "hepa-lane_1-user-worker".to_string(),
+                "hepa-lane_1".to_string(),
                 "agent --prompt-file prompt.md".to_string(),
                 workdir
             )]
         );
-        assert_eq!(tmux.captured, vec!["hepa-lane_1-user-worker"]);
+        assert_eq!(tmux.captured, vec!["hepa-lane_1"]);
         assert_eq!(
             fs::read_to_string(&receipt.full_log_path).expect("full log"),
             "full transcript\nwith prompt and output\n"
         );
         let record_json = fs::read_to_string(&receipt.record_path).expect("session record");
-        assert!(record_json.contains("\"session_id\": \"hepa-lane_1-user-worker\""));
+        assert!(record_json.contains("\"session_id\": \"hepa-lane_1\""));
         assert!(record_json.contains("\"full_log_ref\": \"interactive-full.log\""));
         assert!(record_json.contains("\"workdir_ref\": \"<LANE_WORKTREE>\""));
 
@@ -314,6 +380,22 @@ mod tests {
         assert!(tmux.captured.is_empty());
 
         remove_test_dir(root);
+    }
+
+    #[test]
+    fn lane_send_uses_lane_id_derived_tmux_session() {
+        let mut tmux = FakeTmux::default();
+        let request = HepaLaneSteeringRequest {
+            lane_id: "lane_1".to_string(),
+            message: "continue with the focused fix".to_string(),
+        };
+
+        let receipt = HepaTmuxInteractiveLauncher
+            .send(&request, &mut tmux)
+            .expect("lane send should target tmux session");
+
+        assert_eq!(receipt.lane_id, "lane_1");
+        assert_eq!(receipt.session_id, "hepa-lane_1");
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
