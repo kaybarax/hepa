@@ -1,5 +1,9 @@
+use crate::conflict_planner::HepaConflictPlanner;
 use crate::contracts::HepaTaskStatus;
 use crate::fleet_registry::{HepaFleetError, HepaFleetRegistry};
+use crate::resource_governor::{
+    HepaLaneReservation, HepaResourceGovernor, HepaResourceLimits, HepaScheduleCandidate,
+};
 
 /// Whether the scheduler loop is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +76,14 @@ pub enum HepaTickOutcome {
     Idle,
     Claimable { task_id: String },
     Waiting { waits: Vec<HepaTaskWait> },
+}
+
+/// Result of an atomic claim attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HepaClaimOutcome {
+    NotRunning,
+    Claimed { lane: HepaLaneReservation },
+    Rejected { reasons: Vec<HepaWaitReason> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +206,54 @@ impl HepaScheduler {
         })
     }
 
+    /// Atomically claim a candidate into one lane, but only after dependency,
+    /// resource, and conflict admission all pass. When any rule blocks, the
+    /// recorded wait reasons are returned and nothing is mutated.
+    pub fn claim_one(
+        &self,
+        registry: &HepaFleetRegistry,
+        limits: &HepaResourceLimits,
+        reservations: &[HepaLaneReservation],
+        candidate: &HepaScheduleCandidate,
+        lane_id: &str,
+        updated_at: &str,
+    ) -> Result<HepaClaimOutcome, HepaFleetError> {
+        if self.run_state != HepaSchedulerRunState::Running {
+            return Ok(HepaClaimOutcome::NotRunning);
+        }
+
+        let mut reasons = Vec::new();
+        if let Some(dependency) = registry
+            .unmet_dependencies(&candidate.task_id)?
+            .into_iter()
+            .next()
+        {
+            reasons.push(HepaWaitReason::DependencyPending { dependency });
+        }
+        reasons.extend(HepaResourceGovernor::evaluate(
+            limits,
+            reservations,
+            candidate,
+        ));
+        reasons.extend(HepaConflictPlanner::evaluate(reservations, candidate));
+        if !reasons.is_empty() {
+            return Ok(HepaClaimOutcome::Rejected { reasons });
+        }
+
+        let task = registry.claim_task_into_lane(&candidate.task_id, lane_id, updated_at)?;
+        Ok(HepaClaimOutcome::Claimed {
+            lane: HepaLaneReservation {
+                lane_id: lane_id.to_string(),
+                task_id: task.task_id,
+                adapter_id: candidate.adapter_id.clone(),
+                cost_class: candidate.cost_class,
+                file_areas: candidate.file_areas.clone(),
+                conflict_group: candidate.conflict_group.clone(),
+                touches_lockfile: candidate.touches_lockfile,
+            },
+        })
+    }
+
     fn ready_tasks_by_priority(
         &self,
         registry: &HepaFleetRegistry,
@@ -214,6 +274,7 @@ impl HepaScheduler {
 mod tests {
     use super::*;
     use crate::contracts::{CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaReadinessState};
+    use crate::fleet_registry::HepaCostClass;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -313,6 +374,110 @@ mod tests {
         assert_eq!(status.ready, 1);
         assert_eq!(status.active_lanes, 1);
         assert!(!status.waits.is_empty());
+
+        remove_test_dir(root);
+    }
+
+    fn candidate(task_id: &str) -> HepaScheduleCandidate {
+        HepaScheduleCandidate {
+            task_id: task_id.to_string(),
+            adapter_id: "local".to_string(),
+            cost_class: HepaCostClass::Local,
+            file_areas: vec!["src/api".to_string()],
+            conflict_group: None,
+            touches_lockfile: false,
+        }
+    }
+
+    #[test]
+    fn claim_one_atomically_claims_a_ready_task_into_one_lane() {
+        let root = unique_test_dir("claim");
+        let registry = HepaFleetRegistry::new(&root);
+        registry
+            .create_task(&ready_task("task-1", 1))
+            .expect("create");
+        let mut scheduler = HepaScheduler::new();
+        scheduler.start();
+        let limits = HepaResourceLimits::new(4, 4);
+
+        let outcome = scheduler
+            .claim_one(
+                &registry,
+                &limits,
+                &[],
+                &candidate("task-1"),
+                "lane-1",
+                "2026-06-16T00:01:00Z",
+            )
+            .expect("claim");
+        assert!(matches!(outcome, HepaClaimOutcome::Claimed { .. }));
+
+        let task = registry
+            .show_task("task-1")
+            .expect("show")
+            .expect("present");
+        assert_eq!(task.status, HepaTaskStatus::Running);
+        assert_eq!(task.lane_ids, vec!["lane-1".to_string()]);
+
+        // A second claim cannot double-claim the now-running task.
+        let second = scheduler.claim_one(
+            &registry,
+            &limits,
+            &[],
+            &candidate("task-1"),
+            "lane-2",
+            "2026-06-16T00:02:00Z",
+        );
+        assert!(second.is_err());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn claim_one_rejects_when_a_rule_blocks() {
+        let root = unique_test_dir("claim-blocked");
+        let registry = HepaFleetRegistry::new(&root);
+        registry
+            .create_task(&ready_task("task-1", 1))
+            .expect("create");
+        let mut scheduler = HepaScheduler::new();
+        scheduler.start();
+        let limits = HepaResourceLimits::new(4, 4);
+        // An active lane reserves the same file area the candidate touches.
+        let active = vec![HepaLaneReservation {
+            lane_id: "lane-0".to_string(),
+            task_id: "task-0".to_string(),
+            adapter_id: "local".to_string(),
+            cost_class: HepaCostClass::Local,
+            file_areas: vec!["src/api".to_string()],
+            conflict_group: None,
+            touches_lockfile: false,
+        }];
+
+        let outcome = scheduler
+            .claim_one(
+                &registry,
+                &limits,
+                &active,
+                &candidate("task-1"),
+                "lane-1",
+                "2026-06-16T00:01:00Z",
+            )
+            .expect("claim");
+        match outcome {
+            HepaClaimOutcome::Rejected { reasons } => {
+                assert!(reasons.contains(&HepaWaitReason::FileAreaReserved {
+                    area: "src/api".to_string()
+                }));
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        // The task was not mutated by the rejected claim.
+        let task = registry
+            .show_task("task-1")
+            .expect("show")
+            .expect("present");
+        assert_eq!(task.status, HepaTaskStatus::Ready);
 
         remove_test_dir(root);
     }

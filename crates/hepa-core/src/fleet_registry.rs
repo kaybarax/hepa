@@ -216,6 +216,38 @@ impl HepaFleetRegistry {
         Ok(task)
     }
 
+    /// Atomically claim a ready task into exactly one lane.
+    ///
+    /// The task must currently be `Ready` with no existing lane; the second
+    /// claim attempt fails, so a task can never be double-claimed or fan out to
+    /// more than one lane.
+    pub fn claim_task_into_lane(
+        &self,
+        task_id: &str,
+        lane_id: &str,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        require_safe_segment("lane_id", lane_id)?;
+        let mut task = self.require_task(task_id)?;
+        if task.status != HepaTaskStatus::Ready {
+            return Err(HepaFleetError::new(
+                "status",
+                "only ready tasks can be claimed into a lane",
+            ));
+        }
+        if !task.lane_ids.is_empty() {
+            return Err(HepaFleetError::new(
+                "lane_ids",
+                "task is already claimed into a lane",
+            ));
+        }
+        task.status = HepaTaskStatus::Running;
+        task.lane_ids = vec![lane_id.to_string()];
+        task.updated_at = updated_at.to_string();
+        self.persist_task(&task)?;
+        Ok(task)
+    }
+
     /// Record a task's readiness state.
     pub fn set_task_readiness(
         &self,
