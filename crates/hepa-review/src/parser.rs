@@ -20,6 +20,12 @@ pub struct HepaReviewerOutputError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HepaReviewerNormalizationRoute {
+    DeterministicParser,
+    ReviewerProfileFallback,
+}
+
 impl HepaReviewerOutputError {
     fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -93,6 +99,24 @@ pub fn normalize_reviewer_output(
     Ok(signal)
 }
 
+pub fn normalize_reviewer_output_by_exception(
+    input: HepaReviewerOutputInput,
+    fallback: impl FnOnce(
+        HepaReviewerOutputInput,
+        HepaReviewerOutputError,
+    ) -> Result<HepaReviewSignal, HepaReviewerOutputError>,
+) -> Result<(HepaReviewSignal, HepaReviewerNormalizationRoute), HepaReviewerOutputError> {
+    match normalize_reviewer_output(input.clone()) {
+        Ok(signal) => Ok((signal, HepaReviewerNormalizationRoute::DeterministicParser)),
+        Err(error) => fallback(input, error).map(|signal| {
+            (
+                signal,
+                HepaReviewerNormalizationRoute::ReviewerProfileFallback,
+            )
+        }),
+    }
+}
+
 fn normalize_finding(
     index: usize,
     finding: RawFinding,
@@ -157,6 +181,10 @@ fn require_single_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn normalizes_clean_approved_reviewer_output() {
@@ -287,6 +315,63 @@ mod tests {
             assert_eq!(signal.status, expected_status);
             assert_eq!(signal.findings.len(), expected_findings);
         }
+    }
+
+    #[test]
+    fn clean_parser_path_does_not_engage_reviewer_profile_fallback() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&fallback_calls);
+
+        let (signal, route) = normalize_reviewer_output_by_exception(
+            input(
+                "reviewer-a",
+                r#"{
+                  "status": "approved",
+                  "summary": ["No findings."],
+                  "findings": []
+                }"#,
+            ),
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("clean parser output must not call reviewer-profile fallback")
+            },
+        )
+        .expect("clean output normalizes deterministically");
+
+        assert_eq!(signal.status, HepaReviewStatus::Approved);
+        assert_eq!(route, HepaReviewerNormalizationRoute::DeterministicParser);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn malformed_parser_output_engages_reviewer_profile_fallback_once() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&fallback_calls);
+
+        let (signal, route) = normalize_reviewer_output_by_exception(
+            input("reviewer-a", r#"{"status": "not-a-status"}"#),
+            move |input, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(HepaReviewSignal {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    review_id: input.review_id,
+                    lane_id: input.lane_id,
+                    adapter_id: input.adapter_id,
+                    status: HepaReviewStatus::Failed,
+                    findings: Vec::new(),
+                    summary: vec!["reviewer-profile fallback normalized output".to_string()],
+                    completed_at: input.completed_at,
+                })
+            },
+        )
+        .expect("fallback normalizes malformed output");
+
+        assert_eq!(
+            route,
+            HepaReviewerNormalizationRoute::ReviewerProfileFallback
+        );
+        assert_eq!(signal.status, HepaReviewStatus::Failed);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     fn input(adapter_id: &str, raw_output: &str) -> HepaReviewerOutputInput {
