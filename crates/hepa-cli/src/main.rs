@@ -1,3 +1,4 @@
+mod fleet;
 mod run;
 
 use hepa_adapters::{
@@ -114,6 +115,7 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             ))
         }
         [command, ..] if command == "spec" => Err("unknown spec command".to_string()),
+        [command, rest @ ..] if command == "project" => fleet::project_command(rest),
         [command, subcommand, path] if command == "timing" && subcommand == "summary" => {
             let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("failed to read timing file: {error}"))?;

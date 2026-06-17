@@ -104,6 +104,17 @@ impl HepaFleetRegistry {
         Ok(Some(read_json(&path)?))
     }
 
+    /// Remove a registered project. Returns whether a project was removed.
+    pub fn remove_project(&self, project_id: &str) -> Result<bool, HepaFleetError> {
+        require_safe_segment("project_id", project_id)?;
+        let path = self.project_path(project_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(path)?;
+        Ok(true)
+    }
+
     /// List registered projects in stable `project_id` order.
     pub fn list_projects(&self) -> Result<Vec<HepaRegisteredProject>, HepaFleetError> {
         let mut projects = self.read_records(&self.projects_dir())?;
@@ -471,6 +482,22 @@ mod tests {
         let registry = HepaFleetRegistry::new(&root);
 
         assert!(registry.show_project("absent").expect("show").is_none());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn remove_project_deletes_registration() {
+        let root = unique_test_dir("remove-project");
+        let registry = HepaFleetRegistry::new(&root);
+        registry
+            .register_project(&project("project-1", "<REPO_A>"))
+            .expect("register");
+
+        assert!(registry.remove_project("project-1").expect("remove"));
+        assert!(registry.show_project("project-1").expect("show").is_none());
+        // Removing an absent project is a no-op, not an error.
+        assert!(!registry.remove_project("project-1").expect("idempotent"));
 
         remove_test_dir(root);
     }
