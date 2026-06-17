@@ -106,7 +106,7 @@ impl HepaMonitorPolicy {
     pub fn check_output(&self, output: &str) -> Result<(), HepaMonitorStop> {
         let lowered = output.to_ascii_lowercase();
         for marker in &self.secret_markers {
-            if lowered.contains(&marker.to_ascii_lowercase()) {
+            if output_contains_secret_marker(&lowered, &marker.to_ascii_lowercase()) {
                 return Err(HepaMonitorStop::new(
                     HepaMonitorStopKind::SecretDetected,
                     marker.clone(),
@@ -145,6 +145,31 @@ impl HepaMonitorPolicy {
         }
         Ok(())
     }
+}
+
+fn output_contains_secret_marker(output: &str, marker: &str) -> bool {
+    if marker.contains('=') || marker.contains(':') {
+        return output.contains(marker);
+    }
+
+    output
+        .lines()
+        .any(|line| contains_secret_assignment(line, marker))
+}
+
+fn contains_secret_assignment(line: &str, marker: &str) -> bool {
+    for separator in ['=', ':'] {
+        let Some(index) = line.find(separator) else {
+            continue;
+        };
+        let key = line[..index]
+            .trim()
+            .trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
+        if key.contains(marker) {
+            return true;
+        }
+    }
+    false
 }
 
 fn default_suspicious_path_markers() -> Vec<String> {
@@ -298,6 +323,11 @@ mod tests {
                 ..
             })
         ));
+        assert!(
+            policy
+                .check_output("Updated ResetPasswordForm and reset-password tests")
+                .is_ok()
+        );
     }
 
     #[test]
