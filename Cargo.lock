@@ -68,6 +68,9 @@ version = "0.1.0"
 [[package]]
 name = "hepa-review"
 version = "0.1.0"
+dependencies = [
+ "hepa-core",
+]
 
 [[package]]
 name = "indexmap"

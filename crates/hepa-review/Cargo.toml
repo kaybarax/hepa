@@ -7,4 +7,4 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-
+hepa-core = { path = "../hepa-core" }
