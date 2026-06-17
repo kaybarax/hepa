@@ -222,6 +222,44 @@ fn configured_adapter_executor_blocks_git_lifecycle_before_spawn() {
     remove_test_dir(root);
 }
 
+#[test]
+fn configured_adapter_executor_blocks_unrestricted_host_bypass_before_spawn() {
+    let root = unique_test_dir("configured-blocks-host-bypass");
+    let worktree = root.join("worktree");
+    let artifact_dir = root.join("artifacts");
+    fs::create_dir_all(&worktree).expect("worktree dir");
+    fs::create_dir_all(&artifact_dir).expect("artifact dir");
+    let output_file = artifact_dir.join("blocked.json");
+    let spec = HepaCustomAdapterTemplate {
+        command: "hepa-custom-adapter --prompt-file {prompt_file} --json-output {output_file} --dangerously-skip-permissions"
+            .to_string(),
+        required_commands: vec!["hepa-custom-adapter".to_string()],
+        ..HepaCustomAdapterTemplate::default()
+    }
+    .into_spec()
+    .expect("custom spec");
+    let invocation = HepaOneshotAdapterInvocation {
+        spec,
+        role: HepaAdapterRole::Worker,
+        context: template_context(&worktree, &artifact_dir, &output_file),
+        prompt: "blocked host bypass task".to_string(),
+        environment: BTreeMap::new(),
+        monitor_policy: HepaMonitorPolicy::default(),
+    };
+
+    let error = HepaOneshotAdapterExecutor::new()
+        .run(&invocation)
+        .expect_err("unrestricted host bypass must be blocked before spawn");
+
+    assert_eq!(error.field, "invocation_template");
+    assert_eq!(error.status.as_deref(), Some("blocked"));
+    assert!(error.message.contains("--dangerously-skip-permissions"));
+    assert!(!PathBuf::from(&invocation.context.prompt_file).exists());
+    assert!(!output_file.exists());
+
+    remove_test_dir(root);
+}
+
 fn shell_command_spec(fake_bin: &Path) -> HepaAdapterSpec {
     HepaAdapterSpec {
         schema_version: ADAPTER_SPEC_SCHEMA_VERSION,

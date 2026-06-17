@@ -518,7 +518,7 @@ mod tests {
     use super::*;
     use crate::{
         builtin::builtin_adapter_specs,
-        spec::{ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass},
+        spec::{ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterTemplateContext},
     };
     use std::collections::BTreeMap;
 
@@ -637,6 +637,63 @@ mod tests {
     }
 
     #[test]
+    fn builtin_hepa_adapter_templates_do_not_compose_host_bypass_flags() {
+        let context = template_context();
+        let dangerous_flags = [
+            "--dangerously-skip-permissions",
+            "--allow-all-host",
+            "--privileged",
+            "--no-sandbox",
+        ];
+
+        for spec in builtin_adapter_specs().values() {
+            let mut rendered = vec![
+                spec.render_worker_command(&context)
+                    .expect("worker command renders"),
+            ];
+            if let Some(review_command) = spec
+                .render_review_command(&context)
+                .expect("review command renders")
+            {
+                rendered.push(review_command);
+            }
+
+            for command in rendered {
+                assert_eq!(
+                    unsupported_hepa_flags(&command),
+                    Vec::<String>::new(),
+                    "{} must only compose supported flags",
+                    spec.id
+                );
+                for flag in dangerous_flags {
+                    assert!(
+                        !command.contains(flag),
+                        "{} must not compose unrestricted host bypass flag {flag}",
+                        spec.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_hepa_flags_detect_host_bypass_flags_for_known_adapters() {
+        for flag in [
+            "--dangerously-skip-permissions",
+            "--allow-all-host",
+            "--privileged",
+            "--no-sandbox",
+        ] {
+            assert_eq!(
+                unsupported_hepa_flags(&format!(
+                    "hepa-custom-adapter --prompt-file <PROMPT_FILE> {flag}"
+                )),
+                vec![flag.to_string()]
+            );
+        }
+    }
+
+    #[test]
     fn doctor_reports_auth_env_when_declared_and_detectable() {
         let mut spec = builtin_adapter_specs()
             .remove("custom")
@@ -709,5 +766,16 @@ mod tests {
         assert!(output.contains("small-local"));
         assert!(output.contains("sandbox=agent-native"));
         assert!(output.contains("max_concurrency=2"));
+    }
+
+    fn template_context() -> HepaAdapterTemplateContext {
+        HepaAdapterTemplateContext {
+            prompt_file: "<PROMPT_FILE>".to_string(),
+            worktree: "<WORKTREE>".to_string(),
+            review_prompt_file: "<REVIEW_PROMPT_FILE>".to_string(),
+            output_file: "<OUTPUT_FILE>".to_string(),
+            review_output_file: "<REVIEW_OUTPUT_FILE>".to_string(),
+            artifact_dir: "<ARTIFACT_DIR>".to_string(),
+        }
     }
 }
