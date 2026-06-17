@@ -327,6 +327,10 @@ pub fn run_live_task(
         started_at: "2026-06-16T00:00:02Z",
         completed_at: "2026-06-16T00:00:03Z",
     })?;
+    if live_force_secret_path_change() {
+        inject_secret_path_fixture(&allocation.worktree_path)?;
+        attempt_outcome.changed_files = collect_changed_files(&allocation.worktree_path)?;
+    }
 
     transition_and_record(
         &lane_paths,
@@ -1295,6 +1299,23 @@ fn live_force_first_validation_failure() -> bool {
             .as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES")
     )
+}
+
+fn live_force_secret_path_change() -> bool {
+    matches!(
+        std::env::var("HEPA_LIVE_FORCE_SECRET_PATH_CHANGE")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn inject_secret_path_fixture(worktree: &Path) -> Result<(), String> {
+    fs::write(
+        worktree.join(".env"),
+        "RS5_SECRET_PATH_FIXTURE=placeholder\n",
+    )
+    .map_err(|error| format!("failed to inject secret-path fixture: {error}"))
 }
 
 fn force_validation_failure_for_repair_stress(
@@ -2566,6 +2587,23 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("RS-4 controlled repair trigger"))
         );
+    }
+
+    #[test]
+    fn live_secret_path_fixture_is_collected_and_rejected_by_staging() {
+        let root = unique_test_dir("live-secret-path-fixture");
+        let repo = root.join("repo");
+        init_repo(&repo);
+
+        inject_secret_path_fixture(&repo).expect("fixture should write");
+        let changed = collect_changed_files(&repo).expect("changed files should collect fixture");
+
+        assert_eq!(changed, vec![".env".to_string()]);
+        let error = HepaSafeStaging::new(&repo)
+            .stage_approved_files(&changed)
+            .expect_err("secret-like path must be rejected");
+        assert!(error.to_string().contains("secret-like paths"));
+        remove_test_dir(root);
     }
 
     #[test]
