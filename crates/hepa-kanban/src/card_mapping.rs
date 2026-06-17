@@ -212,6 +212,7 @@ pub fn map_task_to_hermes_card(
         .as_ref()
         .and_then(|report| report.timing.as_ref()))
     {
+        let repair_rounds = repair_round_refs(timing)?;
         fields.insert(
             "agent_loops".to_string(),
             HepaHermesFieldValue::Number(timing.counters.agent_loops.into()),
@@ -231,6 +232,14 @@ pub fn map_task_to_hermes_card(
         fields.insert(
             "container_count".to_string(),
             HepaHermesFieldValue::Number(timing.counters.container_count.into()),
+        );
+        fields.insert(
+            "repair_round_count".to_string(),
+            HepaHermesFieldValue::Number(repair_rounds.len() as u64),
+        );
+        fields.insert(
+            "repair_rounds".to_string(),
+            HepaHermesFieldValue::List(repair_rounds),
         );
     }
 
@@ -396,19 +405,40 @@ fn lane_state_refs(
         .collect()
 }
 
+fn repair_round_refs(timing: &HepaTimingRecord) -> Result<Vec<String>, HepaKanbanMappingError> {
+    timing
+        .phases
+        .iter()
+        .filter(|phase| phase.name.contains("repair"))
+        .map(|phase| {
+            let round = phase
+                .round
+                .map(|round| round.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            Ok(format!(
+                "round-{}:{}",
+                round,
+                stable_json_name(&phase.status)?
+            ))
+        })
+        .collect()
+}
+
 fn timing_comment(
     timing: &HepaTimingRecord,
 ) -> Result<HepaHermesCardComment, HepaKanbanMappingError> {
+    let repair_rounds = repair_round_refs(timing)?;
     Ok(HepaHermesCardComment {
         kind: HepaHermesCommentKind::Timing,
         body: format!(
-            "Timing run: {}\nAgent loops: {}\nManager passes: {}\nInstall events: {}\nContainer count: {}\nPhases: {}",
+            "Timing run: {}\nAgent loops: {}\nManager passes: {}\nInstall events: {}\nContainer count: {}\nPhases: {}\nRepair rounds: {}",
             timing.run_id,
             timing.counters.agent_loops,
             timing.counters.manager_passes,
             timing.counters.install_events,
             timing.counters.container_count,
-            timing.phases.len()
+            timing.phases.len(),
+            join_or_none(&repair_rounds)
         ),
     })
 }
@@ -674,16 +704,28 @@ mod tests {
         let timing = HepaTimingRecord {
             schema_version: CONTRACT_SCHEMA_VERSION,
             run_id: "run-1".to_string(),
-            phases: vec![HepaTimingPhase {
-                name: "review".to_string(),
-                status: HepaPhaseStatus::Completed,
-                duration_seconds: 1.5,
-                round: Some(1),
-                role: None,
-                adapter_id: Some("reviewer-a".to_string()),
-                routing_reason: Some("review fanout".to_string()),
-                sandbox_posture: Some("host-worktree".to_string()),
-            }],
+            phases: vec![
+                HepaTimingPhase {
+                    name: "review".to_string(),
+                    status: HepaPhaseStatus::Completed,
+                    duration_seconds: 1.5,
+                    round: Some(1),
+                    role: None,
+                    adapter_id: Some("reviewer-a".to_string()),
+                    routing_reason: Some("review fanout".to_string()),
+                    sandbox_posture: Some("host-worktree".to_string()),
+                },
+                HepaTimingPhase {
+                    name: "repair".to_string(),
+                    status: HepaPhaseStatus::Blocked,
+                    duration_seconds: 2.0,
+                    round: Some(2),
+                    role: None,
+                    adapter_id: Some("fake".to_string()),
+                    routing_reason: Some("Ralph-V2 repair".to_string()),
+                    sandbox_posture: Some("host-worktree".to_string()),
+                },
+            ],
             counters: HepaTimingCounters {
                 agent_loops: 1,
                 manager_passes: 1,
@@ -799,6 +841,16 @@ mod tests {
             payload.fields.get("container_count"),
             Some(&HepaHermesFieldValue::Number(0))
         );
+        assert_eq!(
+            payload.fields.get("repair_round_count"),
+            Some(&HepaHermesFieldValue::Number(1))
+        );
+        assert_eq!(
+            payload.fields.get("repair_rounds"),
+            Some(&HepaHermesFieldValue::List(vec![
+                "round-2:blocked".to_string()
+            ]))
+        );
         assert!(
             payload
                 .comments
@@ -811,6 +863,13 @@ mod tests {
                 .iter()
                 .any(|comment| comment.kind == HepaHermesCommentKind::Arbitration
                     && comment.body.contains("manager_accepted"))
+        );
+        assert!(
+            payload
+                .comments
+                .iter()
+                .any(|comment| comment.kind == HepaHermesCommentKind::Timing
+                    && comment.body.contains("Repair rounds: round-2:blocked"))
         );
     }
 
