@@ -1,4 +1,5 @@
 use hepa_adapters::builtin::{BUILTIN_ADAPTER_IDS, builtin_adapter_spec};
+use hepa_adapters::container::unrestricted_bypass_flag;
 use hepa_adapters::spec::HepaAdapterRole;
 use hepa_core::env_allowlist::{HepaEnvAllowlist, HepaEnvRole, MANAGER_ONLY_CREDENTIALS};
 use std::collections::BTreeMap;
@@ -40,6 +41,26 @@ fn every_builtin_adapter_role_env_excludes_manager_credentials() {
             assert!(
                 !filtered.contains_key("OPENAI_API_KEY"),
                 "adapter {id} ({role:?}) leaked an undeclared host secret"
+            );
+        }
+    }
+}
+
+/// No built-in adapter's HEPA-composed command grants unrestricted host access.
+#[test]
+fn no_builtin_adapter_command_uses_bypass_flags() {
+    for id in BUILTIN_ADAPTER_IDS {
+        let spec = builtin_adapter_spec(id);
+        assert_eq!(
+            unrestricted_bypass_flag(&spec.command),
+            None,
+            "adapter {id} worker command uses a bypass flag"
+        );
+        if let Some(review_command) = &spec.review_command {
+            assert_eq!(
+                unrestricted_bypass_flag(review_command),
+                None,
+                "adapter {id} review command uses a bypass flag"
             );
         }
     }
