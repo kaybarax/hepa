@@ -34,7 +34,21 @@ pub struct HepaRepairRoundState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaRepairRoundDecision {
     pub allowed: bool,
+    pub block_classification: Option<HepaRepairBlockClassification>,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HepaRepairBlockClassification {
+    RoundExhausted,
+    AttemptsExhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaRepairBlock {
+    pub classification: HepaRepairBlockClassification,
+    pub reason: String,
+    pub human_attention_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +128,7 @@ pub fn enforce_repair_round_budget(
     if state.next_repair_round > policy.max_repair_rounds {
         return Ok(HepaRepairRoundDecision {
             allowed: false,
+            block_classification: Some(HepaRepairBlockClassification::RoundExhausted),
             reason: format!(
                 "repair round {} exceeds max repair rounds {}",
                 state.next_repair_round, policy.max_repair_rounds
@@ -123,6 +138,7 @@ pub fn enforce_repair_round_budget(
     if state.total_attempts_after_next > policy.max_total_attempts {
         return Ok(HepaRepairRoundDecision {
             allowed: false,
+            block_classification: Some(HepaRepairBlockClassification::AttemptsExhausted),
             reason: format!(
                 "total attempts {} exceeds max total attempts {}",
                 state.total_attempts_after_next, policy.max_total_attempts
@@ -131,6 +147,7 @@ pub fn enforce_repair_round_budget(
     }
     Ok(HepaRepairRoundDecision {
         allowed: true,
+        block_classification: None,
         reason: format!(
             "repair round {} within max rounds {} and total attempts {} within max {}",
             state.next_repair_round,
@@ -139,6 +156,18 @@ pub fn enforce_repair_round_budget(
             policy.max_total_attempts
         ),
     })
+}
+
+pub fn block_when_repair_cannot_converge(
+    decision: HepaRepairRoundDecision,
+) -> Option<HepaRepairBlock> {
+    decision
+        .block_classification
+        .map(|classification| HepaRepairBlock {
+            classification,
+            reason: decision.reason,
+            human_attention_required: true,
+        })
 }
 
 fn evidence_lines(input: &HepaRepairBriefInput) -> Vec<String> {
@@ -260,6 +289,7 @@ mod tests {
         )
         .expect("budget evaluates");
         assert!(allowed.allowed);
+        assert_eq!(allowed.block_classification, None);
 
         let round_exhausted = enforce_repair_round_budget(
             policy.clone(),
@@ -270,6 +300,10 @@ mod tests {
         )
         .expect("budget evaluates");
         assert!(!round_exhausted.allowed);
+        assert_eq!(
+            round_exhausted.block_classification,
+            Some(HepaRepairBlockClassification::RoundExhausted)
+        );
         assert!(round_exhausted.reason.contains("exceeds max repair rounds"));
 
         let attempts_exhausted = enforce_repair_round_budget(
@@ -281,6 +315,10 @@ mod tests {
         )
         .expect("budget evaluates");
         assert!(!attempts_exhausted.allowed);
+        assert_eq!(
+            attempts_exhausted.block_classification,
+            Some(HepaRepairBlockClassification::AttemptsExhausted)
+        );
         assert!(
             attempts_exhausted
                 .reason
@@ -303,6 +341,47 @@ mod tests {
         .expect_err("zero max repair rounds fails");
 
         assert_eq!(error.field, "max_repair_rounds");
+    }
+
+    #[test]
+    fn blocks_with_classification_when_repair_cannot_converge() {
+        let decision = enforce_repair_round_budget(
+            HepaRepairRoundPolicy {
+                max_repair_rounds: 2,
+                max_total_attempts: 3,
+            },
+            HepaRepairRoundState {
+                next_repair_round: 3,
+                total_attempts_after_next: 3,
+            },
+        )
+        .expect("budget evaluates");
+
+        let block = block_when_repair_cannot_converge(decision).expect("block is classified");
+
+        assert_eq!(
+            block.classification,
+            HepaRepairBlockClassification::RoundExhausted
+        );
+        assert!(block.reason.contains("exceeds max repair rounds"));
+        assert!(block.human_attention_required);
+    }
+
+    #[test]
+    fn continuing_repair_does_not_create_block() {
+        let decision = enforce_repair_round_budget(
+            HepaRepairRoundPolicy {
+                max_repair_rounds: 2,
+                max_total_attempts: 3,
+            },
+            HepaRepairRoundState {
+                next_repair_round: 1,
+                total_attempts_after_next: 2,
+            },
+        )
+        .expect("budget evaluates");
+
+        assert_eq!(block_when_repair_cannot_converge(decision), None);
     }
 
     fn finding() -> HepaReviewFinding {
