@@ -195,6 +195,7 @@ fn monitor_error(stop: HepaMonitorStop) -> HepaAdapterExecutionError {
         HepaMonitorStopKind::CommandPolicy => "command_policy",
         HepaMonitorStopKind::SecretDetected => "secret_detected",
         HepaMonitorStopKind::ScopeViolation => "scope_violation",
+        HepaMonitorStopKind::SuspiciousPath => "suspicious_path",
         HepaMonitorStopKind::Timeout => "timeout",
         HepaMonitorStopKind::Stall => "stall",
     };
