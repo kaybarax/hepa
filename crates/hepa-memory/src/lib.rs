@@ -1,4 +1,5 @@
 use hepa_core::contracts::HepaLaneState;
+use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     fmt, fs, io,
@@ -18,6 +19,25 @@ pub const CONTEXT_PACK_BYTE_BUDGET: usize = 16 * 1024;
 /// Maximum number of pattern entries retained per learning pack. Older entries
 /// are dropped so packs stay bounded.
 pub const MAX_PATTERN_ENTRIES: usize = 200;
+
+/// Maximum number of reward-signal records retained per project.
+pub const MAX_REWARD_ENTRIES: usize = 500;
+
+pub const REWARD_SIGNALS_FILE: &str = "reward-signals.jsonl";
+
+/// Reward signals captured for one lane on a terminal outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaRewardSignal {
+    pub project_id: String,
+    pub lane_id: String,
+    pub validation_pass: bool,
+    pub reviewer_pass: bool,
+    pub pr_readiness: bool,
+    pub ci_pass: bool,
+    pub human_merge: bool,
+    pub repair_convergence: bool,
+    pub created_at: String,
+}
 
 /// Lane states that conclude a lane and trigger learning write-back.
 pub fn is_terminal_lane_state(state: &HepaLaneState) -> bool {
@@ -130,6 +150,68 @@ impl HepaProjectMemory {
     /// degrade gracefully instead of failing.
     pub fn read_pack(&self, pack: HepaContextPack) -> Option<String> {
         fs::read_to_string(self.pack_path(pack)).ok()
+    }
+
+    fn reward_signals_path(&self) -> PathBuf {
+        self.project_dir().join(REWARD_SIGNALS_FILE)
+    }
+
+    /// Append one lane's reward signals (validation pass, reviewer pass, PR
+    /// readiness, CI pass, human merge, repair convergence). The log is capped
+    /// so it stays bounded.
+    pub fn record_reward(&self, signal: &HepaRewardSignal) -> Result<(), HepaMemoryError> {
+        require_safe_segment("lane_id", &signal.lane_id)?;
+        if signal.created_at.contains('\n') || signal.created_at.contains('\r') {
+            return Err(HepaMemoryError::new("created_at", "must be a single line"));
+        }
+        fs::create_dir_all(self.project_dir())?;
+        let path = self.reward_signals_path();
+
+        let mut lines: Vec<String> = fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        lines.push(
+            serde_json::to_string(signal)
+                .map_err(|error| HepaMemoryError::new("reward_signal", error.to_string()))?,
+        );
+        if lines.len() > MAX_REWARD_ENTRIES {
+            let overflow = lines.len() - MAX_REWARD_ENTRIES;
+            lines.drain(0..overflow);
+        }
+        let mut content = lines.join("\n");
+        content.push('\n');
+        fs::write(&path, content)?;
+        Ok(())
+    }
+
+    /// List recorded reward signals, returning an empty list when none exist so
+    /// callers degrade gracefully.
+    pub fn list_rewards(&self) -> Vec<HepaRewardSignal> {
+        let Ok(contents) = fs::read_to_string(self.reward_signals_path()) else {
+            return Vec::new();
+        };
+        contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Failure-pattern entries for inclusion in a retry/repair brief. Returns
+    /// the bare entries when the failure pack is present, and an empty list when
+    /// it is absent so briefs degrade gracefully.
+    pub fn retry_brief_failure_context(&self) -> Vec<String> {
+        let Some(contents) = self.read_pack(HepaContextPack::FailurePatterns) else {
+            return Vec::new();
+        };
+        contents
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Append a successful prompt pattern, but only on a terminal lane state.
@@ -392,6 +474,68 @@ mod tests {
             .expect("failure pack exists");
         assert!(!failures.contains("/Users/"));
         assert_eq!(failures.matches("- test failed in").count(), 1);
+
+        remove_test_dir(root);
+    }
+
+    fn reward(lane_id: &str) -> HepaRewardSignal {
+        HepaRewardSignal {
+            project_id: "project-1".to_string(),
+            lane_id: lane_id.to_string(),
+            validation_pass: true,
+            reviewer_pass: true,
+            pr_readiness: true,
+            ci_pass: true,
+            human_merge: false,
+            repair_convergence: true,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn records_and_lists_reward_signals() {
+        let root = unique_test_dir("rewards");
+        let memory = HepaProjectMemory::new(&root, "project-1").expect("valid project");
+
+        memory.record_reward(&reward("lane-1")).expect("record one");
+        memory.record_reward(&reward("lane-2")).expect("record two");
+
+        let rewards = memory.list_rewards();
+        assert_eq!(rewards.len(), 2);
+        assert_eq!(rewards[0].lane_id, "lane-1");
+        assert!(rewards[0].validation_pass);
+        assert!(rewards[0].reviewer_pass);
+        assert!(rewards[0].pr_readiness);
+        assert!(rewards[0].ci_pass);
+        assert!(rewards[0].repair_convergence);
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn list_rewards_degrades_gracefully_when_absent() {
+        let root = unique_test_dir("rewards-missing");
+        let memory = HepaProjectMemory::new(&root, "project-1").expect("valid project");
+
+        assert!(memory.list_rewards().is_empty());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn retry_brief_consults_failure_patterns_when_present() {
+        let root = unique_test_dir("retry-brief");
+        let memory = HepaProjectMemory::new(&root, "project-1").expect("valid project");
+
+        // Absent failure pack: no context, but no failure.
+        assert!(memory.retry_brief_failure_context().is_empty());
+
+        memory
+            .append_failure_pattern(&HepaLaneState::Failed, "flaky integration test on retry")
+            .expect("record failure");
+
+        let context = memory.retry_brief_failure_context();
+        assert_eq!(context, vec!["flaky integration test on retry".to_string()]);
 
         remove_test_dir(root);
     }
