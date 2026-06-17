@@ -95,6 +95,43 @@ impl HepaVersionPinRegistry {
     }
 }
 
+/// Explicit classification of an adapter's JSON output. Parsing never silently
+/// falls back to a default; a malformed or schema-drifted output is reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HepaAdapterOutputClassification {
+    Parsed,
+    ParseFailed { reason: String },
+}
+
+/// Classify raw adapter output against the required fields, explicitly reporting
+/// invalid JSON or a missing required field instead of misparsing.
+pub fn classify_adapter_output(
+    raw: &str,
+    required_fields: &[&str],
+) -> HepaAdapterOutputClassification {
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return HepaAdapterOutputClassification::ParseFailed {
+                reason: format!("output is not valid JSON: {error}"),
+            };
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return HepaAdapterOutputClassification::ParseFailed {
+            reason: "output is not a JSON object".to_string(),
+        };
+    };
+    for field in required_fields {
+        if !object.contains_key(*field) {
+            return HepaAdapterOutputClassification::ParseFailed {
+                reason: format!("output is missing required field `{field}`"),
+            };
+        }
+    }
+    HepaAdapterOutputClassification::Parsed
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HepaVersionWarningKind {
     UntestedVersion,
@@ -176,6 +213,32 @@ mod tests {
             .detect_flag_drift("fake", BUILTIN_PINNED_VERSION, &drifted)
             .expect("drift should be detected");
         assert_eq!(warning.kind, HepaVersionWarningKind::FlagDrift);
+    }
+
+    #[test]
+    fn adapter_output_parse_failures_classify_explicitly() {
+        // Valid output with required fields parses.
+        assert_eq!(
+            classify_adapter_output(r#"{"status":"completed","changed_files":[]}"#, &["status"]),
+            HepaAdapterOutputClassification::Parsed
+        );
+
+        // Invalid JSON is reported, not silently misparsed.
+        match classify_adapter_output("not json at all", &["status"]) {
+            HepaAdapterOutputClassification::ParseFailed { reason } => {
+                assert!(reason.contains("not valid JSON"));
+            }
+            other => panic!("expected parse failure, got {other:?}"),
+        }
+
+        // Missing required field (schema drift) is reported explicitly.
+        match classify_adapter_output(r#"{"other":"value"}"#, &["status"]) {
+            HepaAdapterOutputClassification::ParseFailed { reason } => {
+                assert!(reason.contains("missing required field"));
+                assert!(reason.contains("status"));
+            }
+            other => panic!("expected parse failure, got {other:?}"),
+        }
     }
 
     #[test]
