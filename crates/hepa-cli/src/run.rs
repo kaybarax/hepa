@@ -349,74 +349,32 @@ pub fn run_live_task(
         "live adapter completed",
         "2026-06-16T00:00:03Z",
     )?;
-    let validation = validation_summary();
+    let validation = live_validation_blocked_summary();
     write_json(&lane_paths.validation_summary, &validation).map_err(|error| error.to_string())?;
     transition_and_record(
         &lane_paths,
         &mut lane,
         4,
-        HepaLaneState::Reviewing,
-        "validation placeholder passed",
+        HepaLaneState::Blocked,
+        "live post-worker validation/review/staging/PR gates are not implemented",
         "2026-06-16T00:00:04Z",
-    )?;
-
-    let fake = HepaFakeAdapter::default();
-    let review = fake
-        .run_reviewer(&HepaFakeReviewerInput {
-            lane_id: config.lane_id.clone(),
-            review_id: "review-1".to_string(),
-            completed_at: "2026-06-16T00:00:05Z".to_string(),
-        })
-        .map_err(|error| error.to_string())?;
-    write_json(
-        &lane_paths
-            .review_signal("review-1")
-            .map_err(|error| error.to_string())?,
-        &review,
-    )
-    .map_err(|error| error.to_string())?;
-
-    transition_and_record(
-        &lane_paths,
-        &mut lane,
-        5,
-        HepaLaneState::Staging,
-        "live review approved",
-        "2026-06-16T00:00:05Z",
-    )?;
-    transition_and_record(
-        &lane_paths,
-        &mut lane,
-        6,
-        HepaLaneState::PrCreated,
-        "live staging completed",
-        "2026-06-16T00:00:06Z",
-    )?;
-    transition_and_record(
-        &lane_paths,
-        &mut lane,
-        7,
-        HepaLaneState::Completed,
-        "live done gate passed",
-        "2026-06-16T00:00:07Z",
     )?;
     write_json(&lane_paths.lane_state, &lane).map_err(|error| error.to_string())?;
 
-    let readiness = readiness_result(config);
-    task.status = HepaTaskStatus::Completed;
-    task.readiness = HepaReadinessState::Ready;
-    task.completed_at = Some("2026-06-16T00:00:07Z".to_string());
+    let readiness = live_blocked_readiness_result(config);
+    task.status = HepaTaskStatus::Blocked;
+    task.readiness = HepaReadinessState::Blocked;
     write_json(&run_paths.task_state, &task).map_err(|error| error.to_string())?;
 
-    let timing = timing_record(config);
+    let timing = live_blocked_timing_record(config, adapter_id);
     lane_paths
         .write_timing_record(&timing)
         .map_err(|error| error.to_string())?;
-    let terminal_report = terminal_report(config, validation, review, timing.clone());
+    let terminal_report = live_blocked_terminal_report(config, validation, timing.clone());
     write_json(&lane_paths.final_report, &terminal_report).map_err(|error| error.to_string())?;
     write_json(&run_paths.run_state, &readiness).map_err(|error| error.to_string())?;
     run_paths
-        .archive_on_exit("2026-06-16T00:00:08Z", HepaArchiveOutcome::Completed)
+        .archive_on_exit("2026-06-16T00:00:08Z", HepaArchiveOutcome::Blocked)
         .map_err(|error| error.to_string())?;
 
     let cleanup = allocator
@@ -426,7 +384,7 @@ pub fn run_live_task(
     Ok(HepaFakeRunResult {
         run_id: config.run_id.clone(),
         lane_id: config.lane_id.clone(),
-        status: "completed".to_string(),
+        status: "blocked".to_string(),
         timing,
         terminal_report,
         cleanup_performed: matches!(
@@ -660,6 +618,20 @@ fn validation_summary() -> HepaValidationSummary {
     }
 }
 
+fn live_validation_blocked_summary() -> HepaValidationSummary {
+    HepaValidationSummary {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        status: HepaValidationStatus::Failed,
+        commands: Vec::new(),
+        no_tests_detected: false,
+        failure_type: Some("live_pipeline_incomplete".to_string()),
+        summary: vec![
+            "Live worker attempt completed, but HEPA live validation, review, staging, and PR gates are not implemented yet.".to_string(),
+            "Run is blocked instead of fake-completed so RS evidence cannot overclaim release readiness.".to_string(),
+        ],
+    }
+}
+
 fn readiness_result(config: &HepaFakeRunConfig) -> HepaReadinessResult {
     HepaReadinessResult {
         schema_version: CONTRACT_SCHEMA_VERSION,
@@ -668,6 +640,19 @@ fn readiness_result(config: &HepaFakeRunConfig) -> HepaReadinessResult {
         blockers: Vec::new(),
         questions: Vec::new(),
         checked_at: "2026-06-16T00:00:00Z".to_string(),
+    }
+}
+
+fn live_blocked_readiness_result(config: &HepaFakeRunConfig) -> HepaReadinessResult {
+    HepaReadinessResult {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: config.task_id.clone(),
+        status: HepaReadinessStatus::Blocked,
+        blockers: vec![
+            "Live validation, review, staging, and PR gates must be implemented before this lane can be ready.".to_string(),
+        ],
+        questions: Vec::new(),
+        checked_at: "2026-06-16T00:00:04Z".to_string(),
     }
 }
 
@@ -718,6 +703,43 @@ fn timing_record(config: &HepaFakeRunConfig) -> HepaTimingRecord {
     }
 }
 
+fn live_blocked_timing_record(config: &HepaFakeRunConfig, adapter_id: &str) -> HepaTimingRecord {
+    HepaTimingRecord {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        run_id: config.run_id.clone(),
+        phases: vec![
+            HepaTimingPhase {
+                name: "live_worker".to_string(),
+                status: HepaPhaseStatus::Completed,
+                duration_seconds: 1.0,
+                round: Some(1),
+                role: Some(HepaAgentRole::Worker),
+                adapter_id: Some(adapter_id.to_string()),
+                routing_reason: Some("explicit live adapter".to_string()),
+                sandbox_posture: Some(run_sandbox_posture()),
+            },
+            HepaTimingPhase {
+                name: "live_post_worker_gates".to_string(),
+                status: HepaPhaseStatus::Blocked,
+                duration_seconds: 0.0,
+                round: Some(1),
+                role: Some(HepaAgentRole::Manager),
+                adapter_id: None,
+                routing_reason: Some("live pipeline gates not implemented".to_string()),
+                sandbox_posture: Some(run_sandbox_posture()),
+            },
+        ],
+        counters: HepaTimingCounters {
+            agent_loops: 1,
+            manager_passes: 1,
+            worker_profile_llm_calls: 0,
+            reviewer_passes: 0,
+            install_events: 0,
+            container_count: 0,
+        },
+    }
+}
+
 fn terminal_report(
     config: &HepaFakeRunConfig,
     validation: HepaValidationSummary,
@@ -737,6 +759,30 @@ fn terminal_report(
         summary: vec!["Fake run completed deterministically.".to_string()],
         human_attention_required: false,
         completed_at: "2026-06-16T00:00:07Z".to_string(),
+    }
+}
+
+fn live_blocked_terminal_report(
+    config: &HepaFakeRunConfig,
+    validation: HepaValidationSummary,
+    timing: HepaTimingRecord,
+) -> HepaTerminalTaskReport {
+    HepaTerminalTaskReport {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: config.task_id.clone(),
+        lane_id: config.lane_id.clone(),
+        status: HepaTerminalStatus::Blocked,
+        pr_url: None,
+        validation: Some(validation),
+        review_signals: Vec::new(),
+        arbitration: None,
+        timing: Some(timing),
+        summary: vec![
+            "Live worker attempt completed.".to_string(),
+            "HEPA blocked before review/staging/PR because live post-worker gates are not implemented yet.".to_string(),
+        ],
+        human_attention_required: true,
+        completed_at: "2026-06-16T00:00:04Z".to_string(),
     }
 }
 
@@ -910,6 +956,47 @@ mod tests {
         assert!(prompt.contains("Run the smallest relevant validation command"));
         assert!(!prompt.contains("Added by Pi smoke test"));
         assert!(!prompt.contains("Make exactly one change"));
+    }
+
+    #[test]
+    fn live_blocked_records_do_not_fake_complete_post_worker_gates() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Run a real frontend task".to_string(),
+            timing: true,
+        };
+        let validation = live_validation_blocked_summary();
+        let timing = live_blocked_timing_record(&config, "pi");
+        let report = live_blocked_terminal_report(&config, validation.clone(), timing.clone());
+
+        assert_eq!(validation.status, HepaValidationStatus::Failed);
+        assert_eq!(
+            validation.failure_type.as_deref(),
+            Some("live_pipeline_incomplete")
+        );
+        assert_eq!(report.status, HepaTerminalStatus::Blocked);
+        assert!(report.pr_url.is_none());
+        assert!(report.review_signals.is_empty());
+        assert!(report.human_attention_required);
+        assert!(
+            timing
+                .phases
+                .iter()
+                .any(|phase| phase.name == "live_post_worker_gates"
+                    && phase.status == HepaPhaseStatus::Blocked)
+        );
+        assert!(
+            timing
+                .phases
+                .iter()
+                .all(|phase| !phase.name.starts_with("fake_"))
+        );
     }
 
     fn init_repo(repo: &Path) {
