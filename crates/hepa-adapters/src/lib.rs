@@ -7,6 +7,7 @@ pub mod registry;
 pub mod routing;
 pub mod shell_command;
 pub mod spec;
+pub mod user_worker;
 
 pub const CRATE_NAME: &str = "hepa-adapters";
 
