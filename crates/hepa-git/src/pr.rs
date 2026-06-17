@@ -1,3 +1,7 @@
+use hepa_core::contracts::{
+    HepaAgentRole, HepaFindingSeverity, HepaLane, HepaReviewStatus, HepaRiskLevel, HepaTaskSpec,
+    HepaTerminalStatus, HepaTerminalTaskReport, HepaValidationStatus,
+};
 use std::{
     error::Error,
     fmt, io,
@@ -282,6 +286,217 @@ impl HepaManagerGitLifecycle {
     }
 }
 
+/// Inputs needed to honestly reconstruct the run in a PR body.
+#[derive(Debug, Clone, Copy)]
+pub struct HepaPrBodyInput<'a> {
+    pub task_spec: &'a HepaTaskSpec,
+    pub terminal_report: &'a HepaTerminalTaskReport,
+    pub lane: &'a HepaLane,
+    pub external_card_id: Option<&'a str>,
+}
+
+/// Build a deterministic, sanitized PR body that reconstructs the run:
+/// summary, validation, review, risk, adapter, timing, and the Hermes card link.
+pub fn build_pr_body(input: &HepaPrBodyInput) -> String {
+    let report = input.terminal_report;
+    let mut lines = Vec::new();
+
+    lines.push("## Summary".to_string());
+    lines.push(format!("- Status: {}", terminal_status_label(report)));
+    lines.push(format!("- Task: {}", input.task_spec.goal));
+    if report.summary.is_empty() {
+        lines.push("- No summary recorded.".to_string());
+    } else {
+        for entry in &report.summary {
+            lines.push(format!("- {entry}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Validation".to_string());
+    match &report.validation {
+        Some(validation) => {
+            lines.push(format!(
+                "- Result: {}",
+                validation_status_label(&validation.status)
+            ));
+            if validation.no_tests_detected {
+                lines.push("- No tests detected (honestly recorded).".to_string());
+            }
+            if let Some(failure_type) = &validation.failure_type {
+                lines.push(format!("- Failure type: {failure_type}"));
+            }
+            for command in &validation.commands {
+                lines.push(format!(
+                    "- `{}` exited {}",
+                    command.command, command.exit_code
+                ));
+            }
+        }
+        None => lines.push("- No validation summary recorded.".to_string()),
+    }
+
+    lines.push(String::new());
+    lines.push("## Review".to_string());
+    if report.review_signals.is_empty() {
+        lines.push("- No review signals recorded.".to_string());
+    } else {
+        for signal in &report.review_signals {
+            lines.push(format!(
+                "- {} via `{}`: {} ({} finding(s))",
+                signal.review_id,
+                signal.adapter_id,
+                review_status_label(&signal.status),
+                signal.findings.len()
+            ));
+            for finding in &signal.findings {
+                lines.push(format!(
+                    "  - {} [{}] {} (accepted={})",
+                    finding.finding_id,
+                    severity_label(&finding.severity),
+                    finding.message,
+                    finding.accepted
+                ));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Risk".to_string());
+    lines.push(format!("- Declared risk: {}", risk_label(input)));
+    lines.push(format!(
+        "- Human attention required: {}",
+        report.human_attention_required
+    ));
+    match &report.arbitration {
+        Some(arbitration) => {
+            lines.push(format!("- Arbitration: {}", arbitration.status));
+            for entry in &arbitration.pr_body_lines {
+                lines.push(format!("  {entry}"));
+            }
+        }
+        None => lines.push("- Arbitration: none required.".to_string()),
+    }
+
+    lines.push(String::new());
+    lines.push("## Adapter".to_string());
+    lines.push(format!("- Lane adapter: {}", input.lane.adapter_id));
+    for adapter_line in adapter_phase_lines(report) {
+        lines.push(adapter_line);
+    }
+
+    lines.push(String::new());
+    lines.push("## Timing".to_string());
+    match &report.timing {
+        Some(timing) => {
+            let total: f64 = timing
+                .phases
+                .iter()
+                .map(|phase| phase.duration_seconds)
+                .sum();
+            lines.push(format!(
+                "- Wall time: {total:.2}s across {} phase(s)",
+                timing.phases.len()
+            ));
+            let counters = &timing.counters;
+            lines.push(format!(
+                "- Agent loops: {} | manager passes: {} | reviewer passes: {}",
+                counters.agent_loops, counters.manager_passes, counters.reviewer_passes
+            ));
+            lines.push(format!(
+                "- Worker-profile calls: {} | installs: {} | containers: {}",
+                counters.worker_profile_llm_calls,
+                counters.install_events,
+                counters.container_count
+            ));
+        }
+        None => lines.push("- No timing record captured.".to_string()),
+    }
+
+    lines.push(String::new());
+    lines.push("## Hermes card".to_string());
+    match input.external_card_id {
+        Some(card_id) if !card_id.trim().is_empty() => {
+            lines.push(format!("- Card: {card_id}"));
+        }
+        _ => lines.push("- No Hermes card linked.".to_string()),
+    }
+
+    let mut body = lines.join("\n");
+    body.push('\n');
+    body
+}
+
+fn terminal_status_label(report: &HepaTerminalTaskReport) -> &'static str {
+    match report.status {
+        HepaTerminalStatus::Completed => "completed",
+        HepaTerminalStatus::Blocked => "blocked",
+        HepaTerminalStatus::Failed => "failed",
+        HepaTerminalStatus::Cancelled => "cancelled",
+    }
+}
+
+fn validation_status_label(status: &HepaValidationStatus) -> &'static str {
+    match status {
+        HepaValidationStatus::Passed => "passed",
+        HepaValidationStatus::Failed => "failed",
+        HepaValidationStatus::Skipped => "skipped",
+        HepaValidationStatus::NoTestsDetected => "no tests detected",
+    }
+}
+
+fn review_status_label(status: &HepaReviewStatus) -> &'static str {
+    match status {
+        HepaReviewStatus::Approved => "approved",
+        HepaReviewStatus::ChangesRequested => "changes requested",
+        HepaReviewStatus::Blocked => "blocked",
+        HepaReviewStatus::Failed => "failed",
+    }
+}
+
+fn severity_label(severity: &HepaFindingSeverity) -> &'static str {
+    match severity {
+        HepaFindingSeverity::Low => "low",
+        HepaFindingSeverity::Medium => "medium",
+        HepaFindingSeverity::High => "high",
+        HepaFindingSeverity::Critical => "critical",
+    }
+}
+
+fn risk_label(input: &HepaPrBodyInput) -> &'static str {
+    match input.task_spec.risk_level {
+        HepaRiskLevel::Low => "low",
+        HepaRiskLevel::Medium => "medium",
+        HepaRiskLevel::High => "high",
+    }
+}
+
+fn adapter_phase_lines(report: &HepaTerminalTaskReport) -> Vec<String> {
+    let Some(timing) = &report.timing else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut lines = Vec::new();
+    for phase in &timing.phases {
+        if let Some(adapter_id) = &phase.adapter_id {
+            let role = phase.role.as_ref().map(role_label).unwrap_or("unspecified");
+            let key = format!("{role}:{adapter_id}");
+            if seen.insert(key.clone()) {
+                lines.push(format!("- {role} adapter: {adapter_id}"));
+            }
+        }
+    }
+    lines
+}
+
+fn role_label(role: &HepaAgentRole) -> &'static str {
+    match role {
+        HepaAgentRole::Manager => "manager",
+        HepaAgentRole::Worker => "worker",
+        HepaAgentRole::Reviewer => "reviewer",
+    }
+}
+
 #[derive(Debug)]
 pub struct HepaPrError {
     pub field: String,
@@ -335,6 +550,11 @@ fn require_manager_branch(branch: &str) -> Result<(), HepaPrError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hepa_core::contracts::{
+        CONTRACT_SCHEMA_VERSION, HepaLaneState, HepaPhaseStatus, HepaReviewFinding,
+        HepaReviewSignal, HepaTimingCounters, HepaTimingPhase, HepaTimingRecord,
+        HepaValidationCommandResult, HepaValidationSummary,
+    };
     use std::{
         cell::RefCell,
         fs,
@@ -502,6 +722,149 @@ mod tests {
         assert!(runner.calls.borrow().is_empty());
 
         remove_test_dir(repo);
+    }
+
+    #[test]
+    fn pr_body_reconstructs_the_run_honestly() {
+        let task_spec = HepaTaskSpec {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            goal: "Fix the login redirect".to_string(),
+            non_goals: Vec::new(),
+            expected_areas: vec!["src/login.rs".to_string()],
+            acceptance_criteria: vec!["redirect works".to_string()],
+            validation_commands: vec!["cargo test".to_string()],
+            dependencies: Vec::new(),
+            target_branch: Some("main".to_string()),
+            risk_level: HepaRiskLevel::Medium,
+            max_total_rounds: 2,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+        };
+        let report = HepaTerminalTaskReport {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            status: HepaTerminalStatus::Blocked,
+            pr_url: None,
+            validation: Some(HepaValidationSummary {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                status: HepaValidationStatus::Failed,
+                commands: vec![HepaValidationCommandResult {
+                    command: "cargo test".to_string(),
+                    exit_code: 101,
+                    duration_ms: 1200,
+                }],
+                no_tests_detected: false,
+                failure_type: Some("test_failure".to_string()),
+                summary: vec!["1 test failed".to_string()],
+            }),
+            review_signals: vec![HepaReviewSignal {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                review_id: "review-1".to_string(),
+                lane_id: "lane-1".to_string(),
+                adapter_id: "reviewer-fake".to_string(),
+                status: HepaReviewStatus::ChangesRequested,
+                findings: vec![HepaReviewFinding {
+                    finding_id: "finding-1".to_string(),
+                    severity: HepaFindingSeverity::High,
+                    category: "correctness".to_string(),
+                    evidence: "evidence".to_string(),
+                    in_scope: true,
+                    release_risk: true,
+                    recommended_action: "fix it".to_string(),
+                    file_ref: Some("src/login.rs".to_string()),
+                    line: Some(10),
+                    message: "Redirect loops on empty session".to_string(),
+                    accepted: false,
+                }],
+                summary: vec!["changes requested".to_string()],
+                completed_at: "2026-06-16T00:00:05Z".to_string(),
+            }],
+            arbitration: None,
+            timing: Some(HepaTimingRecord {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                run_id: "run-1".to_string(),
+                phases: vec![
+                    HepaTimingPhase {
+                        name: "worker_attempt".to_string(),
+                        status: HepaPhaseStatus::Completed,
+                        duration_seconds: 4.0,
+                        round: Some(1),
+                        role: Some(HepaAgentRole::Worker),
+                        adapter_id: Some("worker-fake".to_string()),
+                        routing_reason: Some("default".to_string()),
+                        sandbox_posture: Some("host-worktree".to_string()),
+                    },
+                    HepaTimingPhase {
+                        name: "review".to_string(),
+                        status: HepaPhaseStatus::Completed,
+                        duration_seconds: 2.0,
+                        round: Some(1),
+                        role: Some(HepaAgentRole::Reviewer),
+                        adapter_id: Some("reviewer-fake".to_string()),
+                        routing_reason: Some("fanout".to_string()),
+                        sandbox_posture: Some("host-worktree".to_string()),
+                    },
+                ],
+                counters: HepaTimingCounters {
+                    agent_loops: 1,
+                    manager_passes: 2,
+                    worker_profile_llm_calls: 0,
+                    reviewer_passes: 1,
+                    install_events: 0,
+                    container_count: 0,
+                },
+            }),
+            summary: vec!["Blocked by failing validation.".to_string()],
+            human_attention_required: true,
+            completed_at: "2026-06-16T00:00:07Z".to_string(),
+        };
+        let lane = HepaLane {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: "lane-1".to_string(),
+            project_id: "project-1".to_string(),
+            task_id: "task-1".to_string(),
+            adapter_id: "worker-fake".to_string(),
+            state: HepaLaneState::Blocked,
+            worktree_ref: "worktree:lane-1".to_string(),
+            branch: "hepa/manager/lane-1".to_string(),
+            run_dir_ref: "control:runs/run-1".to_string(),
+            attempt_count: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:07Z".to_string(),
+            completed_at: None,
+        };
+
+        let body = build_pr_body(&HepaPrBodyInput {
+            task_spec: &task_spec,
+            terminal_report: &report,
+            lane: &lane,
+            external_card_id: Some("hermes-card-1"),
+        });
+
+        for section in [
+            "## Summary",
+            "## Validation",
+            "## Review",
+            "## Risk",
+            "## Adapter",
+            "## Timing",
+            "## Hermes card",
+        ] {
+            assert!(body.contains(section), "missing section {section}");
+        }
+        // Honest reconstruction: failed validation, the real finding, declared
+        // risk, adapters, manager passes, and the card link all appear.
+        assert!(body.contains("Status: blocked"));
+        assert!(body.contains("Result: failed"));
+        assert!(body.contains("`cargo test` exited 101"));
+        assert!(body.contains("Redirect loops on empty session"));
+        assert!(body.contains("Declared risk: medium"));
+        assert!(body.contains("worker adapter: worker-fake"));
+        assert!(body.contains("reviewer adapter: reviewer-fake"));
+        assert!(body.contains("manager passes: 2"));
+        assert!(body.contains("Card: hermes-card-1"));
     }
 
     fn init_repo(repo: &Path) {
