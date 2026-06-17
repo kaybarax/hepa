@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod bench;
 pub mod config;
 pub mod conflict_planner;
 pub mod contracts;

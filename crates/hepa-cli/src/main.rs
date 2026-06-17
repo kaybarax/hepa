@@ -159,6 +159,26 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                 .map_err(|error| format!("failed to parse timing file: {error}"))?;
             Ok(format!("HEPA bench:\n{}", format_timing_summary(&timing)))
         }
+        [command, subcommand] if command == "bench" && subcommand == "reference" => {
+            let lines = hepa_core::bench::hoca_reference_medians()
+                .into_iter()
+                .map(|reference| {
+                    format!(
+                        "{}: wall={:.2}s agent_loops={} containers={} installs={} peak_rss={:.2}MiB",
+                        reference.benchmark_id,
+                        reference.median_wall_seconds,
+                        reference.median_agent_loops,
+                        reference.median_containers,
+                        reference.median_install_events,
+                        reference.median_peak_rss_mib
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!(
+                "HEPA bench reference (HOCA v1.1.0 medians):\n{lines}"
+            ))
+        }
         [command] if command == "bench" => Ok(
             "HEPA bench: provide --timing <file> to summarize a run's timing record".to_string(),
         ),
