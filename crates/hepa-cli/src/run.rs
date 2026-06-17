@@ -350,7 +350,7 @@ pub fn run_live_task(
             "2026-06-16T00:00:04Z",
         )?;
         let repair_started = Instant::now();
-        let repair_result = run_live_repair_round(RunLiveRepairInput {
+        let repair_result = match run_live_repair_round(RunLiveRepairInput {
             config,
             lane_paths: &lane_paths,
             allocation: &allocation,
@@ -361,7 +361,43 @@ pub fn run_live_task(
             prior_prompt: prompt.clone(),
             failed_validation: validation.clone(),
             first_changed_files: attempt_outcome.changed_files.clone(),
-        })?;
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                transition_and_record(
+                    &lane_paths,
+                    &mut lane,
+                    5,
+                    HepaLaneState::Blocked,
+                    "live repair preparation failed",
+                    "2026-06-16T00:00:05Z",
+                )?;
+                return finish_blocked_live_run(FinishBlockedInput {
+                    config,
+                    task,
+                    run_paths: &run_paths,
+                    lane_paths: &lane_paths,
+                    allocator: &allocator,
+                    lane: &mut lane,
+                    validation,
+                    review_signals: Vec::new(),
+                    arbitration: None,
+                    timing: live_timing_record(LiveTimingInput {
+                        config,
+                        adapter_id,
+                        worker_duration_seconds: attempt_outcome.duration_seconds,
+                        validation_duration_seconds,
+                        review_duration_seconds: 0.0,
+                        reviewer_passes: 0,
+                        terminal_phase: LivePipelinePhase::ValidationFailed,
+                        repair_timing: None,
+                    }),
+                    reason: format!(
+                        "Live repair preparation failed after validation evidence: {error}"
+                    ),
+                });
+            }
+        };
         let repair_duration_seconds = repair_started.elapsed().as_secs_f64();
         validation = repair_result.validation;
         attempt_outcome.duration_seconds += repair_result.worker_duration_seconds;
@@ -2203,10 +2239,28 @@ fn collect_live_diff(worktree: &Path) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(sanitize_validation_output(
-        worktree,
-        &String::from_utf8_lossy(&output.stdout),
-    ))
+    let diff = sanitize_validation_output(worktree, &String::from_utf8_lossy(&output.stdout));
+    if !diff.trim().is_empty() {
+        return Ok(diff);
+    }
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--short"])
+        .output()
+        .map_err(|error| format!("failed to inspect worktree status: {error}"))?;
+    if !status.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        ));
+    }
+    let status = sanitize_validation_output(worktree, &String::from_utf8_lossy(&status.stdout));
+    if status.trim().is_empty() {
+        Ok("No tracked diff or status changes were captured.".to_string())
+    } else {
+        Ok(format!("No tracked diff captured. Git status:\n{status}"))
+    }
 }
 
 #[cfg(test)]
@@ -2659,6 +2713,20 @@ mod tests {
         assert!(sanitized.contains("<VALIDATION_RUNTIME>"));
         assert!(!sanitized.contains("/tmp/hepa-validation"));
         assert!(!sanitized.contains(".hepa/worktrees/lane-cli-fake"));
+    }
+
+    #[test]
+    fn live_diff_falls_back_to_status_for_untracked_repair_evidence() {
+        let root = unique_test_dir("live-diff-untracked");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        fs::write(repo.join("new-status-matrix.md"), "# Status\n").expect("new file");
+
+        let diff = collect_live_diff(&repo).expect("diff fallback should be available");
+
+        assert!(diff.contains("No tracked diff captured. Git status:"));
+        assert!(diff.contains("?? new-status-matrix.md"));
+        remove_test_dir(root);
     }
 
     #[test]
