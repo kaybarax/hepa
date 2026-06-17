@@ -212,6 +212,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parser_corpus_covers_supported_adapter_output_shapes() {
+        let cases = [
+            (
+                "reviewer-a",
+                HepaReviewStatus::Approved,
+                r#"{
+                  "status": "approved",
+                  "summary": ["No findings."],
+                  "findings": []
+                }"#,
+                0,
+            ),
+            (
+                "reviewer-b",
+                HepaReviewStatus::ChangesRequested,
+                r#"{
+                  "status": "changes_requested",
+                  "summary": ["Needs repair."],
+                  "findings": [{
+                    "finding_id": "reviewer-b-finding",
+                    "severity": "medium",
+                    "category": "tests",
+                    "evidence": "Validation shows missing coverage.",
+                    "in_scope": true,
+                    "release_risk": false,
+                    "recommended_action": "Add the missing test.",
+                    "file_ref": "tests/review.rs",
+                    "line": 12,
+                    "message": "Coverage is incomplete.",
+                    "accepted": true
+                  }]
+                }"#,
+                1,
+            ),
+            (
+                "reviewer-c",
+                HepaReviewStatus::Blocked,
+                r#"{
+                  "status": "blocked",
+                  "summary": ["Reviewer could not assess generated diff."],
+                  "findings": [{
+                    "severity": "high",
+                    "category": "reviewability",
+                    "evidence": "The diff context was incomplete.",
+                    "in_scope": true,
+                    "release_risk": true,
+                    "recommended_action": "Re-run review with complete context.",
+                    "file_ref": null,
+                    "line": null,
+                    "message": "Review context is insufficient.",
+                    "accepted": false
+                  }]
+                }"#,
+                1,
+            ),
+            (
+                "reviewer-d",
+                HepaReviewStatus::Failed,
+                r#"{
+                  "status": "failed",
+                  "summary": ["Adapter returned a non-review failure."],
+                  "findings": []
+                }"#,
+                0,
+            ),
+        ];
+
+        for (adapter_id, expected_status, raw_output, expected_findings) in cases {
+            let signal =
+                normalize_reviewer_output(input(adapter_id, raw_output)).expect("corpus parses");
+
+            assert_eq!(signal.status, expected_status);
+            assert_eq!(signal.findings.len(), expected_findings);
+        }
+    }
+
     fn input(adapter_id: &str, raw_output: &str) -> HepaReviewerOutputInput {
         HepaReviewerOutputInput {
             review_id: format!("review-{adapter_id}"),
