@@ -752,8 +752,8 @@ fn run_live_validation(worktree: &Path, task_spec: &HepaTaskSpec) -> HepaValidat
                     "`{}` exited {}. stdout: {} stderr: {}",
                     command,
                     exit_code,
-                    sanitize_single_line(&stdout),
-                    sanitize_single_line(&stderr)
+                    sanitize_validation_output(worktree, &stdout),
+                    sanitize_validation_output(worktree, &stderr)
                 ));
             }
             Err(error) => {
@@ -1060,8 +1060,23 @@ fn finish_blocked_live_run(input: FinishBlockedInput<'_>) -> Result<HepaFakeRunR
     })
 }
 
-fn sanitize_single_line(text: &str) -> String {
-    let sanitized = redact_secrets(text);
+fn sanitize_validation_output(worktree: &Path, text: &str) -> String {
+    let mut sanitized = redact_secrets(text);
+    for path in [
+        Some(worktree),
+        worktree.parent(),
+        worktree.parent().and_then(Path::parent),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(path) = path.to_str() {
+            sanitized = sanitized.replace(path, "<VALIDATION_RUNTIME>");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").and_then(|value| value.into_string().ok()) {
+        sanitized = sanitized.replace(&home, "<HOME>");
+    }
     let mut line = sanitized
         .lines()
         .take(4)
@@ -1625,6 +1640,20 @@ mod tests {
                 .iter()
                 .all(|phase| !phase.name.starts_with("fake_"))
         );
+    }
+
+    #[test]
+    fn live_validation_output_redacts_lane_runtime_paths() {
+        let worktree = PathBuf::from("/tmp/hepa-validation/.hepa/worktrees/lane-cli-fake");
+        let output = format!(
+            "RUN v4.1.8 {}\nok src/app/views/login-and-registration/login-form.test.tsx",
+            worktree.display()
+        );
+        let sanitized = sanitize_validation_output(&worktree, &output);
+
+        assert!(sanitized.contains("<VALIDATION_RUNTIME>"));
+        assert!(!sanitized.contains("/tmp/hepa-validation"));
+        assert!(!sanitized.contains(".hepa/worktrees/lane-cli-fake"));
     }
 
     fn init_repo(repo: &Path) {
