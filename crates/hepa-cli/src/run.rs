@@ -45,6 +45,10 @@ use hepa_review::{
         HepaConfiguredReviewer, HepaReviewFanoutInput, aggregate_review_findings,
         apply_review_pass_policy, run_configured_reviewers_concurrently,
     },
+    repair::{
+        HepaRepairBriefInput, HepaRepairRoundPolicy, HepaRepairRoundState,
+        enforce_repair_round_budget, rewrite_repair_prompt_from_evidence,
+    },
 };
 use serde::Serialize;
 use std::{
@@ -292,11 +296,6 @@ pub fn run_live_task(
         .get(adapter_id)
         .ok_or_else(|| format!("adapter not registered: {adapter_id}"))?
         .clone();
-    let prompt =
-        live_worker_prompt_for_adapter(&sanitized_task_text(config), adapter_id, &live_config);
-    let attempt_paths = lane_paths
-        .attempt("attempt-1")
-        .map_err(|error| error.to_string())?;
     let mut environment = std::collections::BTreeMap::new();
     for key in [
         "PI_CODING_AGENT_DIR",
@@ -312,59 +311,22 @@ pub fn run_live_task(
             environment.insert(provider_key_env.clone(), value);
         }
     }
-    let invocation = HepaOneshotAdapterInvocation {
-        spec,
-        role: HepaAdapterRole::Worker,
-        context: HepaAdapterTemplateContext {
-            prompt_file: attempt_paths
-                .attempt_dir
-                .join("prompt.md")
-                .display()
-                .to_string(),
-            worktree: allocation.worktree_path.display().to_string(),
-            review_prompt_file: lane_paths.lane_dir.join("review.md").display().to_string(),
-            output_file: attempt_paths.attempt_report.display().to_string(),
-            review_output_file: lane_paths
-                .lane_dir
-                .join("review.json")
-                .display()
-                .to_string(),
-            artifact_dir: lane_paths.lane_dir.display().to_string(),
-        },
-        prompt,
-        environment,
-        monitor_policy: live_monitor_policy(),
-    };
-    let worker_started = Instant::now();
-    let result = HepaOneshotAdapterExecutor::new()
-        .run(&invocation)
-        .map_err(|error| error.to_string())?;
-    let worker_duration_seconds = worker_started.elapsed().as_secs_f64();
-    let changed_files = collect_changed_files(&allocation.worktree_path)?;
-    let attempt = HepaAttemptReport {
-        schema_version: CONTRACT_SCHEMA_VERSION,
-        attempt_id: "attempt-1".to_string(),
-        lane_id: config.lane_id.clone(),
-        task_id: config.task_id.clone(),
+    let prompt =
+        live_worker_prompt_for_adapter(&sanitized_task_text(config), adapter_id, &live_config);
+    let mut repair_timing = None;
+    let mut attempt_outcome = execute_live_worker_attempt(ExecuteLiveAttemptInput {
+        config,
+        lane_paths: &lane_paths,
+        allocation: &allocation,
+        spec: spec.clone(),
+        adapter_id,
+        environment: environment.clone(),
+        attempt_id: "attempt-1",
         round: 1,
-        role: HepaAgentRole::Worker,
-        adapter_id: adapter_id.to_string(),
-        status: if result.exit_code.unwrap_or_default() == 0 {
-            hepa_core::contracts::HepaAttemptStatus::Completed
-        } else {
-            hepa_core::contracts::HepaAttemptStatus::Failed
-        },
-        commands_run: vec![result.command],
-        changed_files: changed_files.clone(),
-        summary: live_attempt_summary(&allocation.worktree_path, &result.stdout, &result.stderr),
-        blocked_reason: result
-            .exit_code
-            .filter(|code| *code != 0)
-            .map(|code| format!("adapter exited with code {code}")),
-        started_at: "2026-06-16T00:00:02Z".to_string(),
-        completed_at: Some("2026-06-16T00:00:03Z".to_string()),
-    };
-    write_attempt(&lane_paths, &attempt)?;
+        prompt: prompt.clone(),
+        started_at: "2026-06-16T00:00:02Z",
+        completed_at: "2026-06-16T00:00:03Z",
+    })?;
 
     transition_and_record(
         &lane_paths,
@@ -375,7 +337,7 @@ pub fn run_live_task(
         "2026-06-16T00:00:03Z",
     )?;
     let validation_started = Instant::now();
-    let validation = run_live_validation(&allocation.worktree_path, &task_spec);
+    let mut validation = run_live_validation(&allocation.worktree_path, &task_spec);
     let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
     write_json(&lane_paths.validation_summary, &validation).map_err(|error| error.to_string())?;
     if validation.status != HepaValidationStatus::Passed {
@@ -383,48 +345,98 @@ pub fn run_live_task(
             &lane_paths,
             &mut lane,
             4,
-            HepaLaneState::Blocked,
-            "live validation failed",
+            HepaLaneState::Repairing,
+            "live validation failed; repair brief started",
             "2026-06-16T00:00:04Z",
         )?;
-        return finish_blocked_live_run(FinishBlockedInput {
+        let repair_started = Instant::now();
+        let repair_result = run_live_repair_round(RunLiveRepairInput {
             config,
-            task,
-            run_paths: &run_paths,
             lane_paths: &lane_paths,
-            allocator: &allocator,
-            lane: &mut lane,
-            validation,
-            review_signals: Vec::new(),
-            arbitration: None,
-            timing: live_timing_record(
+            allocation: &allocation,
+            task_spec: &task_spec,
+            spec: spec.clone(),
+            adapter_id,
+            environment: environment.clone(),
+            prior_prompt: prompt.clone(),
+            failed_validation: validation.clone(),
+            first_changed_files: attempt_outcome.changed_files.clone(),
+        })?;
+        let repair_duration_seconds = repair_started.elapsed().as_secs_f64();
+        validation = repair_result.validation;
+        attempt_outcome.duration_seconds += repair_result.worker_duration_seconds;
+        attempt_outcome.changed_files = repair_result.changed_files;
+        write_json(&lane_paths.validation_summary, &validation)
+            .map_err(|error| error.to_string())?;
+        if validation.status != HepaValidationStatus::Passed {
+            transition_and_record(
+                &lane_paths,
+                &mut lane,
+                5,
+                HepaLaneState::Blocked,
+                "live repair validation failed",
+                "2026-06-16T00:00:05Z",
+            )?;
+            repair_timing = Some(LiveRepairTiming {
+                brief_duration_seconds: repair_duration_seconds,
+                worker_duration_seconds: repair_result.worker_duration_seconds,
+                validation_duration_seconds: repair_result.validation_duration_seconds,
+                completed: false,
+            });
+            return finish_blocked_live_run(FinishBlockedInput {
                 config,
-                adapter_id,
-                worker_duration_seconds,
-                validation_duration_seconds,
-                0.0,
-                0,
-                LivePipelinePhase::ValidationFailed,
-            ),
-            reason: "Live validation failed; review, staging, and PR were not attempted."
-                .to_string(),
+                task,
+                run_paths: &run_paths,
+                lane_paths: &lane_paths,
+                allocator: &allocator,
+                lane: &mut lane,
+                validation,
+                review_signals: Vec::new(),
+                arbitration: None,
+                timing: live_timing_record(LiveTimingInput {
+                    config,
+                    adapter_id,
+                    worker_duration_seconds: attempt_outcome.duration_seconds,
+                    validation_duration_seconds,
+                    review_duration_seconds: 0.0,
+                    reviewer_passes: 0,
+                    terminal_phase: LivePipelinePhase::ValidationFailed,
+                    repair_timing,
+                }),
+                reason: "Live validation failed after bounded repair round; review, staging, and PR were not attempted."
+                    .to_string(),
+            });
+        }
+        repair_timing = Some(LiveRepairTiming {
+            brief_duration_seconds: repair_duration_seconds,
+            worker_duration_seconds: repair_result.worker_duration_seconds,
+            validation_duration_seconds: repair_result.validation_duration_seconds,
+            completed: true,
         });
+        transition_and_record(
+            &lane_paths,
+            &mut lane,
+            5,
+            HepaLaneState::Validating,
+            "live repair validation passed",
+            "2026-06-16T00:00:05Z",
+        )?;
     }
 
     transition_and_record(
         &lane_paths,
         &mut lane,
-        4,
+        6,
         HepaLaneState::Reviewing,
         "live validation passed",
-        "2026-06-16T00:00:04Z",
+        "2026-06-16T00:00:06Z",
     )?;
     let review_started = Instant::now();
     let diff_context = collect_live_diff(&allocation.worktree_path)?;
     let review_outcome = live_review_fanout(
         config,
         adapter_id,
-        &changed_files,
+        &attempt_outcome.changed_files,
         &validation,
         &diff_context,
     )?;
@@ -462,15 +474,16 @@ pub fn run_live_task(
             validation,
             review_signals: review_outcome.signals,
             arbitration: Some(review_outcome.arbitration),
-            timing: live_timing_record(
+            timing: live_timing_record(LiveTimingInput {
                 config,
                 adapter_id,
-                worker_duration_seconds,
+                worker_duration_seconds: attempt_outcome.duration_seconds,
                 validation_duration_seconds,
                 review_duration_seconds,
-                review_outcome.reviewer_passes,
-                LivePipelinePhase::ReviewFailed,
-            ),
+                reviewer_passes: review_outcome.reviewer_passes,
+                terminal_phase: LivePipelinePhase::ReviewFailed,
+                repair_timing,
+            }),
             reason: format!(
                 "Live review fanout blocked the lane; staging and PR were not attempted: {}",
                 review_outcome.blockers.join("; ")
@@ -481,13 +494,13 @@ pub fn run_live_task(
     transition_and_record(
         &lane_paths,
         &mut lane,
-        5,
+        7,
         HepaLaneState::Staging,
         "live review fanout approved",
-        "2026-06-16T00:00:05Z",
+        "2026-06-16T00:00:07Z",
     )?;
     let staging_report = HepaSafeStaging::new(&allocation.worktree_path)
-        .stage_approved_files(&changed_files)
+        .stage_approved_files(&attempt_outcome.changed_files)
         .map_err(|error| error.to_string())?;
     let commit = HepaManagerGitLifecycle::manager(&allocation.worktree_path)
         .commit_staged(
@@ -504,15 +517,16 @@ pub fn run_live_task(
         )
         .map_err(|error| error.to_string())?;
 
-    let timing_for_pr = live_timing_record(
+    let timing_for_pr = live_timing_record(LiveTimingInput {
         config,
         adapter_id,
-        worker_duration_seconds,
+        worker_duration_seconds: attempt_outcome.duration_seconds,
         validation_duration_seconds,
         review_duration_seconds,
-        review_outcome.reviewer_passes,
-        LivePipelinePhase::PrCreated,
-    );
+        reviewer_passes: review_outcome.reviewer_passes,
+        terminal_phase: LivePipelinePhase::PrCreated,
+        repair_timing,
+    });
     let mut terminal_report = live_terminal_report(
         config,
         validation.clone(),
@@ -521,7 +535,10 @@ pub fn run_live_task(
         review_outcome.arbitration.clone(),
         None,
         vec![
-            format!("Live worker changed {} file(s).", changed_files.len()),
+            format!(
+                "Live worker changed {} file(s).",
+                attempt_outcome.changed_files.len()
+            ),
             format!(
                 "Validation passed for {} command(s).",
                 validation.commands.len()
@@ -564,15 +581,16 @@ pub fn run_live_task(
             validation,
             review_signals: review_outcome.signals.clone(),
             arbitration: Some(review_outcome.arbitration.clone()),
-            timing: live_timing_record(
+            timing: live_timing_record(LiveTimingInput {
                 config,
                 adapter_id,
-                worker_duration_seconds,
+                worker_duration_seconds: attempt_outcome.duration_seconds,
                 validation_duration_seconds,
                 review_duration_seconds,
-                review_outcome.reviewer_passes,
-                LivePipelinePhase::PrFailed,
-            ),
+                reviewer_passes: review_outcome.reviewer_passes,
+                terminal_phase: LivePipelinePhase::PrFailed,
+                repair_timing,
+            }),
             reason: format!("Manager push failed before PR creation: {error}"),
         });
     }
@@ -606,15 +624,16 @@ pub fn run_live_task(
                 validation,
                 review_signals: review_outcome.signals.clone(),
                 arbitration: Some(review_outcome.arbitration.clone()),
-                timing: live_timing_record(
+                timing: live_timing_record(LiveTimingInput {
                     config,
                     adapter_id,
-                    worker_duration_seconds,
+                    worker_duration_seconds: attempt_outcome.duration_seconds,
                     validation_duration_seconds,
                     review_duration_seconds,
-                    review_outcome.reviewer_passes,
-                    LivePipelinePhase::PrFailed,
-                ),
+                    reviewer_passes: review_outcome.reviewer_passes,
+                    terminal_phase: LivePipelinePhase::PrFailed,
+                    repair_timing,
+                }),
                 reason: format!("Manager PR creation failed: {error}"),
             });
         }
@@ -644,15 +663,16 @@ pub fn run_live_task(
     task.completed_at = Some("2026-06-16T00:00:07Z".to_string());
     write_json(&run_paths.task_state, &task).map_err(|error| error.to_string())?;
 
-    let timing = live_timing_record(
+    let timing = live_timing_record(LiveTimingInput {
         config,
         adapter_id,
-        worker_duration_seconds,
+        worker_duration_seconds: attempt_outcome.duration_seconds,
         validation_duration_seconds,
         review_duration_seconds,
-        review_outcome.reviewer_passes,
-        LivePipelinePhase::Completed,
-    );
+        reviewer_passes: review_outcome.reviewer_passes,
+        terminal_phase: LivePipelinePhase::Completed,
+        repair_timing,
+    });
     terminal_report.pr_url = Some(pr.url);
     terminal_report.timing = Some(timing.clone());
     terminal_report
@@ -680,6 +700,272 @@ pub fn run_live_task(
             cleanup.status,
             hepa_git::worktree::HepaWorktreeCleanupStatus::Cleaned
         ),
+    })
+}
+
+struct ExecuteLiveAttemptInput<'a> {
+    config: &'a HepaFakeRunConfig,
+    lane_paths: &'a hepa_core::artifacts::HepaLaneArtifactPaths,
+    allocation: &'a HepaWorktreeAllocation,
+    spec: hepa_adapters::spec::HepaAdapterSpec,
+    adapter_id: &'a str,
+    environment: std::collections::BTreeMap<String, String>,
+    attempt_id: &'a str,
+    round: u32,
+    prompt: String,
+    started_at: &'a str,
+    completed_at: &'a str,
+}
+
+struct LiveAttemptOutcome {
+    duration_seconds: f64,
+    changed_files: Vec<String>,
+}
+
+fn execute_live_worker_attempt(
+    input: ExecuteLiveAttemptInput<'_>,
+) -> Result<LiveAttemptOutcome, String> {
+    let ExecuteLiveAttemptInput {
+        config,
+        lane_paths,
+        allocation,
+        spec,
+        adapter_id,
+        environment,
+        attempt_id,
+        round,
+        prompt,
+        started_at,
+        completed_at,
+    } = input;
+    let attempt_paths = lane_paths
+        .attempt(attempt_id)
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&attempt_paths.attempt_dir).map_err(|error| error.to_string())?;
+    fs::write(attempt_paths.attempt_dir.join("prompt.md"), &prompt)
+        .map_err(|error| error.to_string())?;
+    let invocation = HepaOneshotAdapterInvocation {
+        spec,
+        role: HepaAdapterRole::Worker,
+        context: HepaAdapterTemplateContext {
+            prompt_file: attempt_paths
+                .attempt_dir
+                .join("prompt.md")
+                .display()
+                .to_string(),
+            worktree: allocation.worktree_path.display().to_string(),
+            review_prompt_file: lane_paths.lane_dir.join("review.md").display().to_string(),
+            output_file: attempt_paths.attempt_report.display().to_string(),
+            review_output_file: lane_paths
+                .lane_dir
+                .join("review.json")
+                .display()
+                .to_string(),
+            artifact_dir: lane_paths.lane_dir.display().to_string(),
+        },
+        prompt,
+        environment,
+        monitor_policy: live_monitor_policy(),
+    };
+    let worker_started = Instant::now();
+    let result = HepaOneshotAdapterExecutor::new()
+        .run(&invocation)
+        .map_err(|error| error.to_string())?;
+    let duration_seconds = worker_started.elapsed().as_secs_f64();
+    let changed_files = collect_changed_files(&allocation.worktree_path)?;
+    let attempt = HepaAttemptReport {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        attempt_id: attempt_id.to_string(),
+        lane_id: config.lane_id.clone(),
+        task_id: config.task_id.clone(),
+        round,
+        role: HepaAgentRole::Worker,
+        adapter_id: adapter_id.to_string(),
+        status: if result.exit_code.unwrap_or_default() == 0 {
+            hepa_core::contracts::HepaAttemptStatus::Completed
+        } else {
+            hepa_core::contracts::HepaAttemptStatus::Failed
+        },
+        commands_run: vec![result.command],
+        changed_files: changed_files.clone(),
+        summary: live_attempt_summary(&allocation.worktree_path, &result.stdout, &result.stderr),
+        blocked_reason: result
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("adapter exited with code {code}")),
+        started_at: started_at.to_string(),
+        completed_at: Some(completed_at.to_string()),
+    };
+    write_attempt(lane_paths, &attempt)?;
+    Ok(LiveAttemptOutcome {
+        duration_seconds,
+        changed_files,
+    })
+}
+
+struct RunLiveRepairInput<'a> {
+    config: &'a HepaFakeRunConfig,
+    lane_paths: &'a hepa_core::artifacts::HepaLaneArtifactPaths,
+    allocation: &'a HepaWorktreeAllocation,
+    task_spec: &'a HepaTaskSpec,
+    spec: hepa_adapters::spec::HepaAdapterSpec,
+    adapter_id: &'a str,
+    environment: std::collections::BTreeMap<String, String>,
+    prior_prompt: String,
+    failed_validation: HepaValidationSummary,
+    first_changed_files: Vec<String>,
+}
+
+struct LiveRepairOutcome {
+    worker_duration_seconds: f64,
+    validation_duration_seconds: f64,
+    validation: HepaValidationSummary,
+    changed_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveRepairTiming {
+    brief_duration_seconds: f64,
+    worker_duration_seconds: f64,
+    validation_duration_seconds: f64,
+    completed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveRepairBudgetArtifact {
+    schema_version: u32,
+    lane_id: String,
+    repair_round: u32,
+    max_repair_rounds: u32,
+    max_total_attempts: u32,
+    allowed: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveRepairBriefArtifact {
+    schema_version: u32,
+    lane_id: String,
+    repair_round: u32,
+    prompt: String,
+    evidence: Vec<String>,
+}
+
+fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutcome, String> {
+    let RunLiveRepairInput {
+        config,
+        lane_paths,
+        allocation,
+        task_spec,
+        spec,
+        adapter_id,
+        environment,
+        prior_prompt,
+        failed_validation,
+        first_changed_files,
+    } = input;
+    let policy = HepaRepairRoundPolicy {
+        max_repair_rounds: 2,
+        max_total_attempts: 2,
+    };
+    let repair_round = 2;
+    let decision = enforce_repair_round_budget(
+        policy.clone(),
+        HepaRepairRoundState {
+            next_repair_round: repair_round,
+            total_attempts_after_next: 2,
+        },
+    )
+    .map_err(|error| format!("repair budget invalid: {}: {}", error.field, error.message))?;
+    let repair_dir = lane_paths.lane_dir.join("repair");
+    fs::create_dir_all(&repair_dir).map_err(|error| error.to_string())?;
+    write_json(
+        &repair_dir.join("round-2-budget.json"),
+        &LiveRepairBudgetArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: config.lane_id.clone(),
+            repair_round,
+            max_repair_rounds: policy.max_repair_rounds,
+            max_total_attempts: policy.max_total_attempts,
+            allowed: decision.allowed,
+            reason: decision.reason.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !decision.allowed {
+        return Err(format!(
+            "repair budget blocked round 2: {}",
+            decision.reason
+        ));
+    }
+
+    let failing_commands = failed_validation
+        .commands
+        .iter()
+        .filter(|command| command.exit_code != 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let diff_state = collect_live_diff(&allocation.worktree_path)?;
+    let brief = rewrite_repair_prompt_from_evidence(HepaRepairBriefInput {
+        lane_id: config.lane_id.clone(),
+        repair_round,
+        prior_prompt,
+        failing_commands,
+        review_findings: Vec::new(),
+        diff_state,
+        files_touched: first_changed_files,
+    })
+    .map_err(|error| format!("repair brief invalid: {}: {}", error.field, error.message))?;
+    write_json(
+        &repair_dir.join("round-2-brief.json"),
+        &LiveRepairBriefArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: brief.lane_id.clone(),
+            repair_round: brief.repair_round,
+            prompt: brief.prompt.clone(),
+            evidence: brief.evidence.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let repair_prompt = live_repair_worker_prompt_for_adapter(
+        &brief.prompt,
+        adapter_id,
+        &hepa_core::config::HepaConfig::load(
+            None,
+            &std::collections::BTreeMap::new(),
+            HepaConfigOverrides {
+                pi_model: std::env::var("HEPA_PI_MODEL").ok(),
+                pi_base_url: optional_env("HEPA_PI_BASE_URL"),
+                ..HepaConfigOverrides::default()
+            },
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    fs::write(repair_dir.join("round-2-prompt.md"), &repair_prompt)
+        .map_err(|error| error.to_string())?;
+    let attempt = execute_live_worker_attempt(ExecuteLiveAttemptInput {
+        config,
+        lane_paths,
+        allocation,
+        spec,
+        adapter_id,
+        environment,
+        attempt_id: "attempt-2",
+        round: repair_round,
+        prompt: repair_prompt,
+        started_at: "2026-06-16T00:00:04Z",
+        completed_at: "2026-06-16T00:00:05Z",
+    })?;
+    let validation_started = Instant::now();
+    let validation = run_live_validation(&allocation.worktree_path, task_spec);
+    let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
+    write_json(&repair_dir.join("round-2-validation.json"), &validation)
+        .map_err(|error| error.to_string())?;
+    Ok(LiveRepairOutcome {
+        worker_duration_seconds: attempt.duration_seconds,
+        validation_duration_seconds,
+        validation,
+        changed_files: attempt.changed_files,
     })
 }
 
@@ -720,6 +1006,22 @@ fn live_worker_prompt_for_adapter(
     config: &hepa_core::config::HepaConfig,
 ) -> String {
     let mut prompt = live_worker_prompt(task_text);
+    if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
+        prompt.push_str(
+            "\nAdapter-local model note: answer directly and do not emit hidden reasoning. /no_think\n",
+        );
+    }
+    prompt
+}
+
+fn live_repair_worker_prompt_for_adapter(
+    repair_prompt: &str,
+    adapter_id: &str,
+    config: &hepa_core::config::HepaConfig,
+) -> String {
+    let mut prompt = format!(
+        "{repair_prompt}\n\nExecution rules:\n- You are already running inside the same lane worktree.\n- Fix only the evidenced failures named above.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Finish by reporting changed files, rerun validation results, and any remaining blockers.\n"
+    );
     if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
         prompt.push_str(
             "\nAdapter-local model note: answer directly and do not emit hidden reasoning. /no_think\n",
@@ -1172,15 +1474,28 @@ enum LivePipelinePhase {
     Completed,
 }
 
-fn live_timing_record(
-    config: &HepaFakeRunConfig,
-    adapter_id: &str,
+struct LiveTimingInput<'a> {
+    config: &'a HepaFakeRunConfig,
+    adapter_id: &'a str,
     worker_duration_seconds: f64,
     validation_duration_seconds: f64,
     review_duration_seconds: f64,
     reviewer_passes: u32,
     terminal_phase: LivePipelinePhase,
-) -> HepaTimingRecord {
+    repair_timing: Option<LiveRepairTiming>,
+}
+
+fn live_timing_record(input: LiveTimingInput<'_>) -> HepaTimingRecord {
+    let LiveTimingInput {
+        config,
+        adapter_id,
+        worker_duration_seconds,
+        validation_duration_seconds,
+        review_duration_seconds,
+        reviewer_passes,
+        terminal_phase,
+        repair_timing,
+    } = input;
     let mut phases = vec![
         HepaTimingPhase {
             name: "live_worker".to_string(),
@@ -1194,7 +1509,9 @@ fn live_timing_record(
         },
         HepaTimingPhase {
             name: "live_validation".to_string(),
-            status: if terminal_phase == LivePipelinePhase::ValidationFailed {
+            status: if terminal_phase == LivePipelinePhase::ValidationFailed
+                || repair_timing.is_some()
+            {
                 HepaPhaseStatus::Failed
             } else {
                 HepaPhaseStatus::Completed
@@ -1207,6 +1524,46 @@ fn live_timing_record(
             sandbox_posture: Some(run_sandbox_posture()),
         },
     ];
+    if let Some(repair_timing) = repair_timing {
+        phases.push(HepaTimingPhase {
+            name: "live_repair_brief".to_string(),
+            status: HepaPhaseStatus::Completed,
+            duration_seconds: repair_timing.brief_duration_seconds,
+            round: Some(2),
+            role: Some(HepaAgentRole::Manager),
+            adapter_id: Some("hepa-manager-ralph-v2".to_string()),
+            routing_reason: Some(
+                "failure-aware repair prompt rewritten from validation evidence".to_string(),
+            ),
+            sandbox_posture: Some(run_sandbox_posture()),
+        });
+        phases.push(HepaTimingPhase {
+            name: "live_repair_worker".to_string(),
+            status: HepaPhaseStatus::Completed,
+            duration_seconds: repair_timing.worker_duration_seconds,
+            round: Some(2),
+            role: Some(HepaAgentRole::Worker),
+            adapter_id: Some(adapter_id.to_string()),
+            routing_reason: Some(
+                "bounded repair attempt through the same adapter contract".to_string(),
+            ),
+            sandbox_posture: Some(run_sandbox_posture()),
+        });
+        phases.push(HepaTimingPhase {
+            name: "live_repair_validation".to_string(),
+            status: if repair_timing.completed {
+                HepaPhaseStatus::Completed
+            } else {
+                HepaPhaseStatus::Failed
+            },
+            duration_seconds: repair_timing.validation_duration_seconds,
+            round: Some(2),
+            role: Some(HepaAgentRole::Manager),
+            adapter_id: None,
+            routing_reason: Some("manager-owned validation after repair".to_string()),
+            sandbox_posture: Some(run_sandbox_posture()),
+        });
+    }
     if terminal_phase != LivePipelinePhase::ValidationFailed {
         phases.push(HepaTimingPhase {
             name: "live_review_fanout".to_string(),
@@ -1261,8 +1618,8 @@ fn live_timing_record(
         run_id: config.run_id.clone(),
         phases,
         counters: HepaTimingCounters {
-            agent_loops: 1,
-            manager_passes: 1,
+            agent_loops: if repair_timing.is_some() { 2 } else { 1 },
+            manager_passes: if repair_timing.is_some() { 2 } else { 1 },
             worker_profile_llm_calls: 0,
             reviewer_passes,
             install_events: 0,
@@ -2036,15 +2393,16 @@ mod tests {
             task_text: "Run a real frontend task".to_string(),
             timing: true,
         };
-        let timing = live_timing_record(
-            &config,
-            "pi",
-            2.0,
-            1.0,
-            0.5,
-            2,
-            LivePipelinePhase::Completed,
-        );
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 2.0,
+            validation_duration_seconds: 1.0,
+            review_duration_seconds: 0.5,
+            reviewer_passes: 2,
+            terminal_phase: LivePipelinePhase::Completed,
+            repair_timing: None,
+        });
 
         assert_eq!(timing.counters.agent_loops, 1);
         assert_eq!(timing.counters.manager_passes, 1);
@@ -2080,6 +2438,89 @@ mod tests {
                 .iter()
                 .all(|phase| !phase.name.starts_with("fake_"))
         );
+    }
+
+    #[test]
+    fn live_repair_prompt_preserves_failure_evidence_and_lifecycle_boundary() {
+        let config = hepa_core::config::HepaConfig::load(
+            None,
+            &std::collections::BTreeMap::new(),
+            HepaConfigOverrides {
+                pi_model: Some("deepseek/deepseek-chat".to_string()),
+                ..HepaConfigOverrides::default()
+            },
+        )
+        .expect("config should load");
+
+        let prompt = live_repair_worker_prompt_for_adapter(
+            "Ralph-V2 repair brief for lane lane-1\nRound: 2\n\nEvidence to address:\n- command `git diff --check` failed with exit code 2 after 10 ms.",
+            "pi",
+            &config,
+        );
+
+        assert!(prompt.contains("Round: 2"));
+        assert!(prompt.contains("git diff --check"));
+        assert!(prompt.contains("Fix only the evidenced failures"));
+        assert!(prompt.contains("HEPA owns the Git lifecycle"));
+        assert!(!prompt.contains("/no_think"));
+    }
+
+    #[test]
+    fn live_timing_records_bounded_repair_round() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update AGENTS.md and run git diff --check.".to_string(),
+            timing: true,
+        };
+
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 8.0,
+            validation_duration_seconds: 0.2,
+            review_duration_seconds: 0.3,
+            reviewer_passes: 2,
+            terminal_phase: LivePipelinePhase::Completed,
+            repair_timing: Some(LiveRepairTiming {
+                brief_duration_seconds: 0.1,
+                worker_duration_seconds: 5.0,
+                validation_duration_seconds: 0.2,
+                completed: true,
+            }),
+        });
+
+        assert_eq!(timing.counters.agent_loops, 2);
+        assert_eq!(timing.counters.manager_passes, 2);
+        assert!(
+            timing
+                .phases
+                .iter()
+                .any(|phase| phase.name == "live_repair_brief" && phase.round == Some(2))
+        );
+        assert!(
+            timing
+                .phases
+                .iter()
+                .any(|phase| phase.name == "live_repair_worker" && phase.round == Some(2))
+        );
+        assert!(
+            timing
+                .phases
+                .iter()
+                .any(|phase| phase.name == "live_repair_validation" && phase.round == Some(2))
+        );
+        let first_validation = timing
+            .phases
+            .iter()
+            .find(|phase| phase.name == "live_validation")
+            .expect("round-1 validation phase");
+        assert_eq!(first_validation.status, HepaPhaseStatus::Failed);
     }
 
     #[test]
