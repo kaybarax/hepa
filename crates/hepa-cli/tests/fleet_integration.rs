@@ -140,6 +140,111 @@ fn temp_root(label: &str) -> PathBuf {
 }
 
 #[test]
+fn two_projects_serialize_conflicts_and_enforce_cost_caps() {
+    use hepa_core::resource_governor::HepaLaneReservation;
+
+    let root_a = temp_root("conf-a");
+    let root_b = temp_root("conf-b");
+    let registry_a = HepaFleetRegistry::new(&root_a);
+    let registry_b = HepaFleetRegistry::new(&root_b);
+    registry_a
+        .create_task(&ready_task("task-a1", "project-a"))
+        .expect("a1");
+    registry_b
+        .create_task(&ready_task("task-b1", "project-b"))
+        .expect("b1");
+    registry_b
+        .create_task(&ready_task("task-b2", "project-b"))
+        .expect("b2");
+
+    let mut scheduler = HepaScheduler::new();
+    scheduler.start();
+    // Capacity is generous; only the paid cap (1) constrains paid lanes.
+    let limits = HepaResourceLimits::new(8, 1);
+
+    // Project A claims a PAID lane touching src/api.
+    let paid_candidate = HepaScheduleCandidate {
+        task_id: "task-a1".to_string(),
+        adapter_id: "cloud".to_string(),
+        cost_class: HepaCostClass::Paid,
+        file_areas: vec!["src/api".to_string()],
+        conflict_group: None,
+        touches_lockfile: false,
+    };
+    let lane_a = match scheduler
+        .claim_one(&registry_a, &limits, &[], &paid_candidate, "lane-a1", "t1")
+        .expect("claim a1")
+    {
+        HepaClaimOutcome::Claimed { lane } => lane,
+        other => panic!("expected claim, got {other:?}"),
+    };
+
+    // Project B's PAID lane is blocked by the cost cap while A holds the only slot.
+    let blocked_paid = scheduler
+        .claim_one(
+            &registry_b,
+            &limits,
+            std::slice::from_ref(&lane_a),
+            &HepaScheduleCandidate {
+                task_id: "task-b1".to_string(),
+                adapter_id: "cloud".to_string(),
+                cost_class: HepaCostClass::Paid,
+                file_areas: vec!["docs".to_string()],
+                conflict_group: None,
+                touches_lockfile: false,
+            },
+            "lane-b1",
+            "t2",
+        )
+        .expect("claim b1");
+    match blocked_paid {
+        HepaClaimOutcome::Rejected { reasons } => {
+            assert!(reasons.contains(&HepaWaitReason::PaidLaneCapReached));
+        }
+        other => panic!("expected paid-cap rejection, got {other:?}"),
+    }
+
+    // A conflicting LOCAL lane touching src/api serializes behind A's reservation.
+    let active = vec![HepaLaneReservation {
+        lane_id: lane_a.lane_id.clone(),
+        task_id: lane_a.task_id.clone(),
+        adapter_id: lane_a.adapter_id.clone(),
+        cost_class: lane_a.cost_class,
+        file_areas: lane_a.file_areas.clone(),
+        conflict_group: None,
+        touches_lockfile: false,
+    }];
+    let conflict = scheduler
+        .claim_one(
+            &registry_b,
+            &limits,
+            &active,
+            &HepaScheduleCandidate {
+                task_id: "task-b2".to_string(),
+                adapter_id: "local".to_string(),
+                cost_class: HepaCostClass::Local,
+                file_areas: vec!["src/api".to_string()],
+                conflict_group: None,
+                touches_lockfile: false,
+            },
+            "lane-b2",
+            "t3",
+        )
+        .expect("claim b2");
+    match conflict {
+        HepaClaimOutcome::Rejected { reasons } => {
+            assert!(reasons.contains(&HepaWaitReason::FileAreaReserved {
+                area: "src/api".to_string()
+            }));
+        }
+        other => panic!("expected file-area serialization, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&root_a).expect("cleanup a");
+    std::fs::remove_dir_all(&root_b).expect("cleanup b");
+}
+
+#[test]
 fn registered_project_and_task_records_sync_to_hermes() {
     let root = temp_root("sync");
     let registry = HepaFleetRegistry::new(&root);
