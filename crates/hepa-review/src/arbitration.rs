@@ -28,6 +28,12 @@ pub struct HepaArbitrationError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaReviewStagingGate {
+    pub staging_allowed: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HepaManagerArbitrationAction {
     Accept,
     Reject,
@@ -143,6 +149,45 @@ pub fn summarize_arbitration_results(
         status,
         records,
         pr_body_lines,
+    })
+}
+
+pub fn evaluate_staging_after_arbitration(
+    decisions: &[HepaArbitratedFinding],
+) -> Result<HepaReviewStagingGate, HepaArbitrationError> {
+    if decisions.is_empty() {
+        return Err(HepaArbitrationError {
+            field: "decisions".to_string(),
+            message: "at least one arbitration decision is required".to_string(),
+        });
+    }
+
+    let mut blockers = Vec::new();
+    for decision in decisions {
+        if decision.disposition == HepaArbitrationDisposition::ManagerRequired {
+            blockers.push(format!(
+                "{}: manager arbitration is required before staging",
+                decision.finding.finding_id
+            ));
+            continue;
+        }
+        if decision.finding.accepted
+            && decision.finding.release_risk
+            && matches!(
+                decision.finding.severity,
+                HepaFindingSeverity::High | HepaFindingSeverity::Critical
+            )
+        {
+            blockers.push(format!(
+                "{}: accepted high-risk release finding blocks staging",
+                decision.finding.finding_id
+            ));
+        }
+    }
+    blockers.sort();
+    Ok(HepaReviewStagingGate {
+        staging_allowed: blockers.is_empty(),
+        blockers,
     })
 }
 
@@ -358,6 +403,53 @@ mod tests {
                 .any(|line| line.contains("manager_accepted")
                     && line.contains("Manager accepts the residual risk"))
         );
+    }
+
+    #[test]
+    fn blocking_findings_stop_staging() {
+        let manager_required = apply_deterministic_downgrade_rules(finding(
+            HepaFindingSeverity::High,
+            true,
+            true,
+            false,
+        ))
+        .expect("manager required");
+        let high_risk_accepted = manager_decision(
+            HepaManagerArbitrationAction::Accept,
+            "Manager accepted, but the high release risk must still block staging.",
+        );
+
+        let gate = evaluate_staging_after_arbitration(&[manager_required, high_risk_accepted])
+            .expect("gate evaluates");
+
+        assert!(!gate.staging_allowed);
+        assert_eq!(gate.blockers.len(), 2);
+        assert!(
+            gate.blockers
+                .iter()
+                .any(|blocker| blocker.contains("manager arbitration is required"))
+        );
+        assert!(
+            gate.blockers
+                .iter()
+                .any(|blocker| blocker.contains("blocks staging"))
+        );
+    }
+
+    #[test]
+    fn settled_non_blocking_findings_allow_staging() {
+        let downgraded = apply_deterministic_downgrade_rules(finding(
+            HepaFindingSeverity::Medium,
+            false,
+            false,
+            true,
+        ))
+        .expect("deterministic downgrade");
+
+        let gate = evaluate_staging_after_arbitration(&[downgraded]).expect("gate evaluates");
+
+        assert!(gate.staging_allowed);
+        assert!(gate.blockers.is_empty());
     }
 
     fn manager_decision(
