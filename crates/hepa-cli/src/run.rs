@@ -280,7 +280,8 @@ pub fn run_live_task(
         .get(adapter_id)
         .ok_or_else(|| format!("adapter not registered: {adapter_id}"))?
         .clone();
-    let prompt = live_worker_prompt(&sanitized_task_text(config));
+    let prompt =
+        live_worker_prompt_for_adapter(&sanitized_task_text(config), adapter_id, &live_config);
     let attempt_paths = lane_paths
         .attempt("attempt-1")
         .map_err(|error| error.to_string())?;
@@ -659,6 +660,36 @@ fn live_worker_prompt(task_text: &str) -> String {
     format!(
         "You are HEPA's live stress-test worker.\n\nTask:\n{task_text}\n\nRepository worktree: current directory.\n\nExecution rules:\n- You are already running inside the lane worktree.\n- Make only the changes needed to satisfy the task.\n- Use relative paths when reading or editing files.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Run the smallest relevant validation command requested by the task when practical.\n- Finish by reporting changed files, validation results, and any blockers.\n",
     )
+}
+
+fn live_worker_prompt_for_adapter(
+    task_text: &str,
+    adapter_id: &str,
+    config: &hepa_core::config::HepaConfig,
+) -> String {
+    let mut prompt = live_worker_prompt(task_text);
+    if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
+        prompt.push_str(
+            "\nAdapter-local model note: answer directly and do not emit hidden reasoning. /no_think\n",
+        );
+    }
+    prompt
+}
+
+fn pi_model_needs_no_think_suffix(model: &str, base_url: &Option<String>) -> bool {
+    let model = model.to_ascii_lowercase();
+    let is_qwen = model.contains("qwen");
+    let is_local = model.starts_with("local/")
+        || model.starts_with("ollama/")
+        || model.starts_with("lmstudio/")
+        || model.starts_with("vllm/")
+        || model.starts_with("mlx-community/")
+        || base_url.as_deref().is_some_and(is_loopback_url);
+    is_qwen && is_local
+}
+
+fn is_loopback_url(value: &str) -> bool {
+    value.contains("127.0.0.1") || value.contains("localhost") || value.contains("[::1]")
 }
 
 fn live_task_spec(config: &HepaFakeRunConfig) -> HepaTaskSpec {
@@ -1601,6 +1632,57 @@ mod tests {
         assert!(!prompt.contains("/tmp/hepa-lane"));
         assert!(!prompt.contains("Added by Pi smoke test"));
         assert!(!prompt.contains("Make exactly one change"));
+    }
+
+    #[test]
+    fn live_worker_prompt_adds_no_think_only_for_local_qwen_pi() {
+        let config = hepa_core::config::HepaConfig::load(
+            None,
+            &std::collections::BTreeMap::new(),
+            HepaConfigOverrides {
+                pi_model: Some("local/mlx-community/Qwen3-30B-A3B-4bit".to_string()),
+                pi_base_url: Some(Some("http://127.0.0.1:52415/v1".to_string())),
+                ..HepaConfigOverrides::default()
+            },
+        )
+        .expect("config should load");
+
+        let prompt = live_worker_prompt_for_adapter("Update README.md", "pi", &config);
+
+        assert!(prompt.contains("Update README.md"));
+        assert!(prompt.contains("/no_think"));
+    }
+
+    #[test]
+    fn live_worker_prompt_does_not_add_no_think_for_cloud_or_non_pi() {
+        let cloud_config = hepa_core::config::HepaConfig::load(
+            None,
+            &std::collections::BTreeMap::new(),
+            HepaConfigOverrides {
+                pi_model: Some("deepseek/deepseek-chat".to_string()),
+                ..HepaConfigOverrides::default()
+            },
+        )
+        .expect("config should load");
+        let local_config = hepa_core::config::HepaConfig::load(
+            None,
+            &std::collections::BTreeMap::new(),
+            HepaConfigOverrides {
+                pi_model: Some("local/mlx-community/Qwen3-30B-A3B-4bit".to_string()),
+                pi_base_url: Some(Some("http://127.0.0.1:52415/v1".to_string())),
+                ..HepaConfigOverrides::default()
+            },
+        )
+        .expect("config should load");
+
+        assert!(
+            !live_worker_prompt_for_adapter("Update README.md", "pi", &cloud_config)
+                .contains("/no_think")
+        );
+        assert!(
+            !live_worker_prompt_for_adapter("Update README.md", "custom", &local_config)
+                .contains("/no_think")
+        );
     }
 
     #[test]
