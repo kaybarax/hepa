@@ -150,6 +150,78 @@ fn external_worker_passes_fake_binary_status_reporting_and_artifact_collection()
     remove_test_dir(root);
 }
 
+#[test]
+fn configured_adapters_render_without_git_lifecycle_actions() {
+    let root = unique_test_dir("configured-no-git-lifecycle");
+    let worktree = root.join("worktree");
+    let artifact_dir = root.join("artifacts");
+    fs::create_dir_all(&worktree).expect("worktree dir");
+    fs::create_dir_all(&artifact_dir).expect("artifact dir");
+    let fake_bin = root.join("fake-adapter");
+    write_fake_adapter(&fake_bin);
+    let output_file = artifact_dir.join("output.json");
+    let context = template_context(&worktree, &artifact_dir, &output_file);
+    let policy = HepaMonitorPolicy::default();
+
+    for (spec, role, label) in configured_adapter_specs(&fake_bin) {
+        let command = match role {
+            HepaAdapterRole::Worker => spec.render_worker_command(&context),
+            HepaAdapterRole::Reviewer => spec
+                .render_review_command(&context)
+                .map(|command| command.expect("review command should render")),
+        }
+        .unwrap_or_else(|error| panic!("{label} command should render: {error}"));
+
+        policy
+            .check_command(&command)
+            .unwrap_or_else(|error| panic!("{label} must not render Git lifecycle: {error}"));
+    }
+
+    remove_test_dir(root);
+}
+
+#[test]
+fn configured_adapter_executor_blocks_git_lifecycle_before_spawn() {
+    let root = unique_test_dir("configured-blocks-git-lifecycle");
+    let worktree = root.join("worktree");
+    let artifact_dir = root.join("artifacts");
+    fs::create_dir_all(&worktree).expect("worktree dir");
+    fs::create_dir_all(&artifact_dir).expect("artifact dir");
+    let fake_bin = root.join("fake-adapter");
+    write_fake_adapter(&fake_bin);
+    let output_file = artifact_dir.join("blocked.json");
+    let spec = HepaCustomAdapterTemplate {
+        command: format!(
+            "{} --prompt-file {{prompt_file}} --json-output {{output_file}} && git -C {{worktree}} push",
+            fake_bin.display()
+        ),
+        required_commands: vec![fake_bin.to_string_lossy().to_string()],
+        ..HepaCustomAdapterTemplate::default()
+    }
+    .into_spec()
+    .expect("custom spec");
+    let invocation = HepaOneshotAdapterInvocation {
+        spec,
+        role: HepaAdapterRole::Worker,
+        context: template_context(&worktree, &artifact_dir, &output_file),
+        prompt: "blocked lifecycle task".to_string(),
+        environment: BTreeMap::new(),
+        monitor_policy: HepaMonitorPolicy::default(),
+    };
+
+    let error = HepaOneshotAdapterExecutor::new()
+        .run(&invocation)
+        .expect_err("adapter Git lifecycle must be blocked before spawn");
+
+    assert_eq!(error.field, "monitor");
+    assert_eq!(error.status.as_deref(), Some("blocked"));
+    assert!(error.message.contains("command_policy"));
+    assert!(!PathBuf::from(&invocation.context.prompt_file).exists());
+    assert!(!output_file.exists());
+
+    remove_test_dir(root);
+}
+
 fn shell_command_spec(fake_bin: &Path) -> HepaAdapterSpec {
     HepaAdapterSpec {
         schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
@@ -170,6 +242,76 @@ fn shell_command_spec(fake_bin: &Path) -> HepaAdapterSpec {
         resource_weight: 1,
         max_concurrency: 1,
     }
+}
+
+fn configured_adapter_specs(
+    fake_bin: &Path,
+) -> Vec<(HepaAdapterSpec, HepaAdapterRole, &'static str)> {
+    vec![
+        (
+            shell_command_spec(fake_bin),
+            HepaAdapterRole::Worker,
+            "shell-command",
+        ),
+        (
+            HepaCustomAdapterTemplate {
+                command: command_template(fake_bin, false),
+                review_command: Some(command_template(fake_bin, true)),
+                required_commands: vec![fake_bin.to_string_lossy().to_string()],
+                roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+                ..HepaCustomAdapterTemplate::default()
+            }
+            .into_spec()
+            .expect("custom spec"),
+            HepaAdapterRole::Worker,
+            "custom",
+        ),
+        (
+            HepaUserWorkerAdapterTemplate {
+                command: command_template(fake_bin, false),
+                required_commands: vec![fake_bin.to_string_lossy().to_string()],
+                ..HepaUserWorkerAdapterTemplate::default()
+            }
+            .into_spec()
+            .expect("user worker spec"),
+            HepaAdapterRole::Worker,
+            "user-worker",
+        ),
+        (
+            HepaUserReviewerAdapterTemplate {
+                review_command: command_template(fake_bin, true),
+                required_commands: vec![fake_bin.to_string_lossy().to_string()],
+                ..HepaUserReviewerAdapterTemplate::default()
+            }
+            .into_spec()
+            .expect("user reviewer spec"),
+            HepaAdapterRole::Reviewer,
+            "user-reviewer",
+        ),
+        (
+            HepaLocalWorkerAdapterTemplate {
+                command: command_template(fake_bin, false),
+                review_command: command_template(fake_bin, true),
+                required_commands: vec![fake_bin.to_string_lossy().to_string()],
+                ..HepaLocalWorkerAdapterTemplate::default()
+            }
+            .into_spec()
+            .expect("local worker spec"),
+            HepaAdapterRole::Reviewer,
+            "local-worker",
+        ),
+        (
+            HepaExternalWorkerAdapterTemplate {
+                status_command: command_template(fake_bin, false),
+                required_commands: vec![fake_bin.to_string_lossy().to_string()],
+                ..HepaExternalWorkerAdapterTemplate::default()
+            }
+            .into_spec()
+            .expect("external worker spec"),
+            HepaAdapterRole::Worker,
+            "external-worker",
+        ),
+    ]
 }
 
 fn command_template(fake_bin: &Path, review: bool) -> String {

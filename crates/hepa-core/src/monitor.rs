@@ -12,7 +12,7 @@ pub struct HepaMonitorPolicy {
 impl Default for HepaMonitorPolicy {
     fn default() -> Self {
         Self {
-            command_denylist: vec!["git push".to_string(), "git commit".to_string()],
+            command_denylist: default_git_lifecycle_denylist(),
             secret_markers: vec![
                 "api_key".to_string(),
                 "password".to_string(),
@@ -61,6 +61,12 @@ impl Error for HepaMonitorStop {}
 impl HepaMonitorPolicy {
     pub fn check_command(&self, command: &str) -> Result<(), HepaMonitorStop> {
         let command = command.to_ascii_lowercase();
+        if let Some(evidence) = detect_git_lifecycle_action(&command) {
+            return Err(HepaMonitorStop::new(
+                HepaMonitorStopKind::CommandPolicy,
+                evidence,
+            ));
+        }
         for denied in &self.command_denylist {
             if command.contains(&denied.to_ascii_lowercase()) {
                 return Err(HepaMonitorStop::new(
@@ -116,6 +122,116 @@ impl HepaMonitorPolicy {
     }
 }
 
+fn default_git_lifecycle_denylist() -> Vec<String> {
+    [
+        "git add",
+        "git branch",
+        "git checkout",
+        "git commit",
+        "git merge",
+        "git push",
+        "git rebase",
+        "git reset",
+        "git restore",
+        "git switch",
+        "git tag",
+        "git worktree add",
+        "git worktree remove",
+        "gh pr close",
+        "gh pr create",
+        "gh pr edit",
+        "gh pr merge",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn detect_git_lifecycle_action(command: &str) -> Option<String> {
+    let tokens = shell_like_tokens(command);
+    for (index, token) in tokens.iter().enumerate() {
+        if token == "git" {
+            if let Some(action) = git_action_after(&tokens[index + 1..]) {
+                return Some(action);
+            }
+        }
+        if token == "gh"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| next.as_str() == "pr")
+            && tokens.get(index + 2).is_some_and(|action| {
+                matches!(action.as_str(), "close" | "create" | "edit" | "merge")
+            })
+        {
+            return Some(format!("gh pr {}", tokens[index + 2]));
+        }
+    }
+    None
+}
+
+fn git_action_after(tokens: &[String]) -> Option<String> {
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" => index += 2,
+            token if token.starts_with("-c") && token.len() > 2 => index += 1,
+            token
+                if token.starts_with("--git-dir=")
+                    || token.starts_with("--work-tree=")
+                    || token.starts_with("--namespace=") =>
+            {
+                index += 1
+            }
+            token if token.starts_with('-') => index += 1,
+            "worktree" => {
+                return tokens.get(index + 1).and_then(|action| {
+                    if matches!(action.as_str(), "add" | "remove") {
+                        Some(format!("git worktree {action}"))
+                    } else {
+                        None
+                    }
+                });
+            }
+            action
+                if matches!(
+                    action,
+                    "add"
+                        | "branch"
+                        | "checkout"
+                        | "commit"
+                        | "merge"
+                        | "push"
+                        | "rebase"
+                        | "reset"
+                        | "restore"
+                        | "switch"
+                        | "tag"
+                ) =>
+            {
+                return Some(format!("git {action}"));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn shell_like_tokens(command: &str) -> Vec<String> {
+    command
+        .split(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, ';' | '&' | '|' | '(' | ')')
+        })
+        .filter_map(|token| {
+            let token = token
+                .trim_matches(|character: char| {
+                    matches!(character, '\'' | '"' | ',' | ':' | '[' | ']')
+                })
+                .to_ascii_lowercase();
+            if token.is_empty() { None } else { Some(token) }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,7 +241,7 @@ mod tests {
         let policy = HepaMonitorPolicy::default();
 
         assert!(matches!(
-            policy.check_command("agent && git push"),
+            policy.check_command("agent && git -C <WORKTREE> push"),
             Err(HepaMonitorStop {
                 kind: HepaMonitorStopKind::CommandPolicy,
                 ..
@@ -138,5 +254,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn monitor_blocks_manager_owned_git_and_pr_lifecycle_actions() {
+        let policy = HepaMonitorPolicy::default();
+        let blocked = [
+            "worker && git add src/lib.rs",
+            "worker && git commit -m docs",
+            "worker && git -C <WORKTREE> push",
+            "worker && git worktree remove lane",
+            "reviewer && gh pr create --fill",
+            "reviewer && gh pr merge 42",
+        ];
+
+        for command in blocked {
+            let error = policy
+                .check_command(command)
+                .expect_err("manager-owned lifecycle must be blocked");
+
+            assert_eq!(error.kind, HepaMonitorStopKind::CommandPolicy);
+        }
+
+        assert!(policy.check_command("reviewer && git diff --stat").is_ok());
+        assert!(policy.check_command("worker && git status --short").is_ok());
     }
 }
