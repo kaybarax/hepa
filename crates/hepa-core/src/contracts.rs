@@ -496,6 +496,53 @@ impl HepaValidate for HepaReviewFinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaArbitrationFindingRecord {
+    pub schema_version: u32,
+    pub finding_id: String,
+    pub disposition: String,
+    pub rule_id: Option<String>,
+    pub reason: String,
+    pub severity_before: HepaFindingSeverity,
+    pub severity_after: HepaFindingSeverity,
+    pub accepted: bool,
+}
+
+impl HepaValidate for HepaArbitrationFindingRecord {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("finding_id", &self.finding_id)?;
+        require_single_line("disposition", &self.disposition)?;
+        if let Some(rule_id) = &self.rule_id {
+            require_single_line("rule_id", rule_id)?;
+        }
+        require_non_empty("reason", &self.reason)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaArbitrationSummary {
+    pub schema_version: u32,
+    pub status: String,
+    pub records: Vec<HepaArbitrationFindingRecord>,
+    pub pr_body_lines: Vec<String>,
+    pub card_status: String,
+}
+
+impl HepaValidate for HepaArbitrationSummary {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("status", &self.status)?;
+        require_single_line("card_status", &self.card_status)?;
+        require_string_list("pr_body_lines", &self.pr_body_lines)?;
+        for record in &self.records {
+            record.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaFindingSeverity {
     Low,
@@ -624,6 +671,7 @@ pub struct HepaTerminalTaskReport {
     pub pr_url: Option<String>,
     pub validation: Option<HepaValidationSummary>,
     pub review_signals: Vec<HepaReviewSignal>,
+    pub arbitration: Option<HepaArbitrationSummary>,
     pub timing: Option<HepaTimingRecord>,
     pub summary: Vec<String>,
     pub human_attention_required: bool,
@@ -640,6 +688,9 @@ impl HepaValidate for HepaTerminalTaskReport {
         }
         for review_signal in &self.review_signals {
             review_signal.validate()?;
+        }
+        if let Some(arbitration) = &self.arbitration {
+            arbitration.validate()?;
         }
         if let Some(timing) = &self.timing {
             timing.validate()?;
@@ -866,6 +917,7 @@ mod tests {
                 summary: vec!["No tests detected.".to_string()],
             }),
             review_signals: Vec::new(),
+            arbitration: None,
             timing: Some(HepaTimingRecord {
                 schema_version: CONTRACT_SCHEMA_VERSION,
                 run_id: "run-1".to_string(),

@@ -1,4 +1,7 @@
-use hepa_core::contracts::{HepaFindingSeverity, HepaReviewFinding, HepaValidate};
+use hepa_core::contracts::{
+    CONTRACT_SCHEMA_VERSION, HepaArbitrationFindingRecord, HepaArbitrationSummary,
+    HepaFindingSeverity, HepaReviewFinding, HepaValidate,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HepaArbitrationDisposition {
@@ -101,6 +104,82 @@ pub fn apply_manager_arbitration(
         rule_id: Some("manager-judgment".to_string()),
         reason,
     })
+}
+
+pub fn summarize_arbitration_results(
+    decisions: &[HepaArbitratedFinding],
+) -> Result<HepaArbitrationSummary, HepaArbitrationError> {
+    if decisions.is_empty() {
+        return Err(HepaArbitrationError {
+            field: "decisions".to_string(),
+            message: "at least one arbitration decision is required".to_string(),
+        });
+    }
+
+    let mut records = decisions.iter().map(arbitration_record).collect::<Vec<_>>();
+    records.sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
+    let accepted = records.iter().filter(|record| record.accepted).count();
+    let status = arbitration_status(&records);
+    let pr_body_lines = records
+        .iter()
+        .map(|record| {
+            format!(
+                "- {}: {}, {:?} -> {:?}, accepted={}, reason={}",
+                record.finding_id,
+                record.disposition,
+                record.severity_before,
+                record.severity_after,
+                record.accepted,
+                record.reason
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(HepaArbitrationSummary {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        card_status: format!(
+            "arbitration={status} records={} accepted={accepted}",
+            records.len()
+        ),
+        status,
+        records,
+        pr_body_lines,
+    })
+}
+
+fn arbitration_record(decision: &HepaArbitratedFinding) -> HepaArbitrationFindingRecord {
+    HepaArbitrationFindingRecord {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        finding_id: decision.original.finding_id.clone(),
+        disposition: disposition_name(&decision.disposition).to_string(),
+        rule_id: decision.rule_id.clone(),
+        reason: decision.reason.clone(),
+        severity_before: decision.original.severity.clone(),
+        severity_after: decision.finding.severity.clone(),
+        accepted: decision.finding.accepted,
+    }
+}
+
+fn arbitration_status(records: &[HepaArbitrationFindingRecord]) -> String {
+    if records
+        .iter()
+        .any(|record| record.disposition == "manager_required")
+    {
+        "manager_required".to_string()
+    } else if records.iter().any(|record| record.accepted) {
+        "residual_accepted".to_string()
+    } else {
+        "settled".to_string()
+    }
+}
+
+fn disposition_name(disposition: &HepaArbitrationDisposition) -> &'static str {
+    match disposition {
+        HepaArbitrationDisposition::Downgraded => "downgraded",
+        HepaArbitrationDisposition::ManagerRequired => "manager_required",
+        HepaArbitrationDisposition::ManagerAccepted => "manager_accepted",
+        HepaArbitrationDisposition::ManagerRejected => "manager_rejected",
+        HepaArbitrationDisposition::ManagerDowngraded => "manager_downgraded",
+    }
 }
 
 fn require_reason(reason: &str) -> Result<(), HepaArbitrationError> {
@@ -249,6 +328,36 @@ mod tests {
         )
         .expect_err("same severity is not a downgrade");
         assert_eq!(non_downgrade.field, "severity");
+    }
+
+    #[test]
+    fn arbitration_summary_records_artifact_pr_body_and_card_status() {
+        let accepted = manager_decision(
+            HepaManagerArbitrationAction::Accept,
+            "Manager accepts the residual risk for this lane.",
+        );
+        let rejected = manager_decision(
+            HepaManagerArbitrationAction::Reject,
+            "Manager rejects the finding because validation evidence contradicts it.",
+        );
+
+        let summary =
+            summarize_arbitration_results(&[rejected, accepted]).expect("summary renders");
+
+        assert_eq!(summary.status, "residual_accepted");
+        assert_eq!(
+            summary.card_status,
+            "arbitration=residual_accepted records=2 accepted=1"
+        );
+        assert_eq!(summary.records.len(), 2);
+        assert_eq!(summary.records[0].finding_id, "finding-1");
+        assert!(
+            summary
+                .pr_body_lines
+                .iter()
+                .any(|line| line.contains("manager_accepted")
+                    && line.contains("Manager accepts the residual risk"))
+        );
     }
 
     fn manager_decision(

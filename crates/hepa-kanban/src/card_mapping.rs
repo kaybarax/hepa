@@ -92,6 +92,7 @@ pub enum HepaHermesCommentKind {
     Readiness,
     Validation,
     Review,
+    Arbitration,
     Timing,
     TerminalReport,
     Steering,
@@ -197,6 +198,14 @@ pub fn map_task_to_hermes_card(
             "terminal_status",
             &stable_json_name(&terminal_report.status)?,
         );
+        if let Some(arbitration) = &terminal_report.arbitration {
+            insert_text(&mut fields, "arbitration_status", &arbitration.status);
+            insert_text(
+                &mut fields,
+                "arbitration_card_status",
+                &arbitration.card_status,
+            );
+        }
     }
     if let Some(timing) = input.timing.as_ref().or(input
         .terminal_report
@@ -267,6 +276,21 @@ pub fn map_task_to_hermes_card(
                 stable_json_name(&review.status)?,
                 review.findings.len(),
                 join_or_none(&review.summary)
+            ),
+        });
+    }
+    if let Some(arbitration) = input
+        .terminal_report
+        .as_ref()
+        .and_then(|report| report.arbitration.as_ref())
+    {
+        comments.push(HepaHermesCardComment {
+            kind: HepaHermesCommentKind::Arbitration,
+            body: format!(
+                "Arbitration: {}\nRecords: {}\nPR body: {}",
+                arbitration.card_status,
+                arbitration.records.len(),
+                join_or_none(&arbitration.pr_body_lines)
             ),
         });
     }
@@ -540,10 +564,11 @@ fn require_single_line(
 mod tests {
     use super::*;
     use hepa_core::contracts::{
-        CONTRACT_SCHEMA_VERSION, HepaFindingSeverity, HepaLaneState, HepaPhaseStatus,
-        HepaReadinessState, HepaReadinessStatus, HepaReviewFinding, HepaReviewStatus,
-        HepaRiskLevel, HepaTaskStatus, HepaTerminalStatus, HepaTimingCounters, HepaTimingPhase,
-        HepaValidationCommandResult, HepaValidationStatus,
+        CONTRACT_SCHEMA_VERSION, HepaArbitrationFindingRecord, HepaArbitrationSummary,
+        HepaFindingSeverity, HepaLaneState, HepaPhaseStatus, HepaReadinessState,
+        HepaReadinessStatus, HepaReviewFinding, HepaReviewStatus, HepaRiskLevel, HepaTaskStatus,
+        HepaTerminalStatus, HepaTimingCounters, HepaTimingPhase, HepaValidationCommandResult,
+        HepaValidationStatus,
     };
 
     fn sample_input() -> HepaHermesCardMappingInput {
@@ -676,6 +701,24 @@ mod tests {
             pr_url: Some("<PR_URL>".to_string()),
             validation: Some(validation.clone()),
             review_signals: review_signals.clone(),
+            arbitration: Some(HepaArbitrationSummary {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                status: "residual_accepted".to_string(),
+                records: vec![HepaArbitrationFindingRecord {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    finding_id: "finding-1".to_string(),
+                    disposition: "manager_accepted".to_string(),
+                    rule_id: Some("manager-judgment".to_string()),
+                    reason: "Manager accepted residual docs risk.".to_string(),
+                    severity_before: HepaFindingSeverity::Low,
+                    severity_after: HepaFindingSeverity::Low,
+                    accepted: true,
+                }],
+                pr_body_lines: vec![
+                    "- finding-1: manager_accepted, low -> low, accepted=true, reason=Manager accepted residual docs risk.".to_string(),
+                ],
+                card_status: "arbitration=residual_accepted records=1 accepted=1".to_string(),
+            }),
             timing: Some(timing.clone()),
             summary: vec!["Ready for human".to_string()],
             human_attention_required: false,
@@ -731,6 +774,16 @@ mod tests {
             Some(&HepaHermesFieldValue::Text("<PR_URL>".to_string()))
         );
         assert_eq!(
+            payload.fields.get("arbitration_status"),
+            Some(&HepaHermesFieldValue::Text("residual_accepted".to_string()))
+        );
+        assert_eq!(
+            payload.fields.get("arbitration_card_status"),
+            Some(&HepaHermesFieldValue::Text(
+                "arbitration=residual_accepted records=1 accepted=1".to_string()
+            ))
+        );
+        assert_eq!(
             payload.fields.get("agent_loops"),
             Some(&HepaHermesFieldValue::Number(1))
         );
@@ -751,6 +804,13 @@ mod tests {
                 .comments
                 .iter()
                 .any(|comment| comment.kind == HepaHermesCommentKind::BlockedQuestion)
+        );
+        assert!(
+            payload
+                .comments
+                .iter()
+                .any(|comment| comment.kind == HepaHermesCommentKind::Arbitration
+                    && comment.body.contains("manager_accepted"))
         );
     }
 

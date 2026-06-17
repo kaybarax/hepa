@@ -450,6 +450,7 @@ fn terminal_report(
         pr_url: None,
         validation: Some(validation),
         review_signals: vec![review],
+        arbitration: None,
         timing: Some(timing),
         summary: vec!["Fake run completed deterministically.".to_string()],
         human_attention_required: false,
