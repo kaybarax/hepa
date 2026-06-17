@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod engine;
 pub mod external_worker;
 pub mod fake;
+pub mod interactive;
 pub mod local_worker;
 pub mod registry;
 pub mod routing;
