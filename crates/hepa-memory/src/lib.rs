@@ -1,3 +1,4 @@
+use hepa_core::contracts::HepaLaneState;
 use std::{
     error::Error,
     fmt, fs, io,
@@ -13,6 +14,22 @@ pub fn crate_name() -> &'static str {
 /// Maximum bytes any single context pack may hold. Generation is bounded so a
 /// pack can never grow without limit.
 pub const CONTEXT_PACK_BYTE_BUDGET: usize = 16 * 1024;
+
+/// Maximum number of pattern entries retained per learning pack. Older entries
+/// are dropped so packs stay bounded.
+pub const MAX_PATTERN_ENTRIES: usize = 200;
+
+/// Lane states that conclude a lane and trigger learning write-back.
+pub fn is_terminal_lane_state(state: &HepaLaneState) -> bool {
+    matches!(
+        state,
+        HepaLaneState::Completed
+            | HepaLaneState::Blocked
+            | HepaLaneState::Failed
+            | HepaLaneState::Cancelled
+            | HepaLaneState::Cleaned
+    )
+}
 
 /// The per-project context packs that live under the HEPA control memory root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +130,78 @@ impl HepaProjectMemory {
     /// degrade gracefully instead of failing.
     pub fn read_pack(&self, pack: HepaContextPack) -> Option<String> {
         fs::read_to_string(self.pack_path(pack)).ok()
+    }
+
+    /// Append a successful prompt pattern, but only on a terminal lane state.
+    /// Returns whether a new entry was written.
+    pub fn append_prompt_pattern(
+        &self,
+        lane_state: &HepaLaneState,
+        pattern: &str,
+    ) -> Result<bool, HepaMemoryError> {
+        self.append_pattern(HepaContextPack::PromptPatterns, lane_state, pattern)
+    }
+
+    /// Append a failure pattern, but only on a terminal lane state. Returns
+    /// whether a new entry was written.
+    pub fn append_failure_pattern(
+        &self,
+        lane_state: &HepaLaneState,
+        pattern: &str,
+    ) -> Result<bool, HepaMemoryError> {
+        self.append_pattern(HepaContextPack::FailurePatterns, lane_state, pattern)
+    }
+
+    fn append_pattern(
+        &self,
+        pack: HepaContextPack,
+        lane_state: &HepaLaneState,
+        pattern: &str,
+    ) -> Result<bool, HepaMemoryError> {
+        if !is_terminal_lane_state(lane_state) {
+            return Ok(false);
+        }
+        let redacted = redact(pattern);
+        let redacted = redacted.trim();
+        if redacted.is_empty() {
+            return Ok(false);
+        }
+        self.ensure_context_packs()?;
+
+        let path = self.pack_path(pack);
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        let entry = format!("- {redacted}");
+
+        let mut header_lines = Vec::new();
+        let mut entries = Vec::new();
+        for line in existing.lines() {
+            if line.starts_with("- ") {
+                entries.push(line.to_string());
+            } else {
+                header_lines.push(line.to_string());
+            }
+        }
+        if entries
+            .iter()
+            .any(|existing_entry| existing_entry == &entry)
+        {
+            return Ok(false);
+        }
+        entries.push(entry);
+        if entries.len() > MAX_PATTERN_ENTRIES {
+            let overflow = entries.len() - MAX_PATTERN_ENTRIES;
+            entries.drain(0..overflow);
+        }
+
+        let mut content = header_lines.join("\n");
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(&entries.join("\n"));
+        content.push('\n');
+        write_bounded(&path, &content)?;
+        Ok(true)
     }
 }
 
@@ -242,6 +331,68 @@ mod tests {
         let root = unique_test_dir("traversal");
         assert!(HepaProjectMemory::new(&root, "../escape").is_err());
         assert!(HepaProjectMemory::new(&root, "a/b").is_err());
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn appends_patterns_only_on_terminal_lane_states() {
+        let root = unique_test_dir("append-terminal");
+        let memory = HepaProjectMemory::new(&root, "project-1").expect("valid project");
+
+        // Non-terminal state is a no-op.
+        assert!(
+            !memory
+                .append_prompt_pattern(&HepaLaneState::Running, "use focused diffs")
+                .expect("running append")
+        );
+        // Terminal success appends a prompt pattern.
+        assert!(
+            memory
+                .append_prompt_pattern(&HepaLaneState::Completed, "use focused diffs")
+                .expect("completed append")
+        );
+        let prompt = memory
+            .read_pack(HepaContextPack::PromptPatterns)
+            .expect("prompt pack exists");
+        assert!(prompt.contains("- use focused diffs"));
+
+        // Terminal failure appends a failure pattern.
+        assert!(
+            memory
+                .append_failure_pattern(&HepaLaneState::Blocked, "lockfile drift breaks install")
+                .expect("blocked append")
+        );
+        let failures = memory
+            .read_pack(HepaContextPack::FailurePatterns)
+            .expect("failure pack exists");
+        assert!(failures.contains("- lockfile drift breaks install"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn append_dedupes_and_redacts_patterns() {
+        let root = unique_test_dir("append-dedupe");
+        let memory = HepaProjectMemory::new(&root, "project-1").expect("valid project");
+
+        assert!(
+            memory
+                .append_failure_pattern(&HepaLaneState::Failed, "test failed in /Users/x/app")
+                .expect("first append")
+        );
+        // Identical (post-redaction) entry is deduped.
+        assert!(
+            !memory
+                .append_failure_pattern(&HepaLaneState::Failed, "test failed in /Users/x/app")
+                .expect("dedupe append")
+        );
+
+        let failures = memory
+            .read_pack(HepaContextPack::FailurePatterns)
+            .expect("failure pack exists");
+        assert!(!failures.contains("/Users/"));
+        assert_eq!(failures.matches("- test failed in").count(), 1);
+
         remove_test_dir(root);
     }
 
