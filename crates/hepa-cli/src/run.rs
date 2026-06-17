@@ -1311,9 +1311,12 @@ fn live_force_secret_path_change() -> bool {
 }
 
 fn inject_secret_path_fixture(worktree: &Path) -> Result<(), String> {
+    let secret_dir = worktree.join(".ssh");
+    fs::create_dir_all(&secret_dir)
+        .map_err(|error| format!("failed to create secret-path fixture dir: {error}"))?;
     fs::write(
-        worktree.join(".env"),
-        "RS5_SECRET_PATH_FIXTURE=placeholder\n",
+        secret_dir.join("id_rsa"),
+        "RS5_SECRET_PATH_FIXTURE_PLACEHOLDER\n",
     )
     .map_err(|error| format!("failed to inject secret-path fixture: {error}"))
 }
@@ -2261,7 +2264,7 @@ fn collect_changed_files(worktree: &Path) -> Result<Vec<String>, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .output()
         .map_err(|error| format!("failed to inspect worktree diff: {error}"))?;
     if !output.status.success() {
@@ -2598,7 +2601,7 @@ mod tests {
         inject_secret_path_fixture(&repo).expect("fixture should write");
         let changed = collect_changed_files(&repo).expect("changed files should collect fixture");
 
-        assert_eq!(changed, vec![".env".to_string()]);
+        assert_eq!(changed, vec![".ssh/id_rsa".to_string()]);
         let error = HepaSafeStaging::new(&repo)
             .stage_approved_files(&changed)
             .expect_err("secret-like path must be rejected");
