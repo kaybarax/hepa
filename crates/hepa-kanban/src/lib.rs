@@ -1,5 +1,6 @@
 pub mod card_mapping;
 pub mod doctor;
+pub mod github_webhook;
 pub mod spec_import;
 pub mod sync;
 pub mod transition;

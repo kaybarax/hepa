@@ -14,6 +14,7 @@ use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::{HepaLaneState, HepaTimingRecord};
 use hepa_git::worktree::HepaWorktreeAllocator;
 use hepa_kanban::doctor::system_kanban_doctor_report;
+use hepa_kanban::github_webhook::{HepaGithubIssueWebhookRequest, import_github_issue_webhook};
 use hepa_kanban::spec_import::import_markdown_spec;
 use hepa_kanban::sync::{
     HepaKanbanSyncEngine, HepaKanbanSyncStatus, HepaUnavailableHermesCardStore,
@@ -139,6 +140,46 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             ))
         }
         [command, ..] if command == "spec" => Err("unknown spec command".to_string()),
+        [command, subcommand, path, flags @ ..]
+            if command == "github" && subcommand == "issue-webhook" =>
+        {
+            let options = parse_github_issue_webhook_options(flags)?;
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("failed to read GitHub webhook payload: {error}"))?;
+            let secret =
+                match options.secret_env {
+                    Some(secret_env) => Some(std::env::var(&secret_env).map_err(|_| {
+                        format!("webhook secret env {secret_env} is not configured")
+                    })?),
+                    None => None,
+                };
+            let request = HepaGithubIssueWebhookRequest {
+                event: options.event,
+                delivery_id: options.delivery_id,
+                signature_256: options.signature_256,
+                project_id: options.project_id,
+                secret,
+            };
+            let outcome =
+                import_github_issue_webhook(&request, &text).map_err(|error| error.to_string())?;
+            if let Some(imported) = outcome.imported {
+                Ok(format!(
+                    "HEPA GitHub issue webhook imported: delivery={} tasks={} verification={:?}",
+                    outcome.delivery_id,
+                    imported.tasks.len(),
+                    outcome.verification
+                ))
+            } else {
+                Ok(format!(
+                    "HEPA GitHub issue webhook ignored: delivery={} reason={}",
+                    outcome.delivery_id,
+                    outcome
+                        .ignored_reason
+                        .unwrap_or_else(|| "unknown".to_string())
+                ))
+            }
+        }
+        [command, ..] if command == "github" => Err("unknown github command".to_string()),
         [command, rest @ ..] if command == "project" => fleet::project_command(rest),
         [command, rest @ ..] if command == "task" => fleet::task_command(rest),
         [command, rest @ ..] if command == "scheduler" => fleet::scheduler_command(rest),
@@ -270,6 +311,49 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
         [command, ..] if command == "run" => Err("unknown run command".to_string()),
         _ => Err("unknown command".to_string()),
     }
+}
+
+#[derive(Debug, Clone)]
+struct GithubIssueWebhookOptions {
+    project_id: String,
+    event: String,
+    delivery_id: String,
+    signature_256: Option<String>,
+    secret_env: Option<String>,
+}
+
+fn parse_github_issue_webhook_options(
+    flags: &[String],
+) -> Result<GithubIssueWebhookOptions, String> {
+    let mut project_id = None;
+    let mut event = "issues".to_string();
+    let mut delivery_id = None;
+    let mut signature_256 = None;
+    let mut secret_env = None;
+    let mut index = 0;
+    while index < flags.len() {
+        let flag = flags[index].as_str();
+        let value = flags
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?
+            .clone();
+        match flag {
+            "--project" => project_id = Some(value),
+            "--event" => event = value,
+            "--delivery" => delivery_id = Some(value),
+            "--signature-256" => signature_256 = Some(value),
+            "--secret-env" => secret_env = Some(value),
+            _ => return Err(format!("unknown github issue-webhook option: {flag}")),
+        }
+        index += 2;
+    }
+    Ok(GithubIssueWebhookOptions {
+        project_id: project_id.ok_or_else(|| "--project is required".to_string())?,
+        event,
+        delivery_id: delivery_id.ok_or_else(|| "--delivery is required".to_string())?,
+        signature_256,
+        secret_env,
+    })
 }
 
 fn cli_timestamp() -> String {
@@ -784,6 +868,59 @@ mod tests {
         let error = run_cli(&args(&["spec", "import"])).expect_err("path is required");
 
         assert_eq!(error, "unknown spec command");
+    }
+
+    #[test]
+    fn github_issue_webhook_command_imports_issue_payload() {
+        let root = unique_test_dir("github-webhook");
+        std::fs::create_dir_all(&root).expect("payload dir");
+        let payload_path = root.join("payload.json");
+        std::fs::write(
+            &payload_path,
+            r#"{
+  "action": "opened",
+  "issue": {
+    "number": 42,
+    "title": "Build webhook intake",
+    "body": "Acceptance:\n- Draft task is created.\nValidation:\n- cargo test -p hepa-kanban",
+    "labels": []
+  },
+  "repository": { "default_branch": "main" }
+}"#,
+        )
+        .expect("write payload");
+
+        let output = run_cli(&args(&[
+            "github",
+            "issue-webhook",
+            payload_path.to_str().expect("path is UTF-8"),
+            "--project",
+            "project-1",
+            "--delivery",
+            "delivery-1",
+        ]))
+        .expect("webhook import should run");
+
+        assert_eq!(
+            output,
+            "HEPA GitHub issue webhook imported: delivery=delivery-1 tasks=1 verification=NotConfigured"
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn github_issue_webhook_command_requires_project_and_delivery() {
+        let error = run_cli(&args(&[
+            "github",
+            "issue-webhook",
+            "payload.json",
+            "--project",
+            "project-1",
+        ]))
+        .expect_err("delivery is required");
+
+        assert_eq!(error, "--delivery is required");
     }
 
     #[test]

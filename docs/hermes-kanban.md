@@ -29,6 +29,28 @@ Imported tasks stay draft and not-ready until readiness passes. Each card carrie
 the task id, dependencies, lane states, acceptance criteria, validation commands,
 risk, timing counters, sandbox postures, and arbitration/repair status.
 
+## GitHub issue webhooks
+
+GitHub `issues` webhook payloads can be converted into the same draft task
+records as markdown specs:
+
+```bash
+hepa github issue-webhook payload.json \
+  --project project-1 \
+  --delivery 00000000-0000-0000-0000-000000000000 \
+  --event issues \
+  --signature-256 sha256=<digest> \
+  --secret-env HEPA_GITHUB_WEBHOOK_SECRET
+```
+
+When `--secret-env` is set, HEPA verifies `X-Hub-Signature-256` with HMAC-SHA256
+before parsing the payload. Issue bodies may include `Acceptance:`,
+`Validation:`, `Dependencies:`, and `Questions:` sections; missing acceptance
+criteria creates a blocked draft task with a clarification question. Pull
+request mirror payloads and non-task issue actions are ignored. GitHub labels
+can set HEPA metadata such as `hepa:priority=7`, `hepa:risk=medium`, and
+`hepa:area=crates/hepa-kanban`, but labels never bypass definition-of-ready.
+
 ## Card transitions
 
 As a task progresses, its lane state advances and the card status is projected
