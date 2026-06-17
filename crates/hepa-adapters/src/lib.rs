@@ -2,6 +2,7 @@ pub mod builtin;
 pub mod custom;
 pub mod doctor;
 pub mod engine;
+pub mod external_worker;
 pub mod fake;
 pub mod local_worker;
 pub mod registry;
