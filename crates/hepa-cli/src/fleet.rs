@@ -7,7 +7,10 @@ use hepa_core::contracts::{
 use hepa_core::fleet_registry::{
     HepaCostClass, HepaCostPolicy, HepaFleetRegistry, HepaMemoryPolicy, HepaRegisteredProject,
 };
-use std::path::PathBuf;
+use hepa_core::scheduler::{
+    HepaActiveLaneSummary, HepaScheduler, HepaSchedulerLimits, HepaTickOutcome,
+};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A single-line timestamp for CLI-driven record mutations.
@@ -298,6 +301,110 @@ pub fn task_command(args: &[String]) -> Result<String, String> {
     }
 }
 
+fn scheduler_state_path(control_root: &Path) -> PathBuf {
+    control_root.join("fleet").join("scheduler-state")
+}
+
+fn read_scheduler_running(control_root: &Path) -> bool {
+    std::fs::read_to_string(scheduler_state_path(control_root))
+        .map(|value| value.trim() == "running")
+        .unwrap_or(false)
+}
+
+fn write_scheduler_running(control_root: &Path, running: bool) -> Result<(), String> {
+    let path = scheduler_state_path(control_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(path, if running { "running" } else { "stopped" })
+        .map_err(|error| error.to_string())
+}
+
+/// Active lanes are tasks the registry records as running.
+fn active_lanes(registry: &HepaFleetRegistry) -> Result<Vec<HepaActiveLaneSummary>, String> {
+    use hepa_core::contracts::HepaTaskStatus;
+    Ok(registry
+        .list_tasks()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|task| task.status == HepaTaskStatus::Running)
+        .map(|task| HepaActiveLaneSummary {
+            lane_id: task
+                .lane_ids
+                .first()
+                .cloned()
+                .unwrap_or(task.task_id.clone()),
+            task_id: task.task_id,
+        })
+        .collect())
+}
+
+/// Dispatch `hepa scheduler ...`.
+pub fn scheduler_command(args: &[String]) -> Result<String, String> {
+    let (subcommand, rest) = args
+        .split_first()
+        .ok_or_else(|| "usage: hepa scheduler <tick|start|stop|status>".to_string())?;
+    let (control_root, _flags) = take_control_root(rest)?;
+    let registry = HepaFleetRegistry::new(&control_root);
+    let limits = HepaSchedulerLimits {
+        max_parallel_lanes: 4,
+    };
+
+    match subcommand.as_str() {
+        "start" => {
+            write_scheduler_running(&control_root, true)?;
+            Ok("HEPA scheduler start: running".to_string())
+        }
+        "stop" => {
+            write_scheduler_running(&control_root, false)?;
+            Ok("HEPA scheduler stop: stopped".to_string())
+        }
+        "status" => {
+            let mut scheduler = HepaScheduler::new();
+            if read_scheduler_running(&control_root) {
+                scheduler.start();
+            }
+            let active = active_lanes(&registry)?;
+            let status = scheduler
+                .status(&registry, &limits, &active)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA scheduler status: run_state={:?} ready={} running={} blocked={} queued={} active_lanes={} waits={}",
+                status.run_state,
+                status.ready,
+                status.running,
+                status.blocked,
+                status.queued,
+                status.active_lanes,
+                status.waits.len()
+            ))
+        }
+        "tick" => {
+            let mut scheduler = HepaScheduler::new();
+            if read_scheduler_running(&control_root) {
+                scheduler.start();
+            }
+            let active = active_lanes(&registry)?;
+            let outcome = scheduler
+                .tick(&registry, &limits, &active)
+                .map_err(|error| error.to_string())?;
+            Ok(match outcome {
+                HepaTickOutcome::NotRunning => {
+                    "HEPA scheduler tick: not running (run hepa scheduler start)".to_string()
+                }
+                HepaTickOutcome::Idle => "HEPA scheduler tick: idle (no ready tasks)".to_string(),
+                HepaTickOutcome::Claimable { task_id } => {
+                    format!("HEPA scheduler tick: claimable task={task_id}")
+                }
+                HepaTickOutcome::Waiting { waits } => {
+                    format!("HEPA scheduler tick: waiting tasks={}", waits.len())
+                }
+            })
+        }
+        other => Err(format!("unknown scheduler command: {other}")),
+    }
+}
+
 fn positional(flags: &[String], index: usize, label: &str) -> Result<String, String> {
     flags
         .get(index)
@@ -401,6 +508,38 @@ mod tests {
         let sync = task_command(&s(&["sync-kanban", "--control-root", &control])).expect("sync");
         assert!(sync.contains("tasks=1"));
         assert!(sync.contains("degraded"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scheduler_start_status_tick_and_stop() {
+        let root = unique_test_dir("scheduler");
+        let control = root.to_str().expect("path is UTF-8").to_string();
+
+        // Stopped by default: tick reports not running.
+        let idle_tick = scheduler_command(&s(&["tick", "--control-root", &control])).expect("tick");
+        assert!(idle_tick.contains("not running"));
+
+        assert!(
+            scheduler_command(&s(&["start", "--control-root", &control]))
+                .expect("start")
+                .contains("running")
+        );
+
+        let status =
+            scheduler_command(&s(&["status", "--control-root", &control])).expect("status");
+        assert!(status.contains("run_state=Running"));
+
+        // A running scheduler with no ready tasks is idle.
+        let tick = scheduler_command(&s(&["tick", "--control-root", &control])).expect("tick");
+        assert!(tick.contains("idle"));
+
+        assert!(
+            scheduler_command(&s(&["stop", "--control-root", &control]))
+                .expect("stop")
+                .contains("stopped")
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
