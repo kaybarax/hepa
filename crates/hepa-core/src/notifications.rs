@@ -17,6 +17,23 @@ impl HepaNotificationStatus {
             HepaNotificationStatus::Blocked => "blocked",
         }
     }
+
+    /// Whether a Hermes card's terminal status agrees with this notification, so
+    /// card updates and terminal notifications never disagree.
+    pub fn agrees_with_card_status(self, card_status: &str) -> bool {
+        let normalized = card_status.trim().to_ascii_lowercase();
+        match self {
+            HepaNotificationStatus::Done => {
+                matches!(
+                    normalized.as_str(),
+                    "done" | "completed" | "ready_for_human" | "ready"
+                )
+            }
+            HepaNotificationStatus::Blocked => {
+                matches!(normalized.as_str(), "blocked" | "failed")
+            }
+        }
+    }
 }
 
 /// A terminal notification for one task.
@@ -109,6 +126,58 @@ impl HepaNotificationLog {
     }
 }
 
+/// A delivery transport for terminal notifications.
+///
+/// Transports are pluggable: the default is the local terminal, and optional
+/// transports such as Telegram are ported by implementing this trait (no vendor
+/// transport is bundled or privileged, and none receives manager credentials).
+pub trait HepaNotificationSink {
+    fn deliver(&mut self, notification: &HepaNotification) -> Result<(), String>;
+}
+
+/// In-memory sink that records delivered notifications, for tests and headless
+/// runs.
+#[derive(Debug, Default, Clone)]
+pub struct HepaInMemoryNotificationSink {
+    pub delivered: Vec<HepaNotification>,
+}
+
+impl HepaNotificationSink for HepaInMemoryNotificationSink {
+    fn deliver(&mut self, notification: &HepaNotification) -> Result<(), String> {
+        self.delivered.push(notification.clone());
+        Ok(())
+    }
+}
+
+/// Routes terminal notifications through the dedupe log to a sink so repeated
+/// states are never delivered twice.
+#[derive(Debug, Clone, Default)]
+pub struct HepaNotifier {
+    log: HepaNotificationLog,
+}
+
+impl HepaNotifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Deliver a notification to the sink only the first time its terminal
+    /// `(task, status)` is seen; repeats are deduped and never delivered.
+    pub fn notify(
+        &mut self,
+        notification: &HepaNotification,
+        sink: &mut dyn HepaNotificationSink,
+    ) -> Result<HepaNotificationOutcome, String> {
+        match self.log.record(notification) {
+            HepaNotificationOutcome::Emitted => {
+                sink.deliver(notification)?;
+                Ok(HepaNotificationOutcome::Emitted)
+            }
+            HepaNotificationOutcome::Deduped => Ok(HepaNotificationOutcome::Deduped),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +220,39 @@ mod tests {
             log.record(&done_notification("task-2")),
             HepaNotificationOutcome::Emitted
         );
+    }
+
+    #[test]
+    fn notifier_delivers_once_and_dedupes_repeated_states() {
+        let mut notifier = HepaNotifier::new();
+        let mut sink = HepaInMemoryNotificationSink::default();
+        let done = done_notification("task-1");
+
+        assert_eq!(
+            notifier.notify(&done, &mut sink).expect("first delivery"),
+            HepaNotificationOutcome::Emitted
+        );
+        assert_eq!(
+            notifier.notify(&done, &mut sink).expect("repeat deduped"),
+            HepaNotificationOutcome::Deduped
+        );
+        assert_eq!(
+            notifier.notify(&done, &mut sink).expect("repeat deduped"),
+            HepaNotificationOutcome::Deduped
+        );
+        // The repeated states never reached the transport.
+        assert_eq!(sink.delivered.len(), 1);
+    }
+
+    #[test]
+    fn card_status_and_terminal_notification_agree() {
+        for card_status in ["done", "completed", "ready_for_human"] {
+            assert!(HepaNotificationStatus::Done.agrees_with_card_status(card_status));
+        }
+        assert!(HepaNotificationStatus::Blocked.agrees_with_card_status("blocked"));
+        // A done notification must not agree with an in-progress card.
+        assert!(!HepaNotificationStatus::Done.agrees_with_card_status("in_progress"));
+        assert!(!HepaNotificationStatus::Blocked.agrees_with_card_status("done"));
     }
 
     #[test]
