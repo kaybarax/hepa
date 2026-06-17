@@ -21,7 +21,8 @@ events, and container count, plus the active sandbox posture.
 
 ## Pi runs
 
-Pi is the default one-loop harness. HEPA invokes `pi -p --mode json --model ...`
+Pi is the default one-loop harness. HEPA invokes
+`pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files -p --mode json --model ...`
 once per worker or reviewer attempt, feeds the prompt on stdin, and captures the
 JSON event stream from stdout into the lane artifact. DeepSeek and other cloud
 routes count as paid-cloud lanes; Ollama/loopback/no-key routes count as local

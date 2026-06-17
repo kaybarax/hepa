@@ -410,7 +410,18 @@ fn known_hepa_adapter_flags(binary: &str) -> Option<BTreeSet<&'static str>> {
                 "--review",
             ]
         }
-        "pi" => vec!["--approve", "--mode", "--model", "--provider", "--tools"],
+        "pi" => vec![
+            "--no-approve",
+            "--no-context-files",
+            "--no-extensions",
+            "--no-prompt-templates",
+            "--no-session",
+            "--no-skills",
+            "--mode",
+            "--model",
+            "--provider",
+            "--tools",
+        ],
         _ => return None,
     };
     Some(flags.into_iter().collect())

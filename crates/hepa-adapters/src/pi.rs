@@ -110,11 +110,11 @@ pub fn adapter_spec_from_config(config: &HepaPiConfig) -> HepaAdapterSpec {
     };
     let mut spec = builtin_adapter_spec(PI_ADAPTER_ID);
     spec.command = format!(
-        "pi --approve --tools read,edit,write,bash,grep,find,ls -p --mode json --provider {} --model {}",
+        "pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files --tools read,edit,write,bash,grep,find,ls -p --mode json --provider {} --model {}",
         model_config.provider, model_config.model
     );
     spec.review_command = Some(format!(
-        "pi --approve --tools read,edit,write,bash,grep,find,ls -p --mode json --provider {} --model {}",
+        "pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files --tools read,edit,write,bash,grep,find,ls -p --mode json --provider {} --model {}",
         model_config.provider,
         model_config
             .review_model
@@ -362,11 +362,19 @@ mod tests {
 
         assert!(spec.command.contains("--provider ollama"));
         assert!(spec.command.contains("--model qwen2.5-coder"));
+        assert!(spec.command.contains("--no-approve"));
+        assert!(!spec.command.contains("--approve "));
         assert!(
             spec.review_command
                 .as_deref()
                 .unwrap()
                 .contains("--provider ollama")
+        );
+        assert!(
+            spec.review_command
+                .as_deref()
+                .unwrap()
+                .contains("--no-approve")
         );
         assert_eq!(spec.required_env, Vec::<String>::new());
         assert_eq!(spec.cost_class, HepaAdapterCostClass::Local);

@@ -54,9 +54,15 @@ hepa adapter doctor
 ```
 
 The installer is explicit and version-pinned; HEPA never silently installs Pi
-from doctor. The built-in spec composes `pi -p --mode json --model ...`, feeds
-the prompt on stdin, captures stdout to the lane output artifact, and keeps
-stderr under the deterministic monitor.
+from doctor. The built-in spec composes
+`pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files -p --mode json --model ...`,
+feeds the prompt on stdin, captures stdout to the lane output artifact, and
+keeps stderr under the deterministic monitor. `--no-approve` keeps
+non-interactive Pi runs from trusting project-local Pi settings, packages,
+skills, or extensions unless HEPA adds an explicit adapter policy for them.
+`--no-session` avoids a second persistent transcript outside HEPA's lane
+artifacts, while the `--no-*` discovery flags keep the adapter surface
+deterministic.
 
 DeepSeek cloud:
 

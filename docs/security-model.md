@@ -56,10 +56,14 @@ Pi runs:
   suspicious paths;
 - container mode for untrusted projects.
 
-HEPA composes `pi -p --mode json --model ...` without `--dangerously-*`,
-`--yolo`, `--no-sandbox`, or other unrestricted host-bypass flags. Pi is the
-default harness, not a hard dependency; non-Pi adapters keep the same safety
-boundaries.
+HEPA composes
+`pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files -p --mode json --model ...`
+without `--dangerously-*`, `--yolo`, `--no-sandbox`, or other unrestricted
+host-bypass flags. The explicit `--no-approve` posture prevents
+non-interactive Pi runs from loading project-local Pi resources outside HEPA's
+adapter policy, and `--no-session` keeps HEPA's lane artifact as the single
+persistent transcript. Pi is the default harness, not a hard dependency; non-Pi
+adapters keep the same safety boundaries.
 
 ## Mitigations
 

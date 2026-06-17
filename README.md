@@ -80,6 +80,11 @@ export DEEPSEEK_API_KEY=...
 hepa run /path/to/repo "Fix login redirect" --agent pi
 ```
 
+HEPA invokes Pi with `--no-approve`, `--no-session`, and discovery-disabling
+flags in non-interactive runs so project-local Pi resources do not expand the
+execution surface and HEPA's lane artifact remains the single persistent
+transcript.
+
 For a local Ollama route, set `HEPA_PI_MODEL=ollama/<model>`,
 `HEPA_PI_PROVIDER_KEY_ENV=`, and optionally `HEPA_PI_BASE_URL` to your loopback
 endpoint. Local Pi routes derive `cost_class=local`, so they satisfy

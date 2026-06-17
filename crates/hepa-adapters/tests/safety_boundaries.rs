@@ -71,11 +71,21 @@ fn no_builtin_adapter_command_uses_bypass_flags() {
 fn pi_command_boundary_rejects_bypass_flags() {
     let mut spec = builtin_adapter_spec("pi");
     assert_eq!(unsupported_hepa_flags(&spec.command), Vec::<String>::new());
+    assert!(spec.command.contains("--no-approve"));
+    assert!(!spec.command.contains("--approve "));
 
     spec.command.push_str(" --no-sandbox");
 
     assert_eq!(
         unsupported_hepa_flags(&spec.command),
         vec!["--no-sandbox".to_string()]
+    );
+}
+
+#[test]
+fn pi_command_boundary_rejects_project_trust_approval() {
+    assert_eq!(
+        unsupported_hepa_flags("pi --approve -p --mode json --model deepseek/deepseek-chat"),
+        vec!["--approve".to_string()]
     );
 }

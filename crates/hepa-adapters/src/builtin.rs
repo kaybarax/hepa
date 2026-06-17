@@ -62,9 +62,9 @@ pub fn builtin_adapter_spec(id: &str) -> HepaAdapterSpec {
             display_name: "Pi Coding Agent".to_string(),
             roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
             mode: HepaAdapterMode::Oneshot,
-            command: "pi --approve --tools read,edit,write,bash,grep,find,ls -p --mode json --model deepseek/deepseek-chat".to_string(),
+            command: "pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files --tools read,edit,write,bash,grep,find,ls -p --mode json --model deepseek/deepseek-chat".to_string(),
             review_command: Some(
-                "pi --approve --tools read,edit,write,bash,grep,find,ls -p --mode json --model deepseek/deepseek-chat".to_string(),
+                "pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files --tools read,edit,write,bash,grep,find,ls -p --mode json --model deepseek/deepseek-chat".to_string(),
             ),
             workdir: "{worktree}".to_string(),
             required_commands: vec!["pi".to_string()],
