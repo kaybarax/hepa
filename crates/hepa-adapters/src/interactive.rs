@@ -66,6 +66,12 @@ pub struct HepaLaneSteeringRecord {
     pub lane_state: HepaLaneState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaInteractiveTeardownReceipt {
+    pub lane_id: String,
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HepaTmuxInteractiveLauncher;
 
@@ -135,6 +141,20 @@ impl HepaTmuxInteractiveLauncher {
             log_path,
         })
     }
+
+    pub fn teardown(
+        &self,
+        lane_id: &str,
+        tmux: &mut impl HepaTmux,
+    ) -> Result<HepaInteractiveTeardownReceipt, HepaInteractiveSessionError> {
+        require_artifact_id("lane_id", lane_id)?;
+        let session_id = interactive_session_id(lane_id);
+        tmux.kill_session(&session_id)?;
+        Ok(HepaInteractiveTeardownReceipt {
+            lane_id: lane_id.to_string(),
+            session_id,
+        })
+    }
 }
 
 pub trait HepaTmux {
@@ -152,6 +172,8 @@ pub trait HepaTmux {
         session_id: &str,
         message: &str,
     ) -> Result<(), HepaInteractiveSessionError>;
+
+    fn kill_session(&mut self, session_id: &str) -> Result<(), HepaInteractiveSessionError>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -209,6 +231,21 @@ impl HepaTmux for HepaSystemTmux {
             Err(HepaInteractiveSessionError::new(
                 "tmux",
                 format!("send-keys exited with {status}"),
+            ))
+        }
+    }
+
+    fn kill_session(&mut self, session_id: &str) -> Result<(), HepaInteractiveSessionError> {
+        let status = Command::new("tmux")
+            .args(["kill-session", "-t", session_id])
+            .status()
+            .map_err(|error| HepaInteractiveSessionError::tmux("kill-session", error))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(HepaInteractiveSessionError::new(
+                "tmux",
+                format!("kill-session exited with {status}"),
             ))
         }
     }
@@ -380,6 +417,7 @@ mod tests {
         launched: Vec<(String, String, PathBuf)>,
         captured: Vec<String>,
         sent: Vec<(String, String)>,
+        killed: Vec<String>,
         capture_output: String,
     }
 
@@ -413,6 +451,11 @@ mod tests {
         ) -> Result<(), HepaInteractiveSessionError> {
             self.sent
                 .push((session_id.to_string(), message.to_string()));
+            Ok(())
+        }
+
+        fn kill_session(&mut self, session_id: &str) -> Result<(), HepaInteractiveSessionError> {
+            self.killed.push(session_id.to_string());
             Ok(())
         }
     }
@@ -591,6 +634,19 @@ mod tests {
         assert!(!root.join("artifacts").exists());
 
         remove_test_dir(root);
+    }
+
+    #[test]
+    fn tmux_interactive_teardown_kills_lane_session() {
+        let mut tmux = FakeTmux::default();
+
+        let receipt = HepaTmuxInteractiveLauncher
+            .teardown("lane_1", &mut tmux)
+            .expect("teardown should kill the lane session");
+
+        assert_eq!(receipt.lane_id, "lane_1");
+        assert_eq!(receipt.session_id, "hepa-lane_1");
+        assert_eq!(tmux.killed, vec!["hepa-lane_1"]);
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

@@ -318,6 +318,13 @@ mod tests {
                 .push((session_id.to_string(), message.to_string()));
             Ok(())
         }
+
+        fn kill_session(
+            &mut self,
+            _session_id: &str,
+        ) -> Result<(), hepa_adapters::interactive::HepaInteractiveSessionError> {
+            Ok(())
+        }
     }
 
     #[test]
