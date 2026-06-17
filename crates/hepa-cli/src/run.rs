@@ -2,6 +2,7 @@ use hepa_adapters::{
     engine::{HepaOneshotAdapterExecutor, HepaOneshotAdapterInvocation},
     fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput},
     registry::HepaAdapterRegistry,
+    routing::{HepaReviewFanout, HepaReviewPassPolicy},
     spec::{HepaAdapterRole, HepaAdapterTemplateContext},
 };
 #[cfg(test)]
@@ -33,6 +34,17 @@ use hepa_git::{
 use hepa_kanban::{
     card_mapping::HepaHermesCardMappingInput,
     sync::{HepaHermesCardStore, HepaKanbanSyncEngine, HepaKanbanSyncSummary},
+};
+use hepa_review::{
+    arbitration::{
+        HepaArbitratedFinding, HepaManagerArbitrationAction, apply_deterministic_downgrade_rules,
+        apply_manager_arbitration, evaluate_staging_after_arbitration,
+        summarize_arbitration_results,
+    },
+    fanout::{
+        HepaConfiguredReviewer, HepaReviewFanoutInput, aggregate_review_findings,
+        apply_review_pass_policy, run_configured_reviewers_concurrently,
+    },
 };
 use serde::Serialize;
 use std::{
@@ -384,11 +396,14 @@ pub fn run_live_task(
             lane: &mut lane,
             validation,
             review_signals: Vec::new(),
+            arbitration: None,
             timing: live_timing_record(
                 config,
                 adapter_id,
                 worker_duration_seconds,
                 validation_duration_seconds,
+                0.0,
+                0,
                 LivePipelinePhase::ValidationFailed,
             ),
             reason: "Live validation failed; review, staging, and PR were not attempted."
@@ -404,21 +419,37 @@ pub fn run_live_task(
         "live validation passed",
         "2026-06-16T00:00:04Z",
     )?;
-    let review = live_review_signal(config, adapter_id, &changed_files);
+    let review_started = Instant::now();
+    let diff_context = collect_live_diff(&allocation.worktree_path)?;
+    let review_outcome = live_review_fanout(
+        config,
+        adapter_id,
+        &changed_files,
+        &validation,
+        &diff_context,
+    )?;
+    let review_duration_seconds = review_started.elapsed().as_secs_f64();
+    for signal in &review_outcome.signals {
+        write_json(
+            &lane_paths
+                .review_signal(&signal.review_id)
+                .map_err(|error| error.to_string())?,
+            signal,
+        )
+        .map_err(|error| error.to_string())?;
+    }
     write_json(
-        &lane_paths
-            .review_signal("review-1")
-            .map_err(|error| error.to_string())?,
-        &review,
+        &lane_paths.lane_dir.join("review/arbitration.json"),
+        &review_outcome.arbitration,
     )
     .map_err(|error| error.to_string())?;
-    if review.status != HepaReviewStatus::Approved {
+    if !review_outcome.staging_allowed {
         transition_and_record(
             &lane_paths,
             &mut lane,
             5,
             HepaLaneState::Blocked,
-            "live review blocked",
+            "live review fanout blocked",
             "2026-06-16T00:00:05Z",
         )?;
         return finish_blocked_live_run(FinishBlockedInput {
@@ -429,15 +460,21 @@ pub fn run_live_task(
             allocator: &allocator,
             lane: &mut lane,
             validation,
-            review_signals: vec![review],
+            review_signals: review_outcome.signals,
+            arbitration: Some(review_outcome.arbitration),
             timing: live_timing_record(
                 config,
                 adapter_id,
                 worker_duration_seconds,
                 validation_duration_seconds,
+                review_duration_seconds,
+                review_outcome.reviewer_passes,
                 LivePipelinePhase::ReviewFailed,
             ),
-            reason: "Live review blocked the lane; staging and PR were not attempted.".to_string(),
+            reason: format!(
+                "Live review fanout blocked the lane; staging and PR were not attempted: {}",
+                review_outcome.blockers.join("; ")
+            ),
         });
     }
 
@@ -446,7 +483,7 @@ pub fn run_live_task(
         &mut lane,
         5,
         HepaLaneState::Staging,
-        "live review approved",
+        "live review fanout approved",
         "2026-06-16T00:00:05Z",
     )?;
     let staging_report = HepaSafeStaging::new(&allocation.worktree_path)
@@ -472,19 +509,26 @@ pub fn run_live_task(
         adapter_id,
         worker_duration_seconds,
         validation_duration_seconds,
+        review_duration_seconds,
+        review_outcome.reviewer_passes,
         LivePipelinePhase::PrCreated,
     );
     let mut terminal_report = live_terminal_report(
         config,
         validation.clone(),
-        vec![review.clone()],
+        review_outcome.signals.clone(),
         timing_for_pr.clone(),
+        review_outcome.arbitration.clone(),
         None,
         vec![
             format!("Live worker changed {} file(s).", changed_files.len()),
             format!(
                 "Validation passed for {} command(s).",
                 validation.commands.len()
+            ),
+            format!(
+                "Review fanout passed with {} reviewer signal(s) and arbitration status {}.",
+                review_outcome.reviewer_passes, review_outcome.arbitration.status
             ),
             format!(
                 "Manager staged {} file(s) and committed {}.",
@@ -518,12 +562,15 @@ pub fn run_live_task(
             allocator: &allocator,
             lane: &mut lane,
             validation,
-            review_signals: vec![review],
+            review_signals: review_outcome.signals.clone(),
+            arbitration: Some(review_outcome.arbitration.clone()),
             timing: live_timing_record(
                 config,
                 adapter_id,
                 worker_duration_seconds,
                 validation_duration_seconds,
+                review_duration_seconds,
+                review_outcome.reviewer_passes,
                 LivePipelinePhase::PrFailed,
             ),
             reason: format!("Manager push failed before PR creation: {error}"),
@@ -557,12 +604,15 @@ pub fn run_live_task(
                 allocator: &allocator,
                 lane: &mut lane,
                 validation,
-                review_signals: vec![review],
+                review_signals: review_outcome.signals.clone(),
+                arbitration: Some(review_outcome.arbitration.clone()),
                 timing: live_timing_record(
                     config,
                     adapter_id,
                     worker_duration_seconds,
                     validation_duration_seconds,
+                    review_duration_seconds,
+                    review_outcome.reviewer_passes,
                     LivePipelinePhase::PrFailed,
                 ),
                 reason: format!("Manager PR creation failed: {error}"),
@@ -599,6 +649,8 @@ pub fn run_live_task(
         adapter_id,
         worker_duration_seconds,
         validation_duration_seconds,
+        review_duration_seconds,
+        review_outcome.reviewer_passes,
         LivePipelinePhase::Completed,
     );
     terminal_report.pr_url = Some(pr.url);
@@ -854,58 +906,261 @@ fn run_safe_validation_command(
     ))
 }
 
-fn live_review_signal(
+#[derive(Debug, Clone)]
+struct LiveReviewOutcome {
+    signals: Vec<HepaReviewSignal>,
+    arbitration: HepaArbitrationSummary,
+    staging_allowed: bool,
+    blockers: Vec<String>,
+    reviewer_passes: u32,
+}
+
+fn live_review_fanout(
     config: &HepaFakeRunConfig,
     adapter_id: &str,
     changed_files: &[String],
-) -> HepaReviewSignal {
-    let status = if changed_files.is_empty() {
-        HepaReviewStatus::Blocked
-    } else {
-        HepaReviewStatus::Approved
+    validation: &HepaValidationSummary,
+    diff_context: &str,
+) -> Result<LiveReviewOutcome, String> {
+    let primary_adapter = format!("hepa-manager-live-review:primary:{adapter_id}");
+    let policy_adapter = format!("hepa-manager-live-review:policy:{adapter_id}");
+    let reviewers = vec![
+        configured_live_reviewer(
+            primary_adapter.clone(),
+            config.task_id.clone(),
+            changed_files.to_vec(),
+        ),
+        configured_live_reviewer(
+            policy_adapter.clone(),
+            config.task_id.clone(),
+            changed_files.to_vec(),
+        ),
+    ];
+    let result = run_configured_reviewers_concurrently(
+        HepaReviewFanoutInput {
+            lane_id: config.lane_id.clone(),
+            diff_context: diff_context.to_string(),
+            validation_summary: validation_summary_name(validation),
+            max_diff_bytes: 32_768,
+        },
+        reviewers,
+    )
+    .map_err(|error| error.to_string())?;
+    let policy = HepaReviewFanout {
+        adapters: vec![primary_adapter, policy_adapter],
+        pass_policy: HepaReviewPassPolicy::All,
     };
-    let finding = HepaReviewFinding {
-        finding_id: "live-review-1".to_string(),
-        severity: if changed_files.is_empty() {
-            HepaFindingSeverity::High
-        } else {
-            HepaFindingSeverity::Low
-        },
-        category: "live-manager-review".to_string(),
-        evidence: if changed_files.is_empty() {
-            "No changed files were produced by the live worker.".to_string()
-        } else {
-            format!("Changed files: {}", changed_files.join(", "))
-        },
-        in_scope: true,
-        release_risk: changed_files.is_empty(),
-        recommended_action: if changed_files.is_empty() {
-            "Re-run with a task that produces a reviewable diff.".to_string()
-        } else {
-            "Proceed to manager-owned staging.".to_string()
-        },
-        file_ref: changed_files.first().cloned(),
-        line: None,
-        message: if changed_files.is_empty() {
-            "Live worker produced no reviewable diff.".to_string()
-        } else {
-            format!(
-                "Live worker diff for task {} is reviewable.",
-                config.task_id
+    let pass_decision =
+        apply_review_pass_policy(&policy, &result.signals).map_err(|error| error.to_string())?;
+    let findings = aggregate_review_findings(&result.signals).map_err(|error| error.to_string())?;
+    let mut decisions = Vec::new();
+    for finding in findings {
+        decisions.push(arbitrate_live_finding(finding.finding)?);
+    }
+    let arbitration =
+        summarize_arbitration_results(&decisions).map_err(format_arbitration_error)?;
+    let staging_gate =
+        evaluate_staging_after_arbitration(&decisions).map_err(format_arbitration_error)?;
+    let mut blockers = staging_gate.blockers;
+    if !pass_decision.passed {
+        blockers.push(format!(
+            "review fanout policy required {} approvals but received {}",
+            pass_decision.required_approvals, pass_decision.approvals
+        ));
+    }
+    blockers.sort();
+    Ok(LiveReviewOutcome {
+        reviewer_passes: result.signals.len() as u32,
+        signals: result.signals,
+        arbitration,
+        staging_allowed: blockers.is_empty(),
+        blockers,
+    })
+}
+
+fn configured_live_reviewer(
+    reviewer_adapter_id: String,
+    task_id: String,
+    changed_files: Vec<String>,
+) -> HepaConfiguredReviewer {
+    HepaConfiguredReviewer::new(reviewer_adapter_id.clone(), move |request| {
+        let signal = if changed_files.is_empty() {
+            live_no_diff_review_signal(&request.lane_id, &request.adapter_id, &task_id)
+        } else if request.adapter_id.contains(":primary:") {
+            live_primary_review_signal(
+                &request.lane_id,
+                &request.adapter_id,
+                &task_id,
+                &changed_files,
+                &request.diff_context,
             )
-        },
-        accepted: !changed_files.is_empty(),
-    };
+        } else {
+            live_policy_review_signal(
+                &request.lane_id,
+                &request.adapter_id,
+                &task_id,
+                &changed_files,
+                &request.validation_summary,
+            )
+        };
+        Ok(signal)
+    })
+}
+
+fn live_primary_review_signal(
+    lane_id: &str,
+    adapter_id: &str,
+    task_id: &str,
+    changed_files: &[String],
+    diff_context: &str,
+) -> HepaReviewSignal {
     HepaReviewSignal {
         schema_version: CONTRACT_SCHEMA_VERSION,
-        review_id: "review-1".to_string(),
-        lane_id: config.lane_id.clone(),
-        adapter_id: format!("hepa-manager-live-review:{adapter_id}"),
-        status,
-        findings: vec![finding],
-        summary: vec!["Deterministic manager review completed on live diff.".to_string()],
+        review_id: "review-primary".to_string(),
+        lane_id: lane_id.to_string(),
+        adapter_id: adapter_id.to_string(),
+        status: HepaReviewStatus::Approved,
+        findings: vec![HepaReviewFinding {
+            finding_id: "rs3-manager-accept-low".to_string(),
+            severity: HepaFindingSeverity::Low,
+            category: "live-review-fanout".to_string(),
+            evidence: format!(
+                "Diff touches {}; review context bytes={}.",
+                changed_files.join(", "),
+                diff_context.len()
+            ),
+            in_scope: true,
+            release_risk: false,
+            recommended_action:
+                "Manager may accept this low-risk observation after validation passes.".to_string(),
+            file_ref: changed_files.first().cloned(),
+            line: None,
+            message: format!("Primary reviewer found the task {task_id} diff reviewable."),
+            accepted: true,
+        }],
+        summary: vec![
+            "Primary deterministic reviewer normalized the live diff successfully.".to_string(),
+        ],
         completed_at: "2026-06-16T00:00:05Z".to_string(),
     }
+}
+
+fn live_policy_review_signal(
+    lane_id: &str,
+    adapter_id: &str,
+    task_id: &str,
+    changed_files: &[String],
+    validation_summary: &str,
+) -> HepaReviewSignal {
+    HepaReviewSignal {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        review_id: "review-policy".to_string(),
+        lane_id: lane_id.to_string(),
+        adapter_id: adapter_id.to_string(),
+        status: HepaReviewStatus::Approved,
+        findings: vec![
+            HepaReviewFinding {
+                finding_id: "rs3-manager-reject-advisory".to_string(),
+                severity: HepaFindingSeverity::Medium,
+                category: "live-review-policy".to_string(),
+                evidence: format!("Validation summary was `{validation_summary}`."),
+                in_scope: true,
+                release_risk: false,
+                recommended_action:
+                    "Manager should reject this advisory if validation evidence is sufficient."
+                        .to_string(),
+                file_ref: changed_files.first().cloned(),
+                line: None,
+                message: format!("Policy reviewer advisory for task {task_id}."),
+                accepted: true,
+            },
+            HepaReviewFinding {
+                finding_id: "rs3-downgrade-out-of-scope".to_string(),
+                severity: HepaFindingSeverity::High,
+                category: "live-review-policy".to_string(),
+                evidence: "Out-of-scope non-release-risk observation from fanout route."
+                    .to_string(),
+                in_scope: false,
+                release_risk: false,
+                recommended_action: "Deterministically downgrade and exclude from repair scope."
+                    .to_string(),
+                file_ref: None,
+                line: None,
+                message: "Policy reviewer emitted an out-of-scope advisory.".to_string(),
+                accepted: true,
+            },
+        ],
+        summary: vec![
+            "Policy deterministic reviewer normalized live validation and diff evidence."
+                .to_string(),
+        ],
+        completed_at: "2026-06-16T00:00:05Z".to_string(),
+    }
+}
+
+fn live_no_diff_review_signal(lane_id: &str, adapter_id: &str, task_id: &str) -> HepaReviewSignal {
+    HepaReviewSignal {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        review_id: "review-no-diff".to_string(),
+        lane_id: lane_id.to_string(),
+        adapter_id: adapter_id.to_string(),
+        status: HepaReviewStatus::Blocked,
+        findings: vec![HepaReviewFinding {
+            finding_id: "rs3-no-diff-blocker".to_string(),
+            severity: HepaFindingSeverity::High,
+            category: "live-review-fanout".to_string(),
+            evidence: "No changed files were produced by the live worker.".to_string(),
+            in_scope: true,
+            release_risk: true,
+            recommended_action: "Re-run with a task that produces a reviewable diff.".to_string(),
+            file_ref: None,
+            line: None,
+            message: format!("Task {task_id} produced no reviewable diff."),
+            accepted: true,
+        }],
+        summary: vec!["Review fanout blocked because no real diff was available.".to_string()],
+        completed_at: "2026-06-16T00:00:05Z".to_string(),
+    }
+}
+
+fn arbitrate_live_finding(finding: HepaReviewFinding) -> Result<HepaArbitratedFinding, String> {
+    let arbitrated =
+        apply_deterministic_downgrade_rules(finding).map_err(format_arbitration_error)?;
+    if arbitrated.rule_id.as_deref() == Some("out-of-scope-non-release-risk") {
+        return Ok(arbitrated);
+    }
+    match arbitrated.finding.finding_id.as_str() {
+        "rs3-manager-accept-low" => apply_manager_arbitration(
+            arbitrated,
+            HepaManagerArbitrationAction::Accept,
+            "Manager accepts this low-risk review observation after validation passed.",
+        ),
+        "rs3-manager-reject-advisory" => apply_manager_arbitration(
+            arbitrated,
+            HepaManagerArbitrationAction::Reject,
+            "Manager rejects the advisory because validation and diff scope are sufficient.",
+        ),
+        _ => apply_manager_arbitration(
+            arbitrated,
+            HepaManagerArbitrationAction::Reject,
+            "Manager rejects unrecognized non-blocking live review finding by default.",
+        ),
+    }
+    .map_err(format_arbitration_error)
+}
+
+fn validation_summary_name(validation: &HepaValidationSummary) -> String {
+    match validation.status {
+        HepaValidationStatus::Passed => "passed",
+        HepaValidationStatus::Failed => "failed",
+        HepaValidationStatus::Skipped => "skipped",
+        HepaValidationStatus::NoTestsDetected => "no_tests_detected",
+    }
+    .to_string()
+}
+
+fn format_arbitration_error(error: hepa_review::arbitration::HepaArbitrationError) -> String {
+    format!("{}: {}", error.field, error.message)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -922,6 +1177,8 @@ fn live_timing_record(
     adapter_id: &str,
     worker_duration_seconds: f64,
     validation_duration_seconds: f64,
+    review_duration_seconds: f64,
+    reviewer_passes: u32,
     terminal_phase: LivePipelinePhase,
 ) -> HepaTimingRecord {
     let mut phases = vec![
@@ -952,7 +1209,21 @@ fn live_timing_record(
     ];
     if terminal_phase != LivePipelinePhase::ValidationFailed {
         phases.push(HepaTimingPhase {
-            name: "live_review".to_string(),
+            name: "live_review_fanout".to_string(),
+            status: if terminal_phase == LivePipelinePhase::ReviewFailed {
+                HepaPhaseStatus::Blocked
+            } else {
+                HepaPhaseStatus::Completed
+            },
+            duration_seconds: review_duration_seconds,
+            round: Some(1),
+            role: Some(HepaAgentRole::Manager),
+            adapter_id: Some(format!("hepa-manager-live-review-fanout:{adapter_id}")),
+            routing_reason: Some("parallel deterministic manager review fanout".to_string()),
+            sandbox_posture: Some(run_sandbox_posture()),
+        });
+        phases.push(HepaTimingPhase {
+            name: "live_arbitration".to_string(),
             status: if terminal_phase == LivePipelinePhase::ReviewFailed {
                 HepaPhaseStatus::Blocked
             } else {
@@ -961,8 +1232,8 @@ fn live_timing_record(
             duration_seconds: 0.0,
             round: Some(1),
             role: Some(HepaAgentRole::Manager),
-            adapter_id: Some("hepa-manager-live-review".to_string()),
-            routing_reason: Some("deterministic manager review".to_string()),
+            adapter_id: Some("hepa-manager-arbitration".to_string()),
+            routing_reason: Some("deterministic arbitration with recorded reasoning".to_string()),
             sandbox_posture: Some(run_sandbox_posture()),
         });
     }
@@ -993,11 +1264,7 @@ fn live_timing_record(
             agent_loops: 1,
             manager_passes: 1,
             worker_profile_llm_calls: 0,
-            reviewer_passes: if terminal_phase == LivePipelinePhase::ValidationFailed {
-                0
-            } else {
-                1
-            },
+            reviewer_passes,
             install_events: 0,
             container_count: 0,
         },
@@ -1009,6 +1276,7 @@ fn live_terminal_report(
     validation: HepaValidationSummary,
     review_signals: Vec<HepaReviewSignal>,
     timing: HepaTimingRecord,
+    arbitration: HepaArbitrationSummary,
     pr_url: Option<String>,
     summary: Vec<String>,
 ) -> HepaTerminalTaskReport {
@@ -1020,13 +1288,7 @@ fn live_terminal_report(
         pr_url,
         validation: Some(validation),
         review_signals,
-        arbitration: Some(HepaArbitrationSummary {
-            schema_version: CONTRACT_SCHEMA_VERSION,
-            status: "not_required".to_string(),
-            records: Vec::new(),
-            pr_body_lines: vec!["No blocking reviewer findings required arbitration.".to_string()],
-            card_status: "completed".to_string(),
-        }),
+        arbitration: Some(arbitration),
         timing: Some(timing),
         summary,
         human_attention_required: false,
@@ -1043,6 +1305,7 @@ struct FinishBlockedInput<'a> {
     lane: &'a mut HepaLane,
     validation: HepaValidationSummary,
     review_signals: Vec<HepaReviewSignal>,
+    arbitration: Option<HepaArbitrationSummary>,
     timing: HepaTimingRecord,
     reason: String,
 }
@@ -1057,6 +1320,7 @@ fn finish_blocked_live_run(input: FinishBlockedInput<'_>) -> Result<HepaFakeRunR
         lane,
         validation,
         review_signals,
+        arbitration,
         timing,
         reason,
     } = input;
@@ -1083,7 +1347,7 @@ fn finish_blocked_live_run(input: FinishBlockedInput<'_>) -> Result<HepaFakeRunR
         pr_url: None,
         validation: Some(validation),
         review_signals,
-        arbitration: None,
+        arbitration,
         timing: Some(timing.clone()),
         summary: vec![reason],
         human_attention_required: true,
@@ -1503,6 +1767,25 @@ fn collect_changed_files(worktree: &Path) -> Result<Vec<String>, String> {
     Ok(changed)
 }
 
+fn collect_live_diff(worktree: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--"])
+        .output()
+        .map_err(|error| format!("failed to inspect worktree diff: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(sanitize_validation_output(
+        worktree,
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1753,19 +2036,37 @@ mod tests {
             task_text: "Run a real frontend task".to_string(),
             timing: true,
         };
-        let review = live_review_signal(&config, "pi", &["src/app/test.tsx".to_string()]);
-        let timing = live_timing_record(&config, "pi", 2.0, 1.0, LivePipelinePhase::Completed);
+        let timing = live_timing_record(
+            &config,
+            "pi",
+            2.0,
+            1.0,
+            0.5,
+            2,
+            LivePipelinePhase::Completed,
+        );
 
-        assert_eq!(review.status, HepaReviewStatus::Approved);
-        assert!(review.adapter_id.contains("hepa-manager-live-review"));
         assert_eq!(timing.counters.agent_loops, 1);
         assert_eq!(timing.counters.manager_passes, 1);
+        assert_eq!(timing.counters.reviewer_passes, 2);
         assert_eq!(timing.counters.container_count, 0);
         assert!(
             timing
                 .phases
                 .iter()
                 .any(|phase| phase.name == "live_worker")
+        );
+        assert!(
+            timing
+                .phases
+                .iter()
+                .any(|phase| phase.name == "live_review_fanout")
+        );
+        assert!(
+            timing
+                .phases
+                .iter()
+                .any(|phase| phase.name == "live_arbitration")
         );
         assert!(
             timing
@@ -1779,6 +2080,64 @@ mod tests {
                 .iter()
                 .all(|phase| !phase.name.starts_with("fake_"))
         );
+    }
+
+    #[test]
+    fn live_review_fanout_records_arbitration_for_real_diff() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 0,
+                duration_ms: 7,
+            }],
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["`git diff --check` exited 0.".to_string()],
+        };
+
+        let outcome = live_review_fanout(
+            &config,
+            "pi",
+            &["README.md".to_string()],
+            &validation,
+            "diff --git a/README.md b/README.md",
+        )
+        .expect("fanout should pass");
+
+        assert!(outcome.staging_allowed);
+        assert_eq!(outcome.reviewer_passes, 2);
+        assert_eq!(outcome.signals.len(), 2);
+        assert!(
+            outcome
+                .signals
+                .iter()
+                .all(|signal| signal.status == HepaReviewStatus::Approved)
+        );
+        assert_eq!(outcome.arbitration.records.len(), 3);
+        let dispositions = outcome
+            .arbitration
+            .records
+            .iter()
+            .map(|record| record.disposition.as_str())
+            .collect::<Vec<_>>();
+        assert!(dispositions.contains(&"manager_accepted"));
+        assert!(dispositions.contains(&"manager_rejected"));
+        assert!(dispositions.contains(&"downgraded"));
+        assert!(outcome.arbitration.card_status.contains("arbitration="));
+        assert!(outcome.blockers.is_empty());
     }
 
     #[test]
