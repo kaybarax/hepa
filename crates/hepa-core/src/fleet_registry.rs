@@ -1,4 +1,6 @@
-use crate::contracts::{HepaFleetTask, HepaProject, HepaTaskStatus, HepaValidate};
+use crate::contracts::{
+    HepaFleetTask, HepaProject, HepaReadinessState, HepaTaskStatus, HepaValidate,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -212,6 +214,40 @@ impl HepaFleetRegistry {
         task.updated_at = updated_at.to_string();
         self.persist_task(&task)?;
         Ok(task)
+    }
+
+    /// Record a task's readiness state.
+    pub fn set_task_readiness(
+        &self,
+        task_id: &str,
+        readiness: HepaReadinessState,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        let mut task = self.require_task(task_id)?;
+        task.readiness = readiness;
+        task.updated_at = updated_at.to_string();
+        self.persist_task(&task)?;
+        Ok(task)
+    }
+
+    /// Dependency task ids that are not yet completed. Unknown dependencies count
+    /// as unmet so a task never proceeds on a dangling reference. Result is
+    /// deterministically sorted and de-duplicated.
+    pub fn unmet_dependencies(&self, task_id: &str) -> Result<Vec<String>, HepaFleetError> {
+        let task = self.require_task(task_id)?;
+        let mut unmet = Vec::new();
+        for dependency in &task.dependencies {
+            let completed = matches!(
+                self.show_task(dependency)?.map(|task| task.status),
+                Some(HepaTaskStatus::Completed)
+            );
+            if !completed {
+                unmet.push(dependency.clone());
+            }
+        }
+        unmet.sort();
+        unmet.dedup();
+        Ok(unmet)
     }
 
     fn require_task(&self, task_id: &str) -> Result<HepaFleetTask, HepaFleetError> {
@@ -522,6 +558,39 @@ mod tests {
                 .block_task("absent", "2026-06-16T00:02:00Z")
                 .is_err()
         );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn stores_readiness_and_reports_unmet_dependencies() {
+        let root = unique_test_dir("deps");
+        let registry = HepaFleetRegistry::new(&root);
+
+        let mut completed_dep = task("dep-1");
+        completed_dep.status = HepaTaskStatus::Completed;
+        completed_dep.completed_at = Some("2026-06-16T00:00:00Z".to_string());
+        registry.create_task(&completed_dep).expect("create dep");
+
+        let mut dependent = task("task-1");
+        dependent.dependencies = vec!["dep-1".to_string(), "dep-2".to_string()];
+        registry.create_task(&dependent).expect("create dependent");
+
+        // dep-1 is completed; dep-2 does not exist yet, so it is unmet.
+        let unmet = registry.unmet_dependencies("task-1").expect("unmet");
+        assert_eq!(unmet, vec!["dep-2".to_string()]);
+
+        let updated = registry
+            .set_task_readiness("task-1", HepaReadinessState::Ready, "2026-06-16T00:05:00Z")
+            .expect("set readiness");
+        assert_eq!(updated.readiness, HepaReadinessState::Ready);
+        // Readiness and dependencies persist across reload.
+        let reloaded = registry
+            .show_task("task-1")
+            .expect("show")
+            .expect("present");
+        assert_eq!(reloaded.readiness, HepaReadinessState::Ready);
+        assert_eq!(reloaded.dependencies.len(), 2);
 
         remove_test_dir(root);
     }
