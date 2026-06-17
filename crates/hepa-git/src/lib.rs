@@ -1,4 +1,5 @@
 pub mod branches;
+pub mod pr;
 pub mod staging;
 pub mod worktree;
 
