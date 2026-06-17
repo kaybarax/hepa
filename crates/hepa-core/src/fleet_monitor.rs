@@ -1,4 +1,5 @@
 use crate::contracts::HepaLaneState;
+use std::{fs, io, path::Path};
 
 /// A sampled observation of one active lane, gathered from process state, git,
 /// validation/review artifacts, and the Hermes board.
@@ -175,6 +176,65 @@ impl HepaFleetMonitor {
     }
 }
 
+/// Report of a runtime cleanup pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaCleanupReport {
+    pub removed_runtime_dirs: Vec<String>,
+    pub preserved_unrelated: Vec<String>,
+}
+
+impl HepaFleetMonitor {
+    /// Remove only the named HEPA-created lane runtime directories under the
+    /// runtime root. Any directory not in `hepa_lane_ids` (an unrelated user
+    /// directory) is preserved, and lane ids that would escape the runtime root
+    /// are refused.
+    pub fn cleanup_runtime(
+        runtime_root: &Path,
+        hepa_lane_ids: &[String],
+    ) -> io::Result<HepaCleanupReport> {
+        let mut removed = Vec::new();
+        let owned: std::collections::BTreeSet<&str> =
+            hepa_lane_ids.iter().map(String::as_str).collect();
+
+        for lane_id in &owned {
+            if !is_safe_segment(lane_id) {
+                continue;
+            }
+            let path = runtime_root.join(lane_id);
+            if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+                removed.push((*lane_id).to_string());
+            }
+        }
+
+        let mut preserved = Vec::new();
+        if runtime_root.is_dir() {
+            for entry in fs::read_dir(runtime_root)? {
+                let entry = entry?;
+                if let Some(name) = entry.file_name().to_str() {
+                    if !owned.contains(name) {
+                        preserved.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        removed.sort();
+        preserved.sort();
+        Ok(HepaCleanupReport {
+            removed_runtime_dirs: removed,
+            preserved_unrelated: preserved,
+        })
+    }
+}
+
+fn is_safe_segment(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains("..")
+}
+
 fn action_key(action: &HepaReconcileAction) -> (u8, String) {
     match action {
         HepaReconcileAction::MarkLaneStale { lane_id } => (0, lane_id.clone()),
@@ -271,6 +331,37 @@ mod tests {
                     lane_id: "lane-term".to_string()
                 })
         );
+    }
+
+    #[test]
+    fn cleanup_removes_only_hepa_runtime_dirs() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let runtime_root = std::env::temp_dir().join(format!("hepa-cleanup-{nonce}"));
+        std::fs::create_dir_all(runtime_root.join("lane-1")).expect("lane-1");
+        std::fs::create_dir_all(runtime_root.join("lane-2")).expect("lane-2");
+        // An unrelated user directory that must be preserved.
+        std::fs::create_dir_all(runtime_root.join("user-notes")).expect("user-notes");
+        std::fs::write(runtime_root.join("user-notes/keep.txt"), b"keep\n").expect("user file");
+
+        let report = HepaFleetMonitor::cleanup_runtime(
+            &runtime_root,
+            &["lane-1".to_string(), "lane-2".to_string()],
+        )
+        .expect("cleanup");
+
+        assert_eq!(
+            report.removed_runtime_dirs,
+            vec!["lane-1".to_string(), "lane-2".to_string()]
+        );
+        assert_eq!(report.preserved_unrelated, vec!["user-notes".to_string()]);
+        assert!(!runtime_root.join("lane-1").exists());
+        assert!(runtime_root.join("user-notes/keep.txt").exists());
+
+        std::fs::remove_dir_all(&runtime_root).expect("cleanup test dir");
     }
 
     #[test]
