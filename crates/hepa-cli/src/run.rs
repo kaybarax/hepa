@@ -3,7 +3,8 @@ use hepa_adapters::{
     fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput},
     registry::HepaAdapterRegistry,
     routing::{HepaReviewFanout, HepaReviewPassPolicy},
-    spec::{HepaAdapterRole, HepaAdapterTemplateContext},
+    spec::{HepaAdapterOutputCapture, HepaAdapterRole, HepaAdapterTemplateContext},
+    usage::extract_adapter_usage,
 };
 #[cfg(test)]
 use hepa_core::contracts::HepaProject;
@@ -18,6 +19,7 @@ use hepa_core::{
         HepaTimingRecord, HepaValidate, HepaValidationCommandResult, HepaValidationStatus,
         HepaValidationSummary,
     },
+    cost_accounting::{HepaAdapterUsageEntry, HepaLaneCostReport},
     hard_blockers::block_from_monitor_stop,
     lane_state::{HepaLaneTransitionRequest, transition_lane},
     monitor::HepaMonitorPolicy,
@@ -329,6 +331,8 @@ pub fn run_live_task(
         completed_at: "2026-06-16T00:00:03Z",
     })?;
     lane.attempt_count = 1;
+    let mut usage_entries = attempt_outcome.usage_entries.clone();
+    write_lane_cost_report_if_present(config, &lane_paths, &usage_entries)?;
     if live_force_secret_path_change() {
         inject_secret_path_fixture(&allocation.worktree_path)?;
         attempt_outcome.changed_files = collect_changed_files(&allocation.worktree_path)?;
@@ -482,6 +486,8 @@ pub fn run_live_task(
         validation = repair_result.validation;
         attempt_outcome.duration_seconds += repair_result.worker_duration_seconds;
         attempt_outcome.changed_files = repair_result.changed_files;
+        usage_entries.extend(repair_result.usage_entries.clone());
+        write_lane_cost_report_if_present(config, &lane_paths, &usage_entries)?;
         lane.attempt_count = 2;
         write_json(&lane_paths.validation_summary, &validation)
             .map_err(|error| error.to_string())?;
@@ -903,6 +909,7 @@ struct ExecuteLiveAttemptInput<'a> {
 struct LiveAttemptOutcome {
     duration_seconds: f64,
     changed_files: Vec<String>,
+    usage_entries: Vec<HepaAdapterUsageEntry>,
 }
 
 fn execute_live_worker_attempt(
@@ -927,6 +934,8 @@ fn execute_live_worker_attempt(
     fs::create_dir_all(&attempt_paths.attempt_dir).map_err(|error| error.to_string())?;
     fs::write(attempt_paths.attempt_dir.join("prompt.md"), &prompt)
         .map_err(|error| error.to_string())?;
+    let cost_class = spec.cost_class.clone();
+    let output_capture = spec.output_capture.clone();
     let invocation = HepaOneshotAdapterInvocation {
         spec,
         role: HepaAdapterRole::Worker,
@@ -956,6 +965,14 @@ fn execute_live_worker_attempt(
         .map_err(|error| error.to_string())?;
     let duration_seconds = worker_started.elapsed().as_secs_f64();
     let changed_files = collect_changed_files(&allocation.worktree_path)?;
+    let usage_entries = extract_live_usage_entries(
+        adapter_id,
+        attempt_id,
+        &cost_class,
+        &output_capture,
+        &attempt_paths.attempt_report,
+        &result.stdout,
+    )?;
     let attempt = HepaAttemptReport {
         schema_version: CONTRACT_SCHEMA_VERSION,
         attempt_id: attempt_id.to_string(),
@@ -983,6 +1000,7 @@ fn execute_live_worker_attempt(
     Ok(LiveAttemptOutcome {
         duration_seconds,
         changed_files,
+        usage_entries,
     })
 }
 
@@ -1004,6 +1022,7 @@ struct LiveRepairOutcome {
     validation_duration_seconds: f64,
     validation: HepaValidationSummary,
     changed_files: Vec<String>,
+    usage_entries: Vec<HepaAdapterUsageEntry>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1149,7 +1168,52 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         validation_duration_seconds,
         validation,
         changed_files: attempt.changed_files,
+        usage_entries: attempt.usage_entries,
     })
+}
+
+fn extract_live_usage_entries(
+    adapter_id: &str,
+    invocation_id: &str,
+    cost_class: &hepa_adapters::spec::HepaAdapterCostClass,
+    output_capture: &HepaAdapterOutputCapture,
+    adapter_output_file: &Path,
+    stdout: &str,
+) -> Result<Vec<HepaAdapterUsageEntry>, String> {
+    let raw = match output_capture {
+        HepaAdapterOutputCapture::Stdout => stdout.to_string(),
+        HepaAdapterOutputCapture::AdapterFile => {
+            fs::read_to_string(adapter_output_file).unwrap_or_default()
+        }
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let extraction = extract_adapter_usage(&raw, adapter_id, invocation_id, cost_class)
+        .map_err(|error| format!("adapter usage parse failed: {error}"))?;
+    Ok(extraction.entry.into_iter().collect())
+}
+
+fn write_lane_cost_report_if_present(
+    config: &HepaFakeRunConfig,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    entries: &[HepaAdapterUsageEntry],
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let report = HepaLaneCostReport::from_entries(
+        config.run_id.clone(),
+        config.task_id.clone(),
+        config.lane_id.clone(),
+        entries.to_vec(),
+        "2026-06-16T00:00:06Z",
+    )
+    .map_err(|error| error.to_string())?;
+    lane_paths
+        .write_cost_report(&report)
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn optional_env(key: &str) -> Option<Option<String>> {
@@ -3322,6 +3386,54 @@ mod tests {
         assert!(summary[0].contains("<VALIDATION_RUNTIME>"));
         assert!(!summary[0].contains("/tmp/hepa-validation"));
         assert!(!summary[0].contains(".hepa/worktrees/lane-cli-fake"));
+    }
+
+    #[test]
+    fn live_usage_entries_write_lane_cost_report() {
+        let root = unique_test_dir("live-cost");
+        let control = root.join("control");
+        let archive = root.join("archive");
+        let layout = HepaArtifactLayout::new(&control, &archive).expect("layout");
+        let lane_paths = layout
+            .run("run-1", "task-1")
+            .expect("run")
+            .lane("lane-1")
+            .expect("lane");
+        let config = HepaFakeRunConfig {
+            repo_path: root.join("repo"),
+            control_root: control,
+            worktree_root: root.join("worktrees"),
+            archive_root: archive,
+            run_id: "run-1".to_string(),
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            task_text: "Update docs".to_string(),
+            timing: true,
+        };
+        let output_file = root.join("adapter-output.json");
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(
+            &output_file,
+            r#"{"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15,"cost_micros":99,"currency":"USD"}}"#,
+        )
+        .expect("adapter output");
+        let entries = extract_live_usage_entries(
+            "pi",
+            "attempt-1",
+            &hepa_adapters::spec::HepaAdapterCostClass::PaidCloud,
+            &HepaAdapterOutputCapture::AdapterFile,
+            &output_file,
+            "",
+        )
+        .expect("usage should extract");
+
+        write_lane_cost_report_if_present(&config, &lane_paths, &entries)
+            .expect("cost report should write");
+
+        let cost_json = fs::read_to_string(lane_paths.cost_report).expect("cost artifact");
+        assert!(cost_json.contains("\"total_tokens\": 15"));
+        assert!(cost_json.contains("\"total_cost_micros\": 99"));
+        remove_test_dir(root);
     }
 
     fn init_repo(repo: &Path) {

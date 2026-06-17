@@ -3,6 +3,7 @@ pub mod bench;
 pub mod config;
 pub mod conflict_planner;
 pub mod contracts;
+pub mod cost_accounting;
 pub mod env_allowlist;
 pub mod fleet_monitor;
 pub mod fleet_registry;

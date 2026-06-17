@@ -145,6 +145,33 @@ still blocks unsafe command templates, secret output, and adapter attempts to
 run manager-owned Git lifecycle commands. Hermes cards may display the external
 status, but HEPA's lane state remains authoritative.
 
+## Per-lane cost accounting
+
+Adapters that expose model usage may include a `usage` object in their JSON
+output. HEPA treats this as optional evidence: absence of usage never blocks an
+adapter run, but malformed usage fails loudly for adapters that choose to emit
+it.
+
+```json
+{
+  "status": "completed",
+  "usage": {
+    "input_tokens": 120,
+    "output_tokens": 30,
+    "total_tokens": 150,
+    "cost_micros": 4200,
+    "currency": "USD"
+  }
+}
+```
+
+HEPA normalizes reported usage into a lane `cost.json` artifact with one entry
+per adapter invocation, summed token totals, summed micro-unit currency totals,
+and an `entries_without_cost` count for local or usage-only routes. Cost class
+comes from the adapter spec (`local`, `free-tier`, or `paid-cloud`) rather than
+from adapter output, so local-only routing and paid-lane caps stay authoritative.
+Provider keys and account identifiers are never accepted in cost fields.
+
 ## Version pinning
 
 Known-good invocation templates are pinned per adapter version

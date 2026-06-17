@@ -13,6 +13,7 @@ pub mod registry;
 pub mod routing;
 pub mod shell_command;
 pub mod spec;
+pub mod usage;
 pub mod user_reviewer;
 pub mod user_worker;
 pub mod version_pinning;

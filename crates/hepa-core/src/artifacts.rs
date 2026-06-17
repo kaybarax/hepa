@@ -1,5 +1,6 @@
 use crate::config::HepaConfig;
 use crate::contracts::{HepaTimingRecord, HepaValidate};
+use crate::cost_accounting::HepaLaneCostReport;
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -104,6 +105,7 @@ impl HepaRunArtifactPaths {
             transition_dir: lane_dir.join("state").join("transitions"),
             current_state: lane_dir.join("state").join("current.json"),
             timing_record: lane_dir.join("timing.json"),
+            cost_report: lane_dir.join("cost.json"),
             final_report: lane_dir.join("final-report.json"),
         })
     }
@@ -146,6 +148,7 @@ pub struct HepaLaneArtifactPaths {
     pub transition_dir: PathBuf,
     pub current_state: PathBuf,
     pub timing_record: PathBuf,
+    pub cost_report: PathBuf,
     pub final_report: PathBuf,
 }
 
@@ -217,6 +220,23 @@ impl HepaLaneArtifactPaths {
         require_matching_id("run_id", &self.run_id, &timing.run_id)?;
         write_stable_json(&self.timing_record, timing)?;
         Ok(self.timing_record.clone())
+    }
+
+    pub fn write_cost_report(
+        &self,
+        report: &HepaLaneCostReport,
+    ) -> Result<PathBuf, HepaArtifactWriteError> {
+        report
+            .validate()
+            .map_err(|error| HepaArtifactWriteError::InvalidRecord {
+                field: error.field,
+                message: error.message,
+            })?;
+        require_matching_id("run_id", &self.run_id, &report.run_id)?;
+        require_matching_id("task_id", &self.task_id, &report.task_id)?;
+        require_matching_id("lane_id", &self.lane_id, &report.lane_id)?;
+        write_stable_json(&self.cost_report, report)?;
+        Ok(self.cost_report.clone())
     }
 
     fn require_record_matches(
@@ -862,6 +882,47 @@ mod tests {
         assert!(timing_json.contains("\"run_id\": \"run-1\""));
         assert!(timing_json.contains("\"routing_reason\": \"default fake adapter\""));
         assert!(timing_json.contains("\"sandbox_posture\": \"host-worktree\""));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn cost_reports_write_to_lane_artifacts() {
+        let root = unique_test_dir("cost");
+        let layout =
+            HepaArtifactLayout::new(root.join("control"), root.join("archive")).expect("valid");
+        let lane = layout
+            .run("run-1", "task-1")
+            .expect("valid run")
+            .lane("lane-1")
+            .expect("valid lane");
+        let report = crate::cost_accounting::HepaLaneCostReport::from_entries(
+            "run-1",
+            "task-1",
+            "lane-1",
+            vec![crate::cost_accounting::HepaAdapterUsageEntry {
+                adapter_id: "pi".to_string(),
+                invocation_id: "attempt-1".to_string(),
+                cost_class: crate::cost_accounting::HepaUsageCostClass::PaidCloud,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                total_tokens: Some(15),
+                cost_micros: Some(100),
+                currency: Some("USD".to_string()),
+                source: crate::cost_accounting::HepaUsageSource::AdapterReported,
+            }],
+            "2026-06-18T00:00:00Z",
+        )
+        .expect("cost report should validate");
+
+        let cost_path = lane
+            .write_cost_report(&report)
+            .expect("cost report should write");
+        let cost_json = fs::read_to_string(cost_path).expect("cost artifact exists");
+
+        assert!(cost_json.contains("\"total_cost_micros\": 100"));
+        assert!(cost_json.contains("\"currency_totals\""));
+        assert!(cost_json.contains("\"USD\": 100"));
 
         remove_test_dir(root);
     }
