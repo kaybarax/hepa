@@ -3,12 +3,16 @@ mod run;
 
 use hepa_adapters::{
     doctor::{HepaAdapterDoctorReport, HepaSystemAdapterDoctorProbe, format_adapter_list},
-    interactive::{HepaLaneSteeringRequest, HepaSystemTmux, HepaTmux, HepaTmuxInteractiveLauncher},
+    interactive::{
+        HepaInteractiveSessionRequest, HepaLaneSteeringRequest, HepaSystemTmux, HepaTmux,
+        HepaTmuxInteractiveLauncher,
+    },
     pi::HepaPiInstallPlan,
     registry::HepaAdapterRegistry,
 };
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::{HepaLaneState, HepaTimingRecord};
+use hepa_git::worktree::HepaWorktreeAllocator;
 use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
 use hepa_kanban::spec_import::import_markdown_spec;
 use hepa_kanban::sync::{
@@ -60,6 +64,15 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                 receipt.lane_id,
                 receipt.session_id,
                 receipt.log_path.display()
+            ))
+        }
+        [command, subcommand, lane_id] if command == "lane" && subcommand == "teardown" => {
+            let receipt = HepaTmuxInteractiveLauncher
+                .teardown(lane_id, tmux)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA lane teardown: lane={} session={} killed=true",
+                receipt.lane_id, receipt.session_id
             ))
         }
         [command, rest @ ..]
@@ -187,6 +200,46 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             "HEPA bench: provide --timing <file> to summarize a run's timing record".to_string(),
         ),
         [command, ..] if command == "bench" => Err("unknown bench command".to_string()),
+        [command, repo_path, task_text, flags @ ..] if command == "run-interactive" => {
+            let options = parse_interactive_run_options(flags)?;
+            let repo_path = std::path::PathBuf::from(repo_path);
+            let control_root = repo_path.join(".hepa/control");
+            let worktree_root = repo_path.join(".hepa/worktrees");
+            let lane_id = options.lane_id;
+            let allocator = HepaWorktreeAllocator::new(&repo_path, &worktree_root);
+            let allocation = allocator
+                .allocate_lane_with_metadata(&lane_id, &cli_timestamp())
+                .map_err(|error| error.to_string())?;
+            let artifact_dir = control_root
+                .join("runs/run-cli-interactive/tasks/task-cli-interactive/lanes")
+                .join(&lane_id);
+            let command = options.command.unwrap_or_else(default_interactive_command);
+            let receipt = HepaTmuxInteractiveLauncher
+                .launch(
+                    &HepaInteractiveSessionRequest {
+                        lane_id: lane_id.clone(),
+                        adapter_id: options.agent.clone(),
+                        command,
+                        workdir: allocation.worktree_path,
+                        artifact_dir,
+                    },
+                    tmux,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA interactive run launched: agent={} task={} lane={} session={} record={} log={} worktree_ref=worktree:{}",
+                options.agent,
+                task_text,
+                receipt.record.lane_id,
+                receipt.record.session_id,
+                receipt.record_path.display(),
+                receipt.full_log_path.display(),
+                lane_id
+            ))
+        }
+        [command, ..] if command == "run-interactive" => {
+            Err("unknown run-interactive command".to_string())
+        }
         [command, repo_path, task_text, flags @ ..] if command == "run" => {
             let options = parse_run_options(flags)?;
             let repo_path = std::path::PathBuf::from(repo_path);
@@ -221,6 +274,14 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
     }
 }
 
+fn cli_timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("t{seconds}")
+}
+
 fn install_adapter(adapter_id: &str) -> Result<String, String> {
     if adapter_id != "pi" {
         return Err(format!("no built-in installer for adapter {adapter_id}"));
@@ -245,6 +306,64 @@ fn install_adapter(adapter_id: &str) -> Result<String, String> {
             stderr.trim()
         ))
     }
+}
+
+struct HepaInteractiveRunOptions {
+    agent: String,
+    lane_id: String,
+    command: Option<String>,
+}
+
+fn parse_interactive_run_options(flags: &[String]) -> Result<HepaInteractiveRunOptions, String> {
+    let mut agent = "pi".to_string();
+    let mut lane_id = "lane-cli-interactive".to_string();
+    let mut command = None;
+    let mut index = 0;
+    while index < flags.len() {
+        match flags[index].as_str() {
+            "--agent" => {
+                let Some(value) = flags.get(index + 1) else {
+                    return Err("--agent requires a value".to_string());
+                };
+                if value.trim().is_empty() {
+                    return Err("--agent value must not be empty".to_string());
+                }
+                agent = value.clone();
+                index += 2;
+            }
+            "--lane-id" => {
+                let Some(value) = flags.get(index + 1) else {
+                    return Err("--lane-id requires a value".to_string());
+                };
+                if value.trim().is_empty() {
+                    return Err("--lane-id value must not be empty".to_string());
+                }
+                lane_id = value.clone();
+                index += 2;
+            }
+            "--command" => {
+                let Some(value) = flags.get(index + 1) else {
+                    return Err("--command requires a value".to_string());
+                };
+                if value.trim().is_empty() {
+                    return Err("--command value must not be empty".to_string());
+                }
+                command = Some(value.clone());
+                index += 2;
+            }
+            flag => return Err(format!("unknown run-interactive flag: {flag}")),
+        }
+    }
+    Ok(HepaInteractiveRunOptions {
+        agent,
+        lane_id,
+        command,
+    })
+}
+
+fn default_interactive_command() -> String {
+    "sh -lc 'printf \"HEPA interactive lane ready\\n\"; while IFS= read -r line; do printf \"%s\\n\" \"$line\" >> hepa-interactive-steering.log; printf \"steering-applied: %s\\n\" \"$line\"; done'"
+        .to_string()
 }
 
 struct HepaLaneSendOptions {
@@ -414,24 +533,33 @@ mod tests {
 
     #[derive(Default)]
     struct FakeTmux {
+        launched: Vec<(String, String, String)>,
+        captured: Vec<String>,
         sent: Vec<(String, String)>,
+        killed: Vec<String>,
     }
 
     impl HepaTmux for FakeTmux {
         fn new_session(
             &mut self,
-            _session_id: &str,
-            _command: &str,
-            _workdir: &Path,
+            session_id: &str,
+            command: &str,
+            workdir: &Path,
         ) -> Result<(), hepa_adapters::interactive::HepaInteractiveSessionError> {
+            self.launched.push((
+                session_id.to_string(),
+                command.to_string(),
+                workdir.display().to_string(),
+            ));
             Ok(())
         }
 
         fn capture_pane(
             &mut self,
-            _session_id: &str,
+            session_id: &str,
         ) -> Result<String, hepa_adapters::interactive::HepaInteractiveSessionError> {
-            Ok(String::new())
+            self.captured.push(session_id.to_string());
+            Ok("session ready".to_string())
         }
 
         fn send_keys(
@@ -446,8 +574,9 @@ mod tests {
 
         fn kill_session(
             &mut self,
-            _session_id: &str,
+            session_id: &str,
         ) -> Result<(), hepa_adapters::interactive::HepaInteractiveSessionError> {
+            self.killed.push(session_id.to_string());
             Ok(())
         }
     }
@@ -498,6 +627,51 @@ mod tests {
                 .expect_err("other steering commands must not exist"),
             "unknown lane command"
         );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn run_interactive_launches_lane_worktree_and_records_session() {
+        let root = unique_test_dir("run-interactive");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let mut tmux = FakeTmux::default();
+
+        let output = run_cli_with_tmux(
+            &args(&[
+                "run-interactive",
+                repo.to_str().expect("test path is UTF-8"),
+                "Long interactive fixture task",
+                "--agent",
+                "pi",
+                "--lane-id",
+                "lane-rs6",
+                "--command",
+                "sh -lc 'read line; printf %s \"$line\"'",
+            ]),
+            &mut tmux,
+        )
+        .expect("interactive launch should run");
+
+        assert!(output.contains("HEPA interactive run launched: agent=pi"));
+        assert!(output.contains("lane=lane-rs6 session=hepa-lane-rs6"));
+        assert_eq!(tmux.launched.len(), 1);
+        assert_eq!(tmux.launched[0].0, "hepa-lane-rs6");
+        assert_eq!(tmux.captured, vec!["hepa-lane-rs6".to_string()]);
+        let artifact_dir = repo
+            .join(".hepa/control/runs/run-cli-interactive/tasks/task-cli-interactive/lanes")
+            .join("lane-rs6");
+        let record =
+            fs::read_to_string(artifact_dir.join("interactive-session.json")).expect("record");
+        assert!(record.contains("\"adapter_id\": \"pi\""));
+        assert!(record.contains("\"workdir_ref\": \"<LANE_WORKTREE>\""));
+        assert_eq!(
+            run_cli_with_tmux(&args(&["lane", "teardown", "lane-rs6"]), &mut tmux)
+                .expect("teardown should run"),
+            "HEPA lane teardown: lane=lane-rs6 session=hepa-lane-rs6 killed=true"
+        );
+        assert_eq!(tmux.killed, vec!["hepa-lane-rs6".to_string()]);
 
         remove_test_dir(root);
     }
