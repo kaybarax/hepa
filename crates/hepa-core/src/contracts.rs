@@ -257,6 +257,28 @@ impl HepaValidate for HepaLane {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaLaneSteeringRecord {
+    pub schema_version: u32,
+    pub lane_id: String,
+    pub session_id: String,
+    pub message: String,
+    pub manager_approved: bool,
+    pub dry_run: bool,
+    pub lane_state: HepaLaneState,
+}
+
+impl HepaValidate for HepaLaneSteeringRecord {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("session_id", &self.session_id)?;
+        require_non_empty("message", &self.message)?;
+        reject_secret_like_ref("message", &self.message)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaLaneState {
     DraftSpec,

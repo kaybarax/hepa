@@ -1,4 +1,7 @@
-use hepa_core::{contracts::HepaLaneState, lane_state::HepaLaneStateExt};
+use hepa_core::{
+    contracts::{HepaLaneState, HepaLaneSteeringRecord, HepaValidate},
+    lane_state::HepaLaneStateExt,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -53,17 +56,6 @@ pub struct HepaLaneSteeringReceipt {
     pub session_id: String,
     pub sent: bool,
     pub log_path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HepaLaneSteeringRecord {
-    pub schema_version: u32,
-    pub lane_id: String,
-    pub session_id: String,
-    pub message: String,
-    pub manager_approved: bool,
-    pub dry_run: bool,
-    pub lane_state: HepaLaneState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +122,9 @@ impl HepaTmuxInteractiveLauncher {
             lane_state: request.lane_state.clone(),
         };
         let log_path = request.artifact_dir.join("steering-log.jsonl");
+        record
+            .validate()
+            .map_err(|error| HepaInteractiveSessionError::new(error.field, error.message))?;
         append_stable_json_line(&log_path, &record)?;
         if !request.dry_run {
             tmux.send_keys(&session_id, &request.message)?;
@@ -557,8 +552,11 @@ mod tests {
             )]
         );
         let log = fs::read_to_string(receipt.log_path).expect("steering log");
-        assert!(log.contains("\"manager_approved\":true"));
-        assert!(log.contains("\"message\":\"continue with the focused fix\""));
+        let record: HepaLaneSteeringRecord =
+            serde_json::from_str(log.trim()).expect("steering log record");
+        assert!(record.manager_approved);
+        assert_eq!(record.message, "continue with the focused fix");
+        assert_eq!(record.session_id, "hepa-lane_1");
 
         remove_test_dir(root);
     }

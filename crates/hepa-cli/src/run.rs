@@ -223,6 +223,7 @@ fn sync_fake_run_to_hermes_fixture(
         review_signals: result.terminal_report.review_signals.clone(),
         terminal_report: Some(result.terminal_report.clone()),
         timing: Some(result.timing.clone()),
+        steering_records: Vec::new(),
         blocked_questions: Vec::new(),
     };
 

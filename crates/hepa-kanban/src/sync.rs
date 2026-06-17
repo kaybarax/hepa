@@ -356,6 +356,7 @@ mod tests {
             review_signals: Vec::new(),
             terminal_report: None,
             timing: None,
+            steering_records: Vec::new(),
             blocked_questions: Vec::new(),
         }
     }

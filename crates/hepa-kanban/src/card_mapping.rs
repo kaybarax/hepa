@@ -1,6 +1,7 @@
 use hepa_core::contracts::{
-    HepaFleetTask, HepaLane, HepaProject, HepaReadinessResult, HepaReviewSignal, HepaTaskSpec,
-    HepaTerminalTaskReport, HepaTimingRecord, HepaValidationSummary,
+    HepaFleetTask, HepaLane, HepaLaneSteeringRecord, HepaProject, HepaReadinessResult,
+    HepaReviewSignal, HepaTaskSpec, HepaTerminalTaskReport, HepaTimingRecord,
+    HepaValidationSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fmt};
@@ -18,6 +19,7 @@ pub struct HepaHermesCardMappingInput {
     pub review_signals: Vec<HepaReviewSignal>,
     pub terminal_report: Option<HepaTerminalTaskReport>,
     pub timing: Option<HepaTimingRecord>,
+    pub steering_records: Vec<HepaLaneSteeringRecord>,
     pub blocked_questions: Vec<String>,
 }
 
@@ -92,6 +94,7 @@ pub enum HepaHermesCommentKind {
     Review,
     Timing,
     TerminalReport,
+    Steering,
     BlockedQuestion,
 }
 
@@ -277,6 +280,19 @@ pub fn map_task_to_hermes_card(
             ),
         });
     }
+    for record in &input.steering_records {
+        comments.push(HepaHermesCardComment {
+            kind: HepaHermesCommentKind::Steering,
+            body: format!(
+                "Steering for lane {} to session {}\nDry-run: {}\nManager approved: {}\nMessage: {}",
+                record.lane_id,
+                record.session_id,
+                record.dry_run,
+                record.manager_approved,
+                record.message
+            ),
+        });
+    }
     for question in &input.blocked_questions {
         comments.push(HepaHermesCardComment {
             kind: HepaHermesCommentKind::BlockedQuestion,
@@ -322,6 +338,14 @@ fn validate_mapping_input(
             return Err(HepaKanbanMappingError::new(
                 format!("lanes[{index}].lane_id"),
                 "lane must be listed on task",
+            ));
+        }
+    }
+    for (index, record) in input.steering_records.iter().enumerate() {
+        if !input.task.lane_ids.contains(&record.lane_id) {
+            return Err(HepaKanbanMappingError::new(
+                format!("steering_records[{index}].lane_id"),
+                "steering record must reference a mapped lane",
             ));
         }
     }
@@ -658,6 +682,7 @@ mod tests {
             review_signals,
             terminal_report: Some(terminal_report),
             timing: Some(timing),
+            steering_records: Vec::new(),
             blocked_questions: vec!["Confirm release note wording".to_string()],
         }
     }
@@ -726,6 +751,36 @@ mod tests {
 
         assert!(acceptance < agent_loops);
         assert!(agent_loops < default_project);
+    }
+
+    #[test]
+    fn steering_records_are_projected_to_card_comments() {
+        let mut input = sample_input();
+        input.steering_records = vec![HepaLaneSteeringRecord {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: "lane-1".to_string(),
+            session_id: "hepa-lane-1".to_string(),
+            message: "continue with focused tests".to_string(),
+            manager_approved: true,
+            dry_run: false,
+            lane_state: HepaLaneState::Running,
+        }];
+
+        let payload = map_task_to_hermes_card(&input).expect("mapping should succeed");
+        let comment = payload
+            .comments
+            .iter()
+            .find(|comment| comment.kind == HepaHermesCommentKind::Steering)
+            .expect("steering comment");
+
+        assert!(comment.body.contains("lane lane-1"));
+        assert!(comment.body.contains("session hepa-lane-1"));
+        assert!(comment.body.contains("Manager approved: true"));
+        assert!(
+            comment
+                .body
+                .contains("Message: continue with focused tests")
+        );
     }
 
     #[test]

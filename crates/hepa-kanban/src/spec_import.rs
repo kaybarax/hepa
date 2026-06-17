@@ -145,6 +145,7 @@ pub fn imported_spec_to_draft_cards(
                 review_signals: Vec::new(),
                 terminal_report: None,
                 timing: None,
+                steering_records: Vec::new(),
                 blocked_questions: task.blocked_questions.clone(),
             };
             map_task_to_hermes_card(&input)
