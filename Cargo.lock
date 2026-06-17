@@ -65,6 +65,11 @@ dependencies = [
 [[package]]
 name = "hepa-memory"
 version = "0.1.0"
+dependencies = [
+ "hepa-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hepa-review"
