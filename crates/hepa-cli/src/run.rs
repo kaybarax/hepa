@@ -499,23 +499,89 @@ pub fn run_live_task(
         "live review fanout approved",
         "2026-06-16T00:00:07Z",
     )?;
-    let staging_report = HepaSafeStaging::new(&allocation.worktree_path)
+    let staging_report = match HepaSafeStaging::new(&allocation.worktree_path)
         .stage_approved_files(&attempt_outcome.changed_files)
-        .map_err(|error| error.to_string())?;
-    let commit = HepaManagerGitLifecycle::manager(&allocation.worktree_path)
-        .commit_staged(
-            &HepaCommitMessage::new(format!(
-                "hepa: {}",
-                commit_title(&sanitized_task_text(config))
-            ))
-            .with_body(vec![
-                format!("Task: {}", sanitized_task_text(config)),
-                format!("Run: {}", config.run_id),
-                format!("Lane: {}", config.lane_id),
-                "Manager-owned commit created by HEPA live pipeline.".to_string(),
-            ]),
-        )
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(report) => report,
+        Err(error) => {
+            transition_and_record(
+                &lane_paths,
+                &mut lane,
+                8,
+                HepaLaneState::Blocked,
+                "live manager staging failed",
+                "2026-06-16T00:00:08Z",
+            )?;
+            return finish_blocked_live_run(FinishBlockedInput {
+                config,
+                task,
+                run_paths: &run_paths,
+                lane_paths: &lane_paths,
+                allocator: &allocator,
+                lane: &mut lane,
+                validation,
+                review_signals: review_outcome.signals.clone(),
+                arbitration: Some(review_outcome.arbitration.clone()),
+                timing: live_timing_record(LiveTimingInput {
+                    config,
+                    adapter_id,
+                    worker_duration_seconds: attempt_outcome.duration_seconds,
+                    validation_duration_seconds,
+                    review_duration_seconds,
+                    reviewer_passes: review_outcome.reviewer_passes,
+                    terminal_phase: LivePipelinePhase::PrFailed,
+                    repair_timing,
+                }),
+                reason: format!("Manager staging failed before commit/PR creation: {error}"),
+            });
+        }
+    };
+    let commit = match HepaManagerGitLifecycle::manager(&allocation.worktree_path).commit_staged(
+        &HepaCommitMessage::new(format!(
+            "hepa: {}",
+            commit_title(&sanitized_task_text(config))
+        ))
+        .with_body(vec![
+            format!("Task: {}", sanitized_task_text(config)),
+            format!("Run: {}", config.run_id),
+            format!("Lane: {}", config.lane_id),
+            "Manager-owned commit created by HEPA live pipeline.".to_string(),
+        ]),
+    ) {
+        Ok(commit) => commit,
+        Err(error) => {
+            transition_and_record(
+                &lane_paths,
+                &mut lane,
+                8,
+                HepaLaneState::Blocked,
+                "live manager commit failed",
+                "2026-06-16T00:00:08Z",
+            )?;
+            return finish_blocked_live_run(FinishBlockedInput {
+                config,
+                task,
+                run_paths: &run_paths,
+                lane_paths: &lane_paths,
+                allocator: &allocator,
+                lane: &mut lane,
+                validation,
+                review_signals: review_outcome.signals.clone(),
+                arbitration: Some(review_outcome.arbitration.clone()),
+                timing: live_timing_record(LiveTimingInput {
+                    config,
+                    adapter_id,
+                    worker_duration_seconds: attempt_outcome.duration_seconds,
+                    validation_duration_seconds,
+                    review_duration_seconds,
+                    reviewer_passes: review_outcome.reviewer_passes,
+                    terminal_phase: LivePipelinePhase::PrFailed,
+                    repair_timing,
+                }),
+                reason: format!("Manager commit failed before PR creation: {error}"),
+            });
+        }
+    };
 
     let timing_for_pr = live_timing_record(LiveTimingInput {
         config,
