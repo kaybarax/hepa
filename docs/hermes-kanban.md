@@ -78,3 +78,14 @@ hepa fleet reconcile
 If Hermes is unavailable, board sync degrades and catches up later rather than
 blocking local operation. All board payloads, comments, and diagnostics pass the
 same redaction and privacy rules as run artifacts and PR bodies.
+
+For desktop review during degraded Hermes access, package the local fleet state
+as a static dashboard snapshot:
+
+```bash
+hepa fleet dashboard --output .hepa/dashboard/index.html
+```
+
+The generated HTML and sibling JSON are read-only views over HEPA registry and
+scheduler state, including project/task counts, task statuses, priorities,
+lanes, scheduler run state, and dashboard-visible wait reasons.

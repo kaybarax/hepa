@@ -549,12 +549,293 @@ fn fleet_stress_run(control_root: &Path) -> Result<String, String> {
     ))
 }
 
-/// Dispatch `hepa fleet <status|doctor|report|cleanup|reconcile>`.
+#[derive(Debug, Clone, Serialize)]
+struct HepaDesktopDashboardSnapshot {
+    schema_version: u32,
+    surface: String,
+    generated_at: String,
+    hermes_status: String,
+    project_count: usize,
+    task_count: usize,
+    lane_count: usize,
+    scheduler: HepaDesktopSchedulerSnapshot,
+    projects: Vec<HepaDesktopProjectSnapshot>,
+    tasks: Vec<HepaDesktopTaskSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HepaDesktopSchedulerSnapshot {
+    run_state: String,
+    ready: u32,
+    running: u32,
+    blocked: u32,
+    queued: u32,
+    active_lanes: u32,
+    waits: Vec<HepaDesktopWaitSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HepaDesktopWaitSnapshot {
+    task_id: String,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HepaDesktopProjectSnapshot {
+    project_id: String,
+    display_name: String,
+    default_branch: String,
+    max_parallel_tasks: u32,
+    active: bool,
+    board_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HepaDesktopTaskSnapshot {
+    task_id: String,
+    project_id: String,
+    title: String,
+    status: String,
+    readiness: String,
+    priority: u32,
+    lanes: Vec<String>,
+    dependencies: Vec<String>,
+    card_configured: bool,
+}
+
+fn desktop_dashboard_snapshot(
+    control_root: &Path,
+    projects: &[HepaRegisteredProject],
+    tasks: &[HepaFleetTask],
+) -> Result<HepaDesktopDashboardSnapshot, String> {
+    let registry = HepaFleetRegistry::new(control_root);
+    let mut scheduler = HepaScheduler::new();
+    if read_scheduler_running(control_root) {
+        scheduler.start();
+    }
+    let active = active_lanes(&registry)?;
+    let status = scheduler
+        .status(
+            &registry,
+            &HepaSchedulerLimits {
+                max_parallel_lanes: 4,
+            },
+            &active,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(HepaDesktopDashboardSnapshot {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        surface: "desktop-dashboard-snapshot".to_string(),
+        generated_at: cli_timestamp(),
+        hermes_status: "degraded_or_unavailable_local_snapshot".to_string(),
+        project_count: projects.len(),
+        task_count: tasks.len(),
+        lane_count: tasks.iter().map(|task| task.lane_ids.len()).sum(),
+        scheduler: HepaDesktopSchedulerSnapshot {
+            run_state: format!("{:?}", status.run_state),
+            ready: status.ready,
+            running: status.running,
+            blocked: status.blocked,
+            queued: status.queued,
+            active_lanes: status.active_lanes,
+            waits: status
+                .waits
+                .into_iter()
+                .map(|wait| HepaDesktopWaitSnapshot {
+                    task_id: wait.task_id,
+                    reasons: wait
+                        .reasons
+                        .into_iter()
+                        .map(|reason| reason.describe())
+                        .collect(),
+                })
+                .collect(),
+        },
+        projects: projects
+            .iter()
+            .map(|project| HepaDesktopProjectSnapshot {
+                project_id: project.project.project_id.clone(),
+                display_name: project.project.display_name.clone(),
+                default_branch: project.project.default_branch.clone(),
+                max_parallel_tasks: project.max_parallel_tasks,
+                active: project.project.is_active,
+                board_configured: project.board_metadata.is_some(),
+            })
+            .collect(),
+        tasks: tasks
+            .iter()
+            .map(|task| HepaDesktopTaskSnapshot {
+                task_id: task.task_id.clone(),
+                project_id: task.project_id.clone(),
+                title: task.title.clone(),
+                status: format!("{:?}", task.status),
+                readiness: format!("{:?}", task.readiness),
+                priority: task.priority,
+                lanes: task.lane_ids.clone(),
+                dependencies: task.dependencies.clone(),
+                card_configured: task.external_card_id.is_some(),
+            })
+            .collect(),
+    })
+}
+
+fn dashboard_json_path(html_path: &Path) -> PathBuf {
+    let mut path = html_path.to_path_buf();
+    path.set_extension("json");
+    path
+}
+
+fn write_desktop_dashboard(
+    output_path: &Path,
+    snapshot: &HepaDesktopDashboardSnapshot,
+) -> Result<PathBuf, String> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let json_path = dashboard_json_path(output_path);
+    write_json(&json_path, snapshot)?;
+    fs::write(output_path, render_desktop_dashboard(snapshot))
+        .map_err(|error| error.to_string())?;
+    Ok(json_path)
+}
+
+fn render_desktop_dashboard(snapshot: &HepaDesktopDashboardSnapshot) -> String {
+    let project_cards = snapshot
+        .projects
+        .iter()
+        .map(|project| {
+            format!(
+                "<article><h2>{}</h2><dl><dt>Project</dt><dd>{}</dd><dt>Branch</dt><dd>{}</dd><dt>Parallel</dt><dd>{}</dd><dt>Board</dt><dd>{}</dd></dl></article>",
+                html_escape(&project.display_name),
+                html_escape(&project.project_id),
+                html_escape(&project.default_branch),
+                project.max_parallel_tasks,
+                if project.board_configured { "configured" } else { "headless" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let task_rows = snapshot
+        .tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&task.task_id),
+                html_escape(&task.project_id),
+                html_escape(&task.title),
+                html_escape(&task.status),
+                html_escape(&task.readiness),
+                task.priority
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let waits = snapshot
+        .scheduler
+        .waits
+        .iter()
+        .map(|wait| {
+            format!(
+                "<li><strong>{}</strong>: {}</li>",
+                html_escape(&wait.task_id),
+                html_escape(&wait.reasons.join("; "))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HEPA Fleet Dashboard</title>
+<style>
+:root {{ color-scheme: light; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f7f8; color: #16201c; }}
+body {{ margin: 0; }}
+header {{ background: #16352f; color: white; padding: 24px 32px; }}
+main {{ padding: 24px 32px 40px; }}
+h1, h2 {{ margin: 0; font-weight: 700; letter-spacing: 0; }}
+h1 {{ font-size: 28px; }}
+h2 {{ font-size: 18px; }}
+.meta {{ margin-top: 8px; color: #d5e5df; }}
+.stats, .projects {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0; }}
+.stat, article {{ background: white; border: 1px solid #dbe4e1; border-radius: 6px; padding: 14px; }}
+.value {{ display: block; font-size: 26px; font-weight: 700; margin-top: 4px; }}
+dl {{ display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 12px 0 0; }}
+dt {{ color: #52615c; }}
+dd {{ margin: 0; overflow-wrap: anywhere; }}
+table {{ width: 100%; border-collapse: collapse; background: white; border: 1px solid #dbe4e1; border-radius: 6px; overflow: hidden; }}
+th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid #e8eeeb; vertical-align: top; }}
+th {{ background: #edf3f1; color: #243b35; }}
+ul {{ background: white; border: 1px solid #dbe4e1; border-radius: 6px; padding: 14px 24px; }}
+</style>
+</head>
+<body>
+<header>
+<h1>HEPA Fleet Dashboard</h1>
+<div class="meta">surface={} &middot; Hermes={} &middot; generated={}</div>
+</header>
+<main>
+<section class="stats">
+<div class="stat">Projects<span class="value">{}</span></div>
+<div class="stat">Tasks<span class="value">{}</span></div>
+<div class="stat">Lanes<span class="value">{}</span></div>
+<div class="stat">Scheduler<span class="value">{}</span></div>
+</section>
+<section>
+<h2>Projects</h2>
+<div class="projects">
+{}
+</div>
+</section>
+<section>
+<h2>Tasks</h2>
+<table><thead><tr><th>Task</th><th>Project</th><th>Title</th><th>Status</th><th>Readiness</th><th>Priority</th></tr></thead><tbody>
+{}
+</tbody></table>
+</section>
+<section>
+<h2>Wait Reasons</h2>
+<ul>{}</ul>
+</section>
+</main>
+</body>
+</html>
+"#,
+        html_escape(&snapshot.surface),
+        html_escape(&snapshot.hermes_status),
+        html_escape(&snapshot.generated_at),
+        snapshot.project_count,
+        snapshot.task_count,
+        snapshot.lane_count,
+        html_escape(&snapshot.scheduler.run_state),
+        project_cards,
+        task_rows,
+        if waits.is_empty() {
+            "<li>none</li>".to_string()
+        } else {
+            waits
+        }
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Dispatch `hepa fleet <status|doctor|report|cleanup|reconcile|dashboard>`.
 pub fn fleet_command(args: &[String]) -> Result<String, String> {
-    let (subcommand, rest) = args
-        .split_first()
-        .ok_or_else(|| "usage: hepa fleet <status|doctor|report|cleanup|reconcile>".to_string())?;
-    let (control_root, _flags) = take_control_root(rest)?;
+    let (subcommand, rest) = args.split_first().ok_or_else(|| {
+        "usage: hepa fleet <status|doctor|report|cleanup|reconcile|dashboard>".to_string()
+    })?;
+    let (control_root, mut flags) = take_control_root(rest)?;
     let registry = HepaFleetRegistry::new(&control_root);
     let tasks = registry.list_tasks().map_err(|error| error.to_string())?;
     let projects = registry
@@ -656,6 +937,28 @@ pub fn fleet_command(args: &[String]) -> Result<String, String> {
             ))
         }
         "stress-run" => fleet_stress_run(&control_root),
+        "dashboard" => {
+            let output = take_option(&mut flags, "--output")?
+                .map(PathBuf::from)
+                .unwrap_or_else(|| control_root.join("fleet/dashboard/index.html"));
+            if !flags.is_empty() {
+                return Err(format!(
+                    "unknown fleet dashboard flags: {}",
+                    flags.join(" ")
+                ));
+            }
+            let snapshot = desktop_dashboard_snapshot(&control_root, &projects, &tasks)?;
+            let json_path = write_desktop_dashboard(&output, &snapshot)?;
+            Ok(format!(
+                "HEPA fleet dashboard: html={} json={} projects={} tasks={} lanes={} hermes={}",
+                output.display(),
+                json_path.display(),
+                snapshot.project_count,
+                snapshot.task_count,
+                snapshot.lane_count,
+                snapshot.hermes_status
+            ))
+        }
         other => Err(format!("unknown fleet command: {other}")),
     }
 }
@@ -988,6 +1291,84 @@ mod tests {
 
         let cleanup = fleet_command(&s(&["cleanup", "--control-root", &control])).expect("cleanup");
         assert!(cleanup.contains("removed=0"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fleet_dashboard_writes_static_desktop_snapshot() {
+        let root = unique_test_dir("dashboard");
+        let control = root.to_str().expect("path is UTF-8").to_string();
+        let registry = HepaFleetRegistry::new(&root);
+        registry
+            .register_project(&HepaRegisteredProject {
+                project: HepaProject {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    project_id: "project-1".to_string(),
+                    display_name: "Demo <Project>".to_string(),
+                    repo_ref: "<REPO_A>".to_string(),
+                    default_branch: "main".to_string(),
+                    routing_policy_ref: None,
+                    is_active: true,
+                    created_at: "t0".to_string(),
+                    updated_at: "t0".to_string(),
+                },
+                max_parallel_tasks: 2,
+                cost_policy: HepaCostPolicy {
+                    cost_class: HepaCostClass::Local,
+                    max_paid_lanes: 0,
+                },
+                memory_policy: HepaMemoryPolicy {
+                    max_resident_models: 1,
+                },
+                board_metadata: Some("board-1".to_string()),
+            })
+            .expect("register project");
+        registry
+            .create_task(&HepaFleetTask {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                project_id: "project-1".to_string(),
+                title: "Fix <dashboard>".to_string(),
+                description: String::new(),
+                status: HepaTaskStatus::Ready,
+                readiness: HepaReadinessState::Ready,
+                dependencies: Vec::new(),
+                lane_ids: Vec::new(),
+                external_card_id: Some("card-1".to_string()),
+                priority: 5,
+                created_at: "t0".to_string(),
+                updated_at: "t0".to_string(),
+                completed_at: None,
+            })
+            .expect("create task");
+        scheduler_command(&s(&["start", "--control-root", &control])).expect("start scheduler");
+
+        let html_path = root.join("desktop").join("index.html");
+        let output = fleet_command(&s(&[
+            "dashboard",
+            "--output",
+            html_path.to_str().expect("path is UTF-8"),
+            "--control-root",
+            &control,
+        ]))
+        .expect("dashboard");
+
+        assert!(output.contains("projects=1"));
+        assert!(output.contains("tasks=1"));
+        assert!(html_path.exists());
+        let html = std::fs::read_to_string(&html_path).expect("read html");
+        assert!(html.contains("HEPA Fleet Dashboard"));
+        assert!(html.contains("Demo &lt;Project&gt;"));
+        assert!(html.contains("Fix &lt;dashboard&gt;"));
+        assert!(!html.contains("<REPO_A>"));
+
+        let json_path = dashboard_json_path(&html_path);
+        let json = std::fs::read_to_string(json_path).expect("read json");
+        assert!(json.contains("\"surface\": \"desktop-dashboard-snapshot\""));
+        assert!(json.contains("\"run_state\": \"Running\""));
+        assert!(json.contains("\"card_configured\": true"));
+        assert!(!json.contains("<REPO_A>"));
 
         std::fs::remove_dir_all(&root).ok();
     }
