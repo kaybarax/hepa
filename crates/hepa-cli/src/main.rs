@@ -122,7 +122,8 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             Ok(format_timing_summary(&timing))
         }
         [command, ..] if command == "timing" => Err("unknown timing command".to_string()),
-        [command, repo_path, task_text, flag] if command == "run" && flag == "--fake" => {
+        [command, repo_path, task_text, flags @ ..] if command == "run" => {
+            let options = parse_run_options(flags)?;
             let repo_path = std::path::PathBuf::from(repo_path);
             let result = run::run_fake_task(&run::HepaFakeRunConfig {
                 control_root: repo_path.join(".hepa/control"),
@@ -133,27 +134,17 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                 task_id: "task-cli-fake".to_string(),
                 lane_id: "lane-cli-fake".to_string(),
                 task_text: task_text.clone(),
-                timing: false,
+                timing: options.timing,
             })?;
-            Ok(format!(
-                "HEPA fake run completed: run={} lane={} status={}",
-                result.run_id, result.lane_id, result.status
-            ))
-        }
-        [command, repo_path, task_text, flag] if command == "run" && flag == "--timing" => {
-            let repo_path = std::path::PathBuf::from(repo_path);
-            let result = run::run_fake_task(&run::HepaFakeRunConfig {
-                control_root: repo_path.join(".hepa/control"),
-                worktree_root: repo_path.join(".hepa/worktrees"),
-                archive_root: repo_path.join(".hepa/archive"),
-                repo_path,
-                run_id: "run-cli-fake".to_string(),
-                task_id: "task-cli-fake".to_string(),
-                lane_id: "lane-cli-fake".to_string(),
-                task_text: task_text.clone(),
-                timing: true,
-            })?;
-            Ok(format_timing_summary(&result.timing))
+            if options.timing {
+                Ok(format_timing_summary(&result.timing))
+            } else {
+                Ok(format!(
+                    "HEPA run completed: agent={} run={} lane={} status={} \
+                     (safe defaults: worktree sandbox, manager-owned git, auto-merge off)",
+                    options.agent, result.run_id, result.lane_id, result.status
+                ))
+            }
         }
         [command, ..] if command == "run" => Err("unknown run command".to_string()),
         _ => Err("unknown command".to_string()),
@@ -235,6 +226,43 @@ fn parse_lane_state(value: &str) -> Result<HepaLaneState, String> {
         "completed" => Ok(HepaLaneState::Completed),
         _ => Err(format!("unknown lane state: {value}")),
     }
+}
+
+struct HepaRunOptions {
+    agent: String,
+    timing: bool,
+}
+
+fn parse_run_options(flags: &[String]) -> Result<HepaRunOptions, String> {
+    // Safe defaults: the fake adapter, no timing dump. Worktree sandbox,
+    // manager-owned git lifecycle, and no auto-merge are always enforced.
+    let mut agent = "fake".to_string();
+    let mut timing = false;
+    let mut index = 0;
+    while index < flags.len() {
+        match flags[index].as_str() {
+            "--timing" => {
+                timing = true;
+                index += 1;
+            }
+            "--fake" => {
+                agent = "fake".to_string();
+                index += 1;
+            }
+            "--agent" => {
+                let Some(value) = flags.get(index + 1) else {
+                    return Err("--agent requires a value".to_string());
+                };
+                if value.trim().is_empty() {
+                    return Err("--agent value must not be empty".to_string());
+                }
+                agent = value.clone();
+                index += 2;
+            }
+            flag => return Err(format!("unknown run flag: {flag}")),
+        }
+    }
+    Ok(HepaRunOptions { agent, timing })
 }
 
 fn load_cli_config() -> Result<HepaConfig, String> {
@@ -533,6 +561,38 @@ mod tests {
         assert!(output.contains("container_count=0"));
         assert!(output.contains("fake_worker=1.000s"));
         assert!(output.contains("fake_review=1.000s"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn run_command_accepts_agent_flag_with_safe_defaults() {
+        let root = unique_test_dir("run-agent");
+        let repo = root.join("repo");
+        init_repo(&repo);
+
+        let output = run_cli(&args(&[
+            "run",
+            repo.to_str().expect("test path is UTF-8"),
+            "Update docs",
+            "--agent",
+            "fake",
+        ]))
+        .expect("run with agent should complete");
+
+        assert!(output.contains("HEPA run completed: agent=fake"));
+        assert!(output.contains("status=completed"));
+        assert!(output.contains("auto-merge off"));
+
+        // A missing agent value is rejected.
+        let error = run_cli(&args(&[
+            "run",
+            repo.to_str().expect("test path is UTF-8"),
+            "Update docs",
+            "--agent",
+        ]))
+        .expect_err("missing agent value must error");
+        assert!(error.contains("--agent requires a value"));
 
         remove_test_dir(root);
     }
