@@ -3,6 +3,7 @@ pub mod custom;
 pub mod doctor;
 pub mod engine;
 pub mod fake;
+pub mod local_worker;
 pub mod registry;
 pub mod routing;
 pub mod shell_command;
