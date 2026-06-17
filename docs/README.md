@@ -11,3 +11,4 @@ Implementation documentation for the HEPA workspace.
 - [performance.md](performance.md) — one-loop model, targets, benchmark harness
 - [fleet.md](fleet.md) — projects, scheduler, resource/conflict rules, monitor
 - [hoca-parity.md](hoca-parity.md) — HOCA read-only reference notes
+- [stretch-phase-11.md](stretch-phase-11.md) — Phase 11 evidence ledger
