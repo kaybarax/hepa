@@ -1,5 +1,10 @@
 mod run;
 
+use hepa_adapters::{
+    doctor::{HepaAdapterDoctorReport, HepaSystemAdapterDoctorProbe, format_adapter_list},
+    registry::HepaAdapterRegistry,
+};
+use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::HepaTimingRecord;
 use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
 use hepa_kanban::spec_import::import_markdown_spec;
@@ -52,6 +57,21 @@ fn run_cli(args: &[String]) -> Result<String, String> {
             Ok(report.to_redacted_summary())
         }
         [command, ..] if command == "kanban" => Err("unknown kanban command".to_string()),
+        [command, subcommand] if command == "adapter" && subcommand == "list" => {
+            let config = load_cli_config()?;
+            let registry = HepaAdapterRegistry::load_from_config(&config)
+                .map_err(|error| format!("failed to load adapter registry: {error}"))?;
+            Ok(format_adapter_list(&registry))
+        }
+        [command, subcommand] if command == "adapter" && subcommand == "doctor" => {
+            let config = load_cli_config()?;
+            let registry = HepaAdapterRegistry::load_from_config(&config)
+                .map_err(|error| format!("failed to load adapter registry: {error}"))?;
+            let report =
+                HepaAdapterDoctorReport::from_registry(&registry, &HepaSystemAdapterDoctorProbe);
+            Ok(report.to_redacted_summary())
+        }
+        [command, ..] if command == "adapter" => Err("unknown adapter command".to_string()),
         [command, subcommand, path] if command == "spec" && subcommand == "import" => {
             let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("failed to read spec file: {error}"))?;
@@ -106,6 +126,11 @@ fn run_cli(args: &[String]) -> Result<String, String> {
         [command, ..] if command == "run" => Err("unknown run command".to_string()),
         _ => Err("unknown command".to_string()),
     }
+}
+
+fn load_cli_config() -> Result<HepaConfig, String> {
+    HepaConfig::load_from_env_and_dotenv_file(".env", HepaConfigOverrides::default())
+        .map_err(|error| format!("failed to load HEPA config: {error}"))
 }
 
 fn format_timing_summary(timing: &HepaTimingRecord) -> String {
@@ -170,6 +195,26 @@ mod tests {
         assert!(output.contains("HEPA kanban doctor: degraded"));
         assert!(output.contains("cli=missing"));
         assert!(output.contains("board=missing"));
+    }
+
+    #[test]
+    fn adapter_list_command_prints_default_registry() {
+        let output = run_cli(&args(&["adapter", "list"])).expect("adapter list should run");
+
+        assert!(output.contains("HEPA adapter list:"));
+        assert!(output.contains("fake"));
+        assert!(output.contains("shell-command"));
+        assert!(output.contains("sandbox="));
+        assert!(output.contains("max_concurrency="));
+    }
+
+    #[test]
+    fn adapter_doctor_command_reports_default_checks() {
+        let output = run_cli(&args(&["adapter", "doctor"])).expect("adapter doctor should run");
+
+        assert!(output.contains("HEPA adapter doctor:"));
+        assert!(output.contains("fake=ok"));
+        assert!(output.contains("shell-command="));
     }
 
     #[test]
