@@ -16,6 +16,7 @@ pub mod readiness;
 pub mod redaction;
 pub mod resource_governor;
 pub mod scheduler;
+pub mod timing_trends;
 
 pub const CRATE_NAME: &str = "hepa-core";
 

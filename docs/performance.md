@@ -41,6 +41,9 @@ estimates.
 ```bash
 # Summarize a single run's timing record.
 hepa bench --timing path/to/timing.json
+
+# Summarize timing trends across archived runs.
+hepa timing trends .hepa/archive
 ```
 
 The benchmark harness reads timing artifacts, aggregates medians, and compares
@@ -49,3 +52,9 @@ tests assert the one-loop invariants (zero per-attempt wrapper spawns, zero
 worker-profile calls on the happy path, bounded manager passes, install skip on
 unchanged lockfile, no container starts in default mode) so a regression that
 reintroduces overhead fails CI.
+
+Timing trend reports scan archived run artifacts under `archive:runs/...`, read
+each lane `timing.json`, validate the timing schema, and report portable archive
+refs rather than local filesystem paths. The report includes per-run total
+duration and loop counters plus median totals, loop counts, reviewer passes,
+container counts, and per-phase min/median/max samples.

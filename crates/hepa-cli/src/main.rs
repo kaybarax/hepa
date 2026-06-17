@@ -12,6 +12,7 @@ use hepa_adapters::{
 };
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::{HepaLaneState, HepaTimingRecord};
+use hepa_core::timing_trends::{HepaTimingTrendReport, timing_trend_report};
 use hepa_git::worktree::HepaWorktreeAllocator;
 use hepa_kanban::doctor::system_kanban_doctor_report;
 use hepa_kanban::github_webhook::{HepaGithubIssueWebhookRequest, import_github_issue_webhook};
@@ -190,6 +191,10 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             let timing: HepaTimingRecord = serde_json::from_str(&text)
                 .map_err(|error| format!("failed to parse timing file: {error}"))?;
             Ok(format_timing_summary(&timing))
+        }
+        [command, subcommand, archive_root] if command == "timing" && subcommand == "trends" => {
+            let report = timing_trend_report(archive_root).map_err(|error| error.to_string())?;
+            Ok(format_timing_trend_report(&report))
         }
         [command, ..] if command == "timing" => Err("unknown timing command".to_string()),
         [command] if command == "doctor" => {
@@ -595,6 +600,54 @@ fn format_timing_summary(timing: &HepaTimingRecord) -> String {
     )
 }
 
+fn format_timing_trend_report(report: &HepaTimingTrendReport) -> String {
+    let phases = report
+        .phases
+        .iter()
+        .map(|phase| {
+            format!(
+                "{}:samples={} median={:.3}s min={:.3}s max={:.3}s",
+                phase.name,
+                phase.sample_count,
+                phase.median_seconds,
+                phase.min_seconds,
+                phase.max_seconds
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let runs = report
+        .runs
+        .iter()
+        .map(|run| {
+            format!(
+                "{} total={:.3}s loops={} managers={} reviewers={} containers={} ref={}",
+                run.run_id,
+                run.total_duration_seconds,
+                run.agent_loops,
+                run.manager_passes,
+                run.reviewer_passes,
+                run.container_count,
+                run.timing_ref
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "HEPA timing trends: archive={} timing_records={} runs={} median_total={:.3}s median_agent_loops={:.1} median_manager_passes={:.1} median_reviewer_passes={:.1} median_containers={:.1} phases=[{}] runs=[{}]",
+        report.archive_ref,
+        report.timing_record_count,
+        report.run_count,
+        report.total_duration_median_seconds,
+        report.agent_loops_median,
+        report.manager_passes_median,
+        report.reviewer_passes_median,
+        report.container_count_median,
+        phases,
+        runs
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1050,32 @@ mod tests {
     }
 
     #[test]
+    fn timing_trends_command_summarizes_archived_runs() {
+        let root = unique_test_dir("timing-trends");
+        let archive = root.join("archive");
+        write_timing_fixture(&archive, "run-1", "task-1", "lane-1", 1.0, 2.0, 1);
+        write_timing_fixture(&archive, "run-2", "task-2", "lane-1", 3.0, 4.0, 2);
+
+        let output = run_cli(&args(&[
+            "timing",
+            "trends",
+            archive.to_str().expect("path is UTF-8"),
+        ]))
+        .expect("timing trends should run");
+
+        assert!(output.contains("HEPA timing trends: archive=archive:"));
+        assert!(output.contains("timing_records=2"));
+        assert!(output.contains("runs=2"));
+        assert!(output.contains("median_total=5.000s"));
+        assert!(output.contains("median_agent_loops=1.5"));
+        assert!(output.contains("worker:samples=2 median=2.000s"));
+        assert!(output.contains("archive:runs/run-1/tasks/task-1/lanes/lane-1/timing.json"));
+        assert!(!output.contains(root.to_string_lossy().as_ref()));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn run_command_accepts_agent_flag_with_safe_defaults() {
         let root = unique_test_dir("run-agent");
         let repo = root.join("repo");
@@ -1141,5 +1220,64 @@ mod tests {
         if root.exists() {
             fs::remove_dir_all(root).expect("test dir cleanup");
         }
+    }
+
+    fn write_timing_fixture(
+        archive: &Path,
+        run_id: &str,
+        task_id: &str,
+        lane_id: &str,
+        worker_seconds: f64,
+        review_seconds: f64,
+        agent_loops: u32,
+    ) {
+        let timing = HepaTimingRecord {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            phases: vec![
+                HepaTimingPhase {
+                    name: "worker".to_string(),
+                    status: HepaPhaseStatus::Completed,
+                    duration_seconds: worker_seconds,
+                    round: Some(1),
+                    role: Some(HepaAgentRole::Worker),
+                    adapter_id: Some("fake".to_string()),
+                    routing_reason: Some("test route".to_string()),
+                    sandbox_posture: Some("host-worktree".to_string()),
+                },
+                HepaTimingPhase {
+                    name: "review".to_string(),
+                    status: HepaPhaseStatus::Completed,
+                    duration_seconds: review_seconds,
+                    round: Some(1),
+                    role: Some(HepaAgentRole::Reviewer),
+                    adapter_id: Some("fake".to_string()),
+                    routing_reason: Some("test route".to_string()),
+                    sandbox_posture: Some("host-worktree".to_string()),
+                },
+            ],
+            counters: HepaTimingCounters {
+                agent_loops,
+                manager_passes: agent_loops,
+                worker_profile_llm_calls: 0,
+                reviewer_passes: 1,
+                install_events: 0,
+                container_count: 0,
+            },
+        };
+        let path = archive
+            .join("runs")
+            .join(run_id)
+            .join("tasks")
+            .join(task_id)
+            .join("lanes")
+            .join(lane_id)
+            .join("timing.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("parent dir");
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&timing).expect("timing serializes"),
+        )
+        .expect("timing writes");
     }
 }
