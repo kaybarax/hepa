@@ -1,7 +1,9 @@
 //! CLI handlers for the fleet command groups (project/task/scheduler/fleet),
 //! all backed by the deterministic, temp-root-safe `HepaFleetRegistry`.
 
-use hepa_core::contracts::{CONTRACT_SCHEMA_VERSION, HepaProject};
+use hepa_core::contracts::{
+    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaProject, HepaReadinessState, HepaTaskStatus,
+};
 use hepa_core::fleet_registry::{
     HepaCostClass, HepaCostPolicy, HepaFleetRegistry, HepaMemoryPolicy, HepaRegisteredProject,
 };
@@ -172,6 +174,130 @@ pub fn project_command(args: &[String]) -> Result<String, String> {
     }
 }
 
+/// Dispatch `hepa task ...`.
+pub fn task_command(args: &[String]) -> Result<String, String> {
+    let (subcommand, rest) = args.split_first().ok_or_else(|| {
+        "usage: hepa task <create|list|show|cancel|block|resume|prioritize|sync-kanban>".to_string()
+    })?;
+    let (control_root, flags) = take_control_root(rest)?;
+    let registry = HepaFleetRegistry::new(&control_root);
+    let now = cli_timestamp();
+
+    match subcommand.as_str() {
+        "create" => {
+            let project_id = positional(&flags, 0, "project id")?;
+            let task_id = positional(&flags, 1, "task id")?;
+            let title = positional(&flags, 2, "title")?;
+            let task = HepaFleetTask {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: task_id.clone(),
+                project_id,
+                title,
+                description: String::new(),
+                status: HepaTaskStatus::Queued,
+                readiness: HepaReadinessState::NotReady,
+                dependencies: Vec::new(),
+                lane_ids: Vec::new(),
+                external_card_id: None,
+                priority: 1,
+                created_at: now.clone(),
+                updated_at: now,
+                completed_at: None,
+            };
+            registry
+                .create_task(&task)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("HEPA task create: created {task_id}"))
+        }
+        "list" => {
+            let tasks = registry.list_tasks().map_err(|error| error.to_string())?;
+            if tasks.is_empty() {
+                return Ok("HEPA task list: no tasks".to_string());
+            }
+            let lines = tasks
+                .iter()
+                .map(|task| {
+                    format!(
+                        "{} status={:?} priority={}",
+                        task.task_id, task.status, task.priority
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!("HEPA task list:\n{lines}"))
+        }
+        "show" => {
+            let task_id = positional(&flags, 0, "task id")?;
+            match registry
+                .show_task(&task_id)
+                .map_err(|error| error.to_string())?
+            {
+                Some(task) => Ok(format!(
+                    "HEPA task show: {} status={:?} readiness={:?} priority={} deps={}",
+                    task.task_id,
+                    task.status,
+                    task.readiness,
+                    task.priority,
+                    task.dependencies.len()
+                )),
+                None => Err(format!("task not found: {task_id}")),
+            }
+        }
+        "cancel" => {
+            let task = registry
+                .cancel_task(&positional(&flags, 0, "task id")?, &now)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA task cancel: {} -> {:?}",
+                task.task_id, task.status
+            ))
+        }
+        "block" => {
+            let task = registry
+                .block_task(&positional(&flags, 0, "task id")?, &now)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA task block: {} -> {:?}",
+                task.task_id, task.status
+            ))
+        }
+        "resume" => {
+            let task = registry
+                .resume_task(&positional(&flags, 0, "task id")?, &now)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA task resume: {} -> {:?}",
+                task.task_id, task.status
+            ))
+        }
+        "prioritize" => {
+            let task_id = positional(&flags, 0, "task id")?;
+            let priority = positional(&flags, 1, "priority")?
+                .parse::<u32>()
+                .map_err(|_| "priority must be a number".to_string())?;
+            let task = registry
+                .prioritize_task(&task_id, priority, &now)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA task prioritize: {} priority={}",
+                task.task_id, task.priority
+            ))
+        }
+        "sync-kanban" => {
+            // Without a configured Hermes board the sync degrades and reports
+            // how many tasks would be synced once Hermes is available.
+            let count = registry
+                .list_tasks()
+                .map_err(|error| error.to_string())?
+                .len();
+            Ok(format!(
+                "HEPA task sync-kanban: tasks={count} status=degraded (Hermes unavailable)"
+            ))
+        }
+        other => Err(format!("unknown task command: {other}")),
+    }
+}
+
 fn positional(flags: &[String], index: usize, label: &str) -> Result<String, String> {
     flags
         .get(index)
@@ -227,6 +353,54 @@ mod tests {
             .expect("remove");
         assert!(remove.contains("removed project-1"));
         assert!(project_command(&s(&["show", "project-1", "--control-root", &control])).is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn task_lifecycle_commands_drive_the_registry() {
+        let root = unique_test_dir("task");
+        let control = root.to_str().expect("path is UTF-8").to_string();
+
+        let create = task_command(&s(&[
+            "create",
+            "project-1",
+            "task-1",
+            "Fix login",
+            "--control-root",
+            &control,
+        ]))
+        .expect("create");
+        assert!(create.contains("created task-1"));
+
+        assert!(
+            task_command(&s(&["list", "--control-root", &control]))
+                .expect("list")
+                .contains("task-1")
+        );
+
+        let block =
+            task_command(&s(&["block", "task-1", "--control-root", &control])).expect("block");
+        assert!(block.contains("Blocked"));
+        let resume =
+            task_command(&s(&["resume", "task-1", "--control-root", &control])).expect("resume");
+        assert!(resume.contains("Queued"));
+        let prioritize = task_command(&s(&[
+            "prioritize",
+            "task-1",
+            "7",
+            "--control-root",
+            &control,
+        ]))
+        .expect("prioritize");
+        assert!(prioritize.contains("priority=7"));
+        let cancel =
+            task_command(&s(&["cancel", "task-1", "--control-root", &control])).expect("cancel");
+        assert!(cancel.contains("Cancelled"));
+
+        let sync = task_command(&s(&["sync-kanban", "--control-root", &control])).expect("sync");
+        assert!(sync.contains("tasks=1"));
+        assert!(sync.contains("degraded"));
 
         std::fs::remove_dir_all(&root).ok();
     }
