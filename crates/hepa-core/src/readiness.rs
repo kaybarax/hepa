@@ -86,6 +86,28 @@ impl HepaDoneGateResult {
     pub fn is_ready(&self) -> bool {
         matches!(self.status, HepaDoneStatus::Ready)
     }
+
+    /// A Hermes card may only show done when the HEPA done gate is satisfied.
+    /// Board requests to mark a card done are rejected while readiness fails.
+    pub fn card_may_show_done(&self) -> bool {
+        self.is_ready()
+    }
+}
+
+impl HepaNotReadyReason {
+    /// Stable wire name used in artifacts, card comments, and notifications.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HepaNotReadyReason::NeedsRebase => "needs_rebase",
+            HepaNotReadyReason::MergeConflict => "merge_conflict",
+            HepaNotReadyReason::CiFailed => "ci_failed",
+            HepaNotReadyReason::ReviewFailed => "review_failed",
+            HepaNotReadyReason::MissingArtifact => "missing_artifact",
+            HepaNotReadyReason::HumanClarificationNeeded => "human_clarification_needed",
+            HepaNotReadyReason::BlockedByDependency => "blocked_by_dependency",
+            HepaNotReadyReason::KanbanDrift => "kanban_drift",
+        }
+    }
 }
 
 /// Evaluate the definition of done. A lane is ready only when every required
@@ -244,5 +266,123 @@ mod tests {
         let result = evaluate_done_gate(&input);
 
         assert!(result.is_ready());
+    }
+
+    #[test]
+    fn each_not_ready_classification_is_reachable_and_actionable() {
+        let cases: Vec<(HepaDoneGateInput, HepaNotReadyReason)> = vec![
+            (
+                HepaDoneGateInput {
+                    branch_synced_with_base: false,
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::NeedsRebase,
+            ),
+            (
+                HepaDoneGateInput {
+                    merge_conflict: true,
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::MergeConflict,
+            ),
+            (
+                HepaDoneGateInput {
+                    ci_present: true,
+                    ci_passing: false,
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::CiFailed,
+            ),
+            (
+                HepaDoneGateInput {
+                    review_passed: false,
+                    residual_findings_accepted: false,
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::ReviewFailed,
+            ),
+            (
+                HepaDoneGateInput {
+                    pr_exists: false,
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::MissingArtifact,
+            ),
+            (
+                HepaDoneGateInput {
+                    human_clarification_needed: true,
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::HumanClarificationNeeded,
+            ),
+            (
+                HepaDoneGateInput {
+                    unmet_dependencies: vec!["task-0".to_string()],
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::BlockedByDependency,
+            ),
+            (
+                HepaDoneGateInput {
+                    card_lane_consistent: false,
+                    ..HepaDoneGateInput::default()
+                },
+                HepaNotReadyReason::KanbanDrift,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let result = evaluate_done_gate(&input);
+            assert_eq!(result.status, HepaDoneStatus::NotReady, "{expected:?}");
+            let blocker = result
+                .blockers
+                .iter()
+                .find(|blocker| blocker.reason == expected)
+                .unwrap_or_else(|| panic!("missing classification {expected:?}"));
+            // Actionable: a non-trivial directive, not just a label.
+            assert!(
+                blocker.message.len() > 20,
+                "non-actionable reason for {expected:?}: {}",
+                blocker.message
+            );
+        }
+    }
+
+    #[test]
+    fn classification_wire_names_match_the_architecture_vocabulary() {
+        let expected = [
+            (HepaNotReadyReason::NeedsRebase, "needs_rebase"),
+            (HepaNotReadyReason::MergeConflict, "merge_conflict"),
+            (HepaNotReadyReason::CiFailed, "ci_failed"),
+            (HepaNotReadyReason::ReviewFailed, "review_failed"),
+            (HepaNotReadyReason::MissingArtifact, "missing_artifact"),
+            (
+                HepaNotReadyReason::HumanClarificationNeeded,
+                "human_clarification_needed",
+            ),
+            (
+                HepaNotReadyReason::BlockedByDependency,
+                "blocked_by_dependency",
+            ),
+            (HepaNotReadyReason::KanbanDrift, "kanban_drift"),
+        ];
+
+        for (reason, name) in expected {
+            assert_eq!(reason.as_str(), name);
+            let json = serde_json::to_string(&reason).expect("reason serializes");
+            assert_eq!(json, format!("\"{name}\""));
+        }
+    }
+
+    #[test]
+    fn card_may_not_show_done_while_readiness_fails() {
+        let blocked = evaluate_done_gate(&HepaDoneGateInput {
+            card_lane_consistent: false,
+            ..HepaDoneGateInput::default()
+        });
+        assert!(!blocked.card_may_show_done());
+
+        let ready = evaluate_done_gate(&HepaDoneGateInput::default());
+        assert!(ready.card_may_show_done());
     }
 }
