@@ -486,6 +486,29 @@ mod tests {
     }
 
     #[test]
+    fn spec_import_command_imports_tasks_from_a_markdown_file() {
+        let root = unique_test_dir("spec-import");
+        std::fs::create_dir_all(&root).expect("spec dir");
+        let spec_path = root.join("spec.md");
+        std::fs::write(
+            &spec_path,
+            "Project: project-1\n\n## Task: task-1: Write docs\nExplain the feature.\nAcceptance:\n- Docs describe usage.\nValidation:\n- cargo test\n",
+        )
+        .expect("write spec");
+
+        let output = run_cli(&args(&[
+            "spec",
+            "import",
+            spec_path.to_str().expect("path is UTF-8"),
+        ]))
+        .expect("spec import should run");
+
+        assert_eq!(output, "HEPA spec import completed: tasks=1");
+
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn spec_import_command_reports_usage_for_missing_path() {
         let error = run_cli(&args(&["spec", "import"])).expect_err("path is required");
 
