@@ -53,6 +53,60 @@ impl HepaVersionPinRegistry {
         self.pins
             .contains_key(&(adapter_id.to_string(), version.to_string()))
     }
+
+    /// Doctor check: warn when an adapter version has no pinned template.
+    pub fn warn_if_untested(&self, adapter_id: &str, version: &str) -> Option<HepaVersionWarning> {
+        if self.is_pinned(adapter_id, version) {
+            return None;
+        }
+        Some(HepaVersionWarning {
+            adapter_id: adapter_id.to_string(),
+            version: version.to_string(),
+            kind: HepaVersionWarningKind::UntestedVersion,
+            message: format!(
+                "adapter {adapter_id} version {version} is untested; pin a known-good \
+                 invocation template before relying on it"
+            ),
+        })
+    }
+
+    /// Doctor check: detect invocation flag drift. An untested version warns; a
+    /// pinned version whose actual command differs from the pinned template is
+    /// flagged as drift so a silently broken invocation is caught.
+    pub fn detect_flag_drift(
+        &self,
+        adapter_id: &str,
+        version: &str,
+        actual_command: &str,
+    ) -> Option<HepaVersionWarning> {
+        match self.template_for(adapter_id, version) {
+            None => self.warn_if_untested(adapter_id, version),
+            Some(pinned) if pinned != actual_command => Some(HepaVersionWarning {
+                adapter_id: adapter_id.to_string(),
+                version: version.to_string(),
+                kind: HepaVersionWarningKind::FlagDrift,
+                message: format!(
+                    "adapter {adapter_id} version {version} invocation drifted from its pinned \
+                     template; re-pin and re-validate before use"
+                ),
+            }),
+            Some(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HepaVersionWarningKind {
+    UntestedVersion,
+    FlagDrift,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaVersionWarning {
+    pub adapter_id: String,
+    pub version: String,
+    pub kind: HepaVersionWarningKind,
+    pub message: String,
 }
 
 #[cfg(test)]
@@ -81,6 +135,47 @@ mod tests {
         let registry = HepaVersionPinRegistry::with_builtins();
         assert!(!registry.is_pinned("fake", "9.9.9"));
         assert!(registry.template_for("fake", "9.9.9").is_none());
+    }
+
+    #[test]
+    fn doctor_warns_on_untested_versions_with_actionable_message() {
+        let registry = HepaVersionPinRegistry::with_builtins();
+
+        let warning = registry
+            .warn_if_untested("fake", "9.9.9")
+            .expect("untested version should warn");
+        assert_eq!(warning.kind, HepaVersionWarningKind::UntestedVersion);
+        assert!(warning.message.contains("untested"));
+        assert!(warning.message.contains("pin a known-good"));
+
+        assert!(
+            registry
+                .warn_if_untested("fake", BUILTIN_PINNED_VERSION)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn simulated_flag_drift_is_detected() {
+        let registry = HepaVersionPinRegistry::with_builtins();
+        let pinned = registry
+            .template_for("fake", BUILTIN_PINNED_VERSION)
+            .expect("fake is pinned")
+            .to_string();
+
+        // Matching command: no drift.
+        assert!(
+            registry
+                .detect_flag_drift("fake", BUILTIN_PINNED_VERSION, &pinned)
+                .is_none()
+        );
+
+        // Drifted command (a flag changed): flagged as drift.
+        let drifted = format!("{pinned} --new-unexpected-flag");
+        let warning = registry
+            .detect_flag_drift("fake", BUILTIN_PINNED_VERSION, &drifted)
+            .expect("drift should be detected");
+        assert_eq!(warning.kind, HepaVersionWarningKind::FlagDrift);
     }
 
     #[test]
