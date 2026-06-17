@@ -269,14 +269,32 @@ fn extract_final_message(value: &serde_json::Value) -> Option<String> {
             value
                 .get("history")
                 .and_then(serde_json::Value::as_array)
-                .and_then(|history| history.iter().rev().find_map(extract_message_text))
+                .and_then(|history| {
+                    history
+                        .iter()
+                        .rev()
+                        .find_map(extract_assistant_message_text)
+                })
         })
         .or_else(|| {
             value
                 .get("messages")
                 .and_then(serde_json::Value::as_array)
-                .and_then(|messages| messages.iter().rev().find_map(extract_message_text))
+                .and_then(|messages| {
+                    messages
+                        .iter()
+                        .rev()
+                        .find_map(extract_assistant_message_text)
+                })
         })
+}
+
+fn extract_assistant_message_text(value: &serde_json::Value) -> Option<String> {
+    let role = value.get("role").and_then(serde_json::Value::as_str);
+    if role != Some("assistant") {
+        return None;
+    }
+    extract_message_text(value).filter(|text| !text.trim().is_empty())
 }
 
 fn extract_message_text(value: &serde_json::Value) -> Option<String> {
@@ -363,6 +381,20 @@ mod tests {
         assert_eq!(
             parsed.final_message,
             "{\"status\":\"approved\",\"summary\":[\"ok\"],\"findings\":[]}"
+        );
+    }
+
+    #[test]
+    fn pi_event_stream_does_not_treat_user_prompt_as_final_message() {
+        let raw = r#"{"type":"agent_start"}
+{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"original prompt"}]},{"role":"assistant","content":[]}]}"#;
+
+        let error = parse_pi_json_events(raw).expect_err("empty assistant output should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("agent_end missing final assistant message")
         );
     }
 
