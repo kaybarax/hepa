@@ -1,5 +1,5 @@
 use hepa_adapters::routing::{HepaReviewFanout, HepaReviewPassPolicy};
-use hepa_core::contracts::{HepaReviewSignal, HepaValidate};
+use hepa_core::contracts::{HepaReviewFinding, HepaReviewSignal, HepaValidate};
 use std::{error::Error, fmt, sync::Arc, thread};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,13 @@ pub struct HepaReviewPassDecision {
     pub passed: bool,
     pub approved_adapters: Vec<String>,
     pub non_approving_adapters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaAggregatedReviewFinding {
+    pub adapter_id: String,
+    pub review_id: String,
+    pub finding: HepaReviewFinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +165,32 @@ pub fn apply_review_pass_policy(
     })
 }
 
+pub fn aggregate_review_findings(
+    signals: &[HepaReviewSignal],
+) -> Result<Vec<HepaAggregatedReviewFinding>, HepaReviewFanoutError> {
+    let mut findings = Vec::new();
+    for signal in signals {
+        signal
+            .validate()
+            .map_err(|error| HepaReviewFanoutError::new(error.field, error.message))?;
+        for finding in &signal.findings {
+            findings.push(HepaAggregatedReviewFinding {
+                adapter_id: signal.adapter_id.clone(),
+                review_id: signal.review_id.clone(),
+                finding: finding.clone(),
+            });
+        }
+    }
+    findings.sort_by(|left, right| {
+        left.adapter_id
+            .cmp(&right.adapter_id)
+            .then_with(|| left.review_id.cmp(&right.review_id))
+            .then_with(|| left.finding.finding_id.cmp(&right.finding.finding_id))
+            .then_with(|| left.finding.message.cmp(&right.finding.message))
+    });
+    Ok(findings)
+}
+
 fn required_approvals(policy: &HepaReviewFanout) -> u32 {
     match policy.pass_policy {
         HepaReviewPassPolicy::All => policy.adapters.len() as u32,
@@ -216,7 +249,9 @@ fn cap_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hepa_core::contracts::{CONTRACT_SCHEMA_VERSION, HepaReviewStatus, HepaValidationStatus};
+    use hepa_core::contracts::{
+        CONTRACT_SCHEMA_VERSION, HepaFindingSeverity, HepaReviewStatus, HepaValidationStatus,
+    };
     use std::{
         sync::{
             Arc, Mutex,
@@ -316,6 +351,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aggregates_findings_deterministically_independent_of_input_order() {
+        let first_order = vec![
+            signal_with_findings(
+                "lane-1",
+                "reviewer-b",
+                vec![finding("finding-2", "src/b.rs", 20, "second finding")],
+            ),
+            signal_with_findings(
+                "lane-1",
+                "reviewer-a",
+                vec![finding("finding-1", "src/a.rs", 10, "first finding")],
+            ),
+        ];
+        let second_order = first_order.iter().cloned().rev().collect::<Vec<_>>();
+
+        let first = aggregate_review_findings(&first_order).expect("first order aggregates");
+        let second = aggregate_review_findings(&second_order).expect("second order aggregates");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .iter()
+                .map(|finding| {
+                    (
+                        finding.adapter_id.as_str(),
+                        finding.finding.finding_id.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![("reviewer-a", "finding-1"), ("reviewer-b", "finding-2")]
+        );
+    }
+
     fn signal(lane_id: &str, adapter_id: &str) -> HepaReviewSignal {
         signal_with_status(lane_id, adapter_id, HepaReviewStatus::Approved)
     }
@@ -334,6 +403,33 @@ mod tests {
             findings: Vec::new(),
             summary: vec!["approved".to_string()],
             completed_at: "2026-06-16T00:00:00Z".to_string(),
+        }
+    }
+
+    fn signal_with_findings(
+        lane_id: &str,
+        adapter_id: &str,
+        findings: Vec<HepaReviewFinding>,
+    ) -> HepaReviewSignal {
+        HepaReviewSignal {
+            findings,
+            ..signal_with_status(lane_id, adapter_id, HepaReviewStatus::ChangesRequested)
+        }
+    }
+
+    fn finding(finding_id: &str, file_ref: &str, line: u32, message: &str) -> HepaReviewFinding {
+        HepaReviewFinding {
+            finding_id: finding_id.to_string(),
+            severity: HepaFindingSeverity::High,
+            category: "correctness".to_string(),
+            evidence: format!("{file_ref}:{line} shows the issue."),
+            in_scope: true,
+            release_risk: true,
+            recommended_action: "Fix the issue and rerun validation.".to_string(),
+            file_ref: Some(file_ref.to_string()),
+            line: Some(line),
+            message: message.to_string(),
+            accepted: true,
         }
     }
 
