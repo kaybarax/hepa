@@ -12,18 +12,23 @@ An adapter spec (`HepaAdapterSpec`) declares:
 - `mode` (oneshot or interactive)
 - `command` / `review_command` invocation templates with placeholders such as
   `{prompt_file}`, `{worktree}`, `{artifact_dir}`, `{output_file}`
+- `prompt_transport` (`prompt-file` or `stdin`) and `output_capture`
+  (`adapter-file` or `stdout`)
 - `workdir`, `required_commands`, `required_env`
 - `sandbox` (none, agent-native, container)
 - `supports_resume`, `supports_json_output`
 - `capabilities`, `cost_class`, `resource_weight`, `max_concurrency`
 
-Specs are validated and reject secret-like `required_env` and invalid
-placeholders.
+Specs are validated and reject manager-only `required_env` entries and invalid
+placeholders. Provider key names such as `DEEPSEEK_API_KEY` are allowed as
+adapter env allowlist entries; manager credentials such as `GITHUB_TOKEN` are
+not.
 
 ## Built-in adapters
 
 | Id | Roles | Sandbox | Notes |
 | --- | --- | --- | --- |
+| `pi` | worker, reviewer | none | default Pi Coding Agent harness; prompt on stdin, JSON events on stdout |
 | `fake` | worker, reviewer | none | deterministic, used for fixtures |
 | `shell-command` | worker | agent-native | shell command adapter |
 | `custom` | worker, reviewer | agent-native | user-defined template |
@@ -37,6 +42,48 @@ List them with:
 ```bash
 hepa adapter list
 ```
+
+## Pi adapter
+
+Pi is the built-in default harness and namesake, not a hard requirement. It
+routes through the same adapter contract as every other adapter.
+
+```bash
+hepa adapter install pi
+hepa adapter doctor
+```
+
+The installer is explicit and version-pinned; HEPA never silently installs Pi
+from doctor. The built-in spec composes `pi -p --mode json --model ...`, feeds
+the prompt on stdin, captures stdout to the lane output artifact, and keeps
+stderr under the deterministic monitor.
+
+DeepSeek cloud:
+
+```bash
+export HEPA_DEFAULT_ADAPTER=pi
+export HEPA_PI_MODEL=deepseek/deepseek-chat
+export HEPA_PI_PROVIDER_KEY_ENV=DEEPSEEK_API_KEY
+export DEEPSEEK_API_KEY=...
+```
+
+Ollama local:
+
+```bash
+export HEPA_DEFAULT_ADAPTER=pi
+export HEPA_PI_MODEL=ollama/qwen2.5-coder
+export HEPA_PI_PROVIDER_KEY_ENV=
+export HEPA_PI_BASE_URL=http://127.0.0.1:11434/v1
+```
+
+Cost class is derived from the model/base URL/key surface: Ollama/loopback/no-key
+routes are local, while remote provider routes with keys are paid-cloud. The
+existing `local-only` routing policy and paid-lane caps enforce the result.
+
+Pi output is newline-delimited JSON events. HEPA parses `agent_end` for the final
+assistant message and tool activity; changed files are derived from `git status`
+in the lane worktree, not from Pi output. Malformed, truncated, or schema-drifted
+streams are explicit parse failures.
 
 ## Custom adapter requirements
 
@@ -71,3 +118,6 @@ hepa doctor           # aggregate adapter + kanban health
   required field (schema drift); fix the adapter output.
 - **Unavailable/unauthenticated** — install the CLI or complete authentication;
   adapter-specific routes get documented skips, not silent passes.
+
+CI uses deterministic fake `pi` binaries that emit canned `--mode json` events;
+no real network, model, or install is required for tests.

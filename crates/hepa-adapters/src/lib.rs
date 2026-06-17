@@ -7,6 +7,7 @@ pub mod external_worker;
 pub mod fake;
 pub mod interactive;
 pub mod local_worker;
+pub mod pi;
 pub mod registry;
 pub mod routing;
 pub mod shell_command;

@@ -35,6 +35,8 @@ impl HepaLocalWorkerAdapterTemplate {
             cost_class: HepaAdapterCostClass::Local,
             resource_weight: 1,
             max_concurrency: self.max_concurrency,
+            prompt_transport: crate::spec::HepaAdapterPromptTransport::PromptFile,
+            output_capture: crate::spec::HepaAdapterOutputCapture::AdapterFile,
         };
         spec.validate().map_err(HepaLocalWorkerAdapterError::from)?;
         Ok(spec)

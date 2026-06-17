@@ -410,6 +410,7 @@ fn known_hepa_adapter_flags(binary: &str) -> Option<BTreeSet<&'static str>> {
                 "--review",
             ]
         }
+        "pi" => vec!["--approve", "--mode", "--model", "--provider", "--tools"],
         _ => return None,
     };
     Some(flags.into_iter().collect())
@@ -759,6 +760,8 @@ mod tests {
                 cost_class: HepaAdapterCostClass::Local,
                 resource_weight: 1,
                 max_concurrency: 2,
+                prompt_transport: crate::spec::HepaAdapterPromptTransport::PromptFile,
+                output_capture: crate::spec::HepaAdapterOutputCapture::AdapterFile,
             })
             .expect("spec upsert");
         let output = format_adapter_list(&registry);

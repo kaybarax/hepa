@@ -44,6 +44,8 @@ impl HepaCustomAdapterTemplate {
             cost_class: self.cost_class,
             resource_weight: self.resource_weight,
             max_concurrency: self.max_concurrency,
+            prompt_transport: crate::spec::HepaAdapterPromptTransport::PromptFile,
+            output_capture: crate::spec::HepaAdapterOutputCapture::AdapterFile,
         };
         spec.validate().map_err(HepaCustomAdapterError::from)?;
         Ok(spec)
@@ -161,7 +163,7 @@ mod tests {
         .expect_err("manager credentials must fail");
 
         assert_eq!(error.field, "required_env[0]");
-        assert!(error.message.contains("secret-like"));
+        assert!(error.message.contains("manager-only"));
     }
 
     fn context() -> HepaAdapterTemplateContext {

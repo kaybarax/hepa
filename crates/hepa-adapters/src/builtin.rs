@@ -1,10 +1,11 @@
 use crate::spec::{
-    ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterMode, HepaAdapterRole,
-    HepaAdapterSandbox, HepaAdapterSpec,
+    ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterMode, HepaAdapterOutputCapture,
+    HepaAdapterPromptTransport, HepaAdapterRole, HepaAdapterSandbox, HepaAdapterSpec,
 };
 use std::collections::BTreeMap;
 
-pub const BUILTIN_ADAPTER_IDS: [&str; 7] = [
+pub const BUILTIN_ADAPTER_IDS: [&str; 8] = [
+    "pi",
     "fake",
     "shell-command",
     "custom",
@@ -14,11 +15,12 @@ pub const BUILTIN_ADAPTER_IDS: [&str; 7] = [
     "external-worker",
 ];
 
-pub const BUILTIN_ADAPTER_LIST_ORDER: [&str; 7] = [
+pub const BUILTIN_ADAPTER_LIST_ORDER: [&str; 8] = [
     "custom",
     "external-worker",
     "fake",
     "local-worker",
+    "pi",
     "shell-command",
     "user-reviewer",
     "user-worker",
@@ -54,6 +56,36 @@ pub fn builtin_adapter_spec(id: &str) -> HepaAdapterSpec {
             resource_weight: 1,
             max_concurrency: 64,
         }),
+        "pi" => HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi Coding Agent".to_string(),
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: "pi --approve --tools read,edit,write,bash,grep,find,ls -p --mode json --model deepseek/deepseek-chat".to_string(),
+            review_command: Some(
+                "pi --approve --tools read,edit,write,bash,grep,find,ls -p --mode json --model deepseek/deepseek-chat".to_string(),
+            ),
+            workdir: "{worktree}".to_string(),
+            required_commands: vec!["pi".to_string()],
+            required_env: vec!["DEEPSEEK_API_KEY".to_string()],
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec![
+                "frontend".to_string(),
+                "backend".to_string(),
+                "refactor".to_string(),
+                "docs".to_string(),
+                "review".to_string(),
+                "local-only".to_string(),
+            ],
+            cost_class: HepaAdapterCostClass::PaidCloud,
+            resource_weight: 1,
+            max_concurrency: 2,
+            prompt_transport: HepaAdapterPromptTransport::PromptArg,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        },
         "shell-command" => spec(AdapterSpecTemplate {
             id: "shell-command",
             display_name: "Shell Command Adapter",
@@ -226,6 +258,8 @@ fn spec(template: AdapterSpecTemplate<'_>) -> HepaAdapterSpec {
         cost_class: template.cost_class,
         resource_weight: template.resource_weight,
         max_concurrency: template.max_concurrency,
+        prompt_transport: HepaAdapterPromptTransport::PromptFile,
+        output_capture: HepaAdapterOutputCapture::AdapterFile,
     }
 }
 
@@ -247,7 +281,9 @@ mod tests {
         for spec in specs.values() {
             spec.validate().expect("built-in spec should validate");
             assert!(
-                spec.required_env.is_empty(),
+                !spec.required_env.iter().any(|key| key == "GITHUB_TOKEN"
+                    || key.starts_with("HEPA_MANAGER_")
+                    || key.starts_with("MANAGER_")),
                 "built-ins must not require manager credentials"
             );
         }

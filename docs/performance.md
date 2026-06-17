@@ -19,6 +19,16 @@ Every run records timing telemetry: per-phase durations and counters for agent
 loops, manager passes, worker-profile LLM calls, reviewer passes, install
 events, and container count, plus the active sandbox posture.
 
+## Pi runs
+
+Pi is the default one-loop harness. HEPA invokes `pi -p --mode json --model ...`
+once per worker or reviewer attempt, feeds the prompt on stdin, and captures the
+JSON event stream from stdout into the lane artifact. DeepSeek and other cloud
+routes count as paid-cloud lanes; Ollama/loopback/no-key routes count as local
+lanes and can satisfy `local-only` projects. Container count remains zero for
+trusted host-worktree runs and becomes one only when container mode is required,
+such as untrusted projects.
+
 ## Targets
 
 Validated against the Phase 0.4 HOCA reference baseline on the same task and

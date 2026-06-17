@@ -14,6 +14,7 @@ pub struct HepaConfig {
     pub notification: HepaNotificationConfig,
     pub default_adapter: String,
     pub routing_file: String,
+    pub pi: HepaPiConfig,
     pub hermes: HepaHermesBridgeConfig,
 }
 
@@ -29,6 +30,7 @@ impl Default for HepaConfig {
             notification: HepaNotificationConfig::default(),
             default_adapter: "fake".to_string(),
             routing_file: ".hepa/routing.yaml".to_string(),
+            pi: HepaPiConfig::default(),
             hermes: HepaHermesBridgeConfig::default(),
         }
     }
@@ -78,6 +80,7 @@ impl HepaConfig {
         self.notification.validate()?;
         require_single_line("default_adapter", &self.default_adapter)?;
         require_single_line("routing_file", &self.routing_file)?;
+        self.pi.validate()?;
         self.hermes.validate()?;
         Ok(())
     }
@@ -96,6 +99,12 @@ impl HepaConfig {
             },
             default_adapter: self.default_adapter.clone(),
             routing_file: "<ROUTING_FILE>".to_string(),
+            pi: HepaPiDiagnostics {
+                model: self.pi.model.clone(),
+                review_model_configured: self.pi.review_model.is_some(),
+                provider_key_env_configured: self.pi.provider_key_env.is_some(),
+                base_url_configured: self.pi.base_url.is_some(),
+            },
             hermes: HepaHermesBridgeDiagnostics {
                 enabled: self.hermes.enabled,
                 endpoint_configured: self.hermes.endpoint.is_some(),
@@ -103,6 +112,41 @@ impl HepaConfig {
                 sync_interval_seconds: self.hermes.sync_interval_seconds,
             },
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaPiConfig {
+    pub model: String,
+    pub review_model: Option<String>,
+    pub provider_key_env: Option<String>,
+    pub base_url: Option<String>,
+}
+
+impl Default for HepaPiConfig {
+    fn default() -> Self {
+        Self {
+            model: "deepseek/deepseek-chat".to_string(),
+            review_model: None,
+            provider_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            base_url: None,
+        }
+    }
+}
+
+impl HepaPiConfig {
+    fn validate(&self) -> Result<(), HepaConfigError> {
+        require_single_line("pi.model", &self.model)?;
+        if let Some(review_model) = &self.review_model {
+            require_single_line("pi.review_model", review_model)?;
+        }
+        if let Some(provider_key_env) = &self.provider_key_env {
+            require_single_line("pi.provider_key_env", provider_key_env)?;
+        }
+        if let Some(base_url) = &self.base_url {
+            require_single_line("pi.base_url", base_url)?;
+        }
+        Ok(())
     }
 }
 
@@ -173,7 +217,16 @@ pub struct HepaConfigDiagnostics {
     pub notification: HepaNotificationDiagnostics,
     pub default_adapter: String,
     pub routing_file: String,
+    pub pi: HepaPiDiagnostics,
     pub hermes: HepaHermesBridgeDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaPiDiagnostics {
+    pub model: String,
+    pub review_model_configured: bool,
+    pub provider_key_env_configured: bool,
+    pub base_url_configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +254,10 @@ pub struct HepaConfigOverrides {
     pub notification_command: Option<Option<String>>,
     pub default_adapter: Option<String>,
     pub routing_file: Option<String>,
+    pub pi_model: Option<String>,
+    pub pi_review_model: Option<Option<String>>,
+    pub pi_provider_key_env: Option<Option<String>>,
+    pub pi_base_url: Option<Option<String>>,
     pub hermes_enabled: Option<bool>,
     pub hermes_endpoint: Option<Option<String>>,
     pub hermes_board_id: Option<Option<String>>,
@@ -266,6 +323,10 @@ fn apply_values(
             }
             "HEPA_DEFAULT_ADAPTER" => config.default_adapter = value.clone(),
             "HEPA_ROUTING_FILE" => config.routing_file = value.clone(),
+            "HEPA_PI_MODEL" => config.pi.model = value.clone(),
+            "HEPA_PI_REVIEW_MODEL" => config.pi.review_model = parse_optional(value),
+            "HEPA_PI_PROVIDER_KEY_ENV" => config.pi.provider_key_env = parse_optional(value),
+            "HEPA_PI_BASE_URL" => config.pi.base_url = parse_optional(value),
             "HEPA_HERMES_ENABLED" => {
                 config.hermes.enabled = parse_bool(key, value)?;
             }
@@ -311,6 +372,18 @@ fn apply_overrides(config: &mut HepaConfig, overrides: HepaConfigOverrides) {
     }
     if let Some(value) = overrides.routing_file {
         config.routing_file = value;
+    }
+    if let Some(value) = overrides.pi_model {
+        config.pi.model = value;
+    }
+    if let Some(value) = overrides.pi_review_model {
+        config.pi.review_model = value;
+    }
+    if let Some(value) = overrides.pi_provider_key_env {
+        config.pi.provider_key_env = value;
+    }
+    if let Some(value) = overrides.pi_base_url {
+        config.pi.base_url = value;
     }
     if let Some(value) = overrides.hermes_enabled {
         config.hermes.enabled = value;
@@ -446,6 +519,11 @@ mod tests {
         assert!(config.notification.terminal_enabled);
         assert_eq!(config.default_adapter, "fake");
         assert_eq!(config.routing_file, ".hepa/routing.yaml");
+        assert_eq!(config.pi.model, "deepseek/deepseek-chat");
+        assert_eq!(
+            config.pi.provider_key_env.as_deref(),
+            Some("DEEPSEEK_API_KEY")
+        );
         assert!(config.hermes.enabled);
     }
 
@@ -456,6 +534,8 @@ mod tests {
             HEPA_MAX_TOTAL_ROUNDS=4
             HEPA_NOTIFY_TERMINAL=false
             HEPA_DEFAULT_ADAPTER=dotenv-worker
+            HEPA_PI_MODEL=ollama/qwen2.5-coder
+            HEPA_PI_PROVIDER_KEY_ENV=
             HEPA_HERMES_ENDPOINT="http://hermes.invalid"
         "#;
         let environment = BTreeMap::from([
@@ -478,6 +558,8 @@ mod tests {
         assert_eq!(config.max_repair_rounds, 5);
         assert!(!config.notification.terminal_enabled);
         assert_eq!(config.default_adapter, "cli-worker");
+        assert_eq!(config.pi.model, "ollama/qwen2.5-coder");
+        assert_eq!(config.pi.provider_key_env, None);
         assert!(!config.hermes.enabled);
         assert_eq!(
             config.hermes.endpoint.as_deref(),
@@ -538,6 +620,12 @@ mod tests {
                 command: Some("notify --target PRIVATE_DESTINATION".to_string()),
             },
             routing_file: "PRIVATE_ROOT/routing.yaml".to_string(),
+            pi: HepaPiConfig {
+                model: "deepseek/deepseek-chat".to_string(),
+                review_model: Some("deepseek/deepseek-chat".to_string()),
+                provider_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+                base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            },
             hermes: HepaHermesBridgeConfig {
                 enabled: true,
                 endpoint: Some("https://hermes.invalid/team".to_string()),
@@ -554,10 +642,16 @@ mod tests {
         assert_eq!(diagnostics.worktree_root, "<WORKTREE_ROOT>");
         assert_eq!(diagnostics.archive_root, "<ARCHIVE_ROOT>");
         assert_eq!(diagnostics.routing_file, "<ROUTING_FILE>");
+        assert_eq!(diagnostics.pi.model, "deepseek/deepseek-chat");
+        assert!(diagnostics.pi.review_model_configured);
+        assert!(diagnostics.pi.provider_key_env_configured);
+        assert!(diagnostics.pi.base_url_configured);
         assert!(diagnostics.notification.command_configured);
         assert!(diagnostics.hermes.endpoint_configured);
         assert!(diagnostics.hermes.board_id_configured);
         assert!(!json.contains("PRIVATE_ROOT"));
+        assert!(!json.contains("127.0.0.1"));
+        assert!(!json.contains("DEEPSEEK_API_KEY"));
         assert!(!json.contains("PRIVATE_DESTINATION"));
         assert!(!json.contains("hermes.invalid"));
         assert!(!json.contains("board-private"));

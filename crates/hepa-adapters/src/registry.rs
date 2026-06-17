@@ -1,4 +1,4 @@
-use crate::{builtin::builtin_adapter_specs, spec::HepaAdapterSpec};
+use crate::{builtin::builtin_adapter_specs, pi::adapter_spec_from_config, spec::HepaAdapterSpec};
 use hepa_core::config::HepaConfig;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -33,7 +33,14 @@ pub struct HepaAdapterRegistry {
 
 impl HepaAdapterRegistry {
     pub fn load_from_config(config: &HepaConfig) -> Result<Self, HepaAdapterRegistryError> {
-        Self::load(Path::new(&config.control_root).join("adapters/registry.json"))
+        let mut registry =
+            Self::load(Path::new(&config.control_root).join("adapters/registry.json"))?;
+        registry
+            .document
+            .adapters
+            .insert("pi".to_string(), adapter_spec_from_config(&config.pi));
+        validate_document(&registry.document)?;
+        Ok(registry)
     }
 
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, HepaAdapterRegistryError> {
@@ -242,12 +249,39 @@ mod tests {
                 .map(|spec| spec.cost_class.clone()),
             Some(HepaAdapterCostClass::Local)
         );
-        assert!(
-            registry
-                .list()
-                .into_iter()
-                .all(|spec| spec.required_env.is_empty())
-        );
+        assert!(registry.list().into_iter().all(|spec| {
+            !spec.required_env.iter().any(|key| {
+                key == "GITHUB_TOKEN"
+                    || key.starts_with("HEPA_MANAGER_")
+                    || key.starts_with("MANAGER_")
+            })
+        }));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn registry_derives_pi_spec_from_model_config() {
+        let root = unique_test_dir("pi-config");
+        let config = HepaConfig::load(
+            Some(
+                r#"
+                HEPA_PI_MODEL=ollama/qwen2.5-coder
+                HEPA_PI_PROVIDER_KEY_ENV=
+                HEPA_PI_BASE_URL=http://127.0.0.1:11434/v1
+                "#,
+            ),
+            &BTreeMap::new(),
+            HepaConfigOverrides::isolated_temp_root(root.to_string_lossy()),
+        )
+        .expect("config should load");
+        let registry = HepaAdapterRegistry::load_from_config(&config).expect("registry loads");
+        let pi = registry.get("pi").expect("pi adapter");
+
+        assert!(pi.command.contains("--provider ollama"));
+        assert!(pi.command.contains("--model qwen2.5-coder"));
+        assert_eq!(pi.required_env, Vec::<String>::new());
+        assert_eq!(pi.cost_class, HepaAdapterCostClass::Local);
 
         remove_test_dir(root);
     }
@@ -302,6 +336,8 @@ mod tests {
             cost_class: HepaAdapterCostClass::Local,
             resource_weight: 1,
             max_concurrency: 1,
+            prompt_transport: crate::spec::HepaAdapterPromptTransport::PromptFile,
+            output_capture: crate::spec::HepaAdapterOutputCapture::AdapterFile,
         }
     }
 

@@ -4,6 +4,7 @@ mod run;
 use hepa_adapters::{
     doctor::{HepaAdapterDoctorReport, HepaSystemAdapterDoctorProbe, format_adapter_list},
     interactive::{HepaLaneSteeringRequest, HepaSystemTmux, HepaTmux, HepaTmuxInteractiveLauncher},
+    pi::HepaPiInstallPlan,
     registry::HepaAdapterRegistry,
 };
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
@@ -113,6 +114,9 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                 HepaAdapterDoctorReport::from_registry(&registry, &HepaSystemAdapterDoctorProbe);
             Ok(report.to_redacted_summary())
         }
+        [command, subcommand, adapter_id] if command == "adapter" && subcommand == "install" => {
+            install_adapter(adapter_id)
+        }
         [command, ..] if command == "adapter" => Err("unknown adapter command".to_string()),
         [command, subcommand, path] if command == "spec" && subcommand == "import" => {
             let text = std::fs::read_to_string(path)
@@ -186,7 +190,7 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
         [command, repo_path, task_text, flags @ ..] if command == "run" => {
             let options = parse_run_options(flags)?;
             let repo_path = std::path::PathBuf::from(repo_path);
-            let result = run::run_fake_task(&run::HepaFakeRunConfig {
+            let run_config = run::HepaFakeRunConfig {
                 control_root: repo_path.join(".hepa/control"),
                 worktree_root: repo_path.join(".hepa/worktrees"),
                 archive_root: repo_path.join(".hepa/archive"),
@@ -196,7 +200,12 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                 lane_id: "lane-cli-fake".to_string(),
                 task_text: task_text.clone(),
                 timing: options.timing,
-            })?;
+            };
+            let result = if options.agent == "pi" {
+                run::run_live_task(&run_config, "pi")?
+            } else {
+                run::run_fake_task(&run_config)?
+            };
             if options.timing {
                 Ok(format_timing_summary(&result.timing))
             } else {
@@ -209,6 +218,32 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
         }
         [command, ..] if command == "run" => Err("unknown run command".to_string()),
         _ => Err("unknown command".to_string()),
+    }
+}
+
+fn install_adapter(adapter_id: &str) -> Result<String, String> {
+    if adapter_id != "pi" {
+        return Err(format!("no built-in installer for adapter {adapter_id}"));
+    }
+    let plan = HepaPiInstallPlan::npm_global();
+    let mut command = std::process::Command::new(&plan.command[0]);
+    command.args(&plan.command[1..]);
+    let output = command
+        .output()
+        .map_err(|error| format!("{}; failed to start installer: {error}", plan.action_line()))?;
+    if output.status.success() {
+        Ok(format!(
+            "{}\nHEPA adapter install pi: ok",
+            plan.action_line()
+        ))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "{}; installer failed with status {:?}: {}",
+            plan.action_line(),
+            output.status.code(),
+            stderr.trim()
+        ))
     }
 }
 

@@ -22,6 +22,10 @@ pub struct HepaAdapterSpec {
     pub cost_class: HepaAdapterCostClass,
     pub resource_weight: u32,
     pub max_concurrency: u32,
+    #[serde(default)]
+    pub prompt_transport: HepaAdapterPromptTransport,
+    #[serde(default)]
+    pub output_capture: HepaAdapterOutputCapture,
 }
 
 impl HepaAdapterSpec {
@@ -49,7 +53,7 @@ impl HepaAdapterSpec {
         require_string_list("required_commands", &self.required_commands)?;
         reject_secret_like_list("required_commands", &self.required_commands)?;
         require_string_list("required_env", &self.required_env)?;
-        reject_secret_like_list("required_env", &self.required_env)?;
+        reject_manager_env_list("required_env", &self.required_env)?;
         require_string_list("capabilities", &self.capabilities)?;
         if self.resource_weight == 0 {
             return Err(HepaAdapterSpecError::new(
@@ -62,6 +66,11 @@ impl HepaAdapterSpec {
                 "max_concurrency",
                 "must be greater than zero",
             ));
+        }
+        if self.output_capture == HepaAdapterOutputCapture::Stdout
+            && !template_uses_role_output(&self.command, self.review_command.as_deref())
+        {
+            // Stdout capture intentionally does not require an output placeholder.
         }
         Ok(())
     }
@@ -246,6 +255,21 @@ fn reject_secret_like_list(field: &str, values: &[String]) -> Result<(), HepaAda
     Ok(())
 }
 
+fn reject_manager_env_list(field: &str, values: &[String]) -> Result<(), HepaAdapterSpecError> {
+    for (index, value) in values.iter().enumerate() {
+        if value == "GITHUB_TOKEN"
+            || value.starts_with("HEPA_MANAGER_")
+            || value.starts_with("MANAGER_")
+        {
+            return Err(HepaAdapterSpecError::new(
+                format!("{field}[{index}]"),
+                "must not contain manager-only credentials",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn reject_secret_like(field: impl Into<String>, value: &str) -> Result<(), HepaAdapterSpecError> {
     let lowered = value.to_ascii_lowercase();
     let github_token_prefix = ["ghp", "_"].concat();
@@ -304,6 +328,28 @@ pub enum HepaAdapterCostClass {
     Local,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HepaAdapterPromptTransport {
+    #[default]
+    PromptFile,
+    Stdin,
+    PromptArg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HepaAdapterOutputCapture {
+    #[default]
+    AdapterFile,
+    Stdout,
+}
+
+fn template_uses_role_output(command: &str, review_command: Option<&str>) -> bool {
+    command.contains("{output_file}")
+        || review_command.is_some_and(|value| value.contains("{review_output_file}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +378,8 @@ mod tests {
             cost_class: HepaAdapterCostClass::PaidCloud,
             resource_weight: 1,
             max_concurrency: 2,
+            prompt_transport: HepaAdapterPromptTransport::PromptFile,
+            output_capture: HepaAdapterOutputCapture::AdapterFile,
         };
 
         let json = serde_json::to_string(&spec).expect("adapter spec should serialize");
@@ -421,6 +469,8 @@ mod tests {
             cost_class: HepaAdapterCostClass::Local,
             resource_weight: 1,
             max_concurrency: 1,
+            prompt_transport: HepaAdapterPromptTransport::PromptFile,
+            output_capture: HepaAdapterOutputCapture::AdapterFile,
         };
 
         let worker_error = spec
@@ -454,6 +504,8 @@ mod tests {
             cost_class: HepaAdapterCostClass::PaidCloud,
             resource_weight: 1,
             max_concurrency: 2,
+            prompt_transport: HepaAdapterPromptTransport::PromptFile,
+            output_capture: HepaAdapterOutputCapture::AdapterFile,
         };
         spec.max_concurrency = 0;
 
@@ -483,6 +535,8 @@ mod tests {
             cost_class: HepaAdapterCostClass::PaidCloud,
             resource_weight: 1,
             max_concurrency: 2,
+            prompt_transport: HepaAdapterPromptTransport::PromptFile,
+            output_capture: HepaAdapterOutputCapture::AdapterFile,
         };
 
         let error = spec.validate().expect_err("unknown placeholders must fail");
@@ -492,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_like_adapter_spec_values_are_rejected() {
+    fn manager_env_adapter_spec_values_are_rejected() {
         let secret_env_name = ["GITHUB", "TOKEN"].join("_");
         let spec = HepaAdapterSpec {
             schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
@@ -512,13 +566,41 @@ mod tests {
             cost_class: HepaAdapterCostClass::PaidCloud,
             resource_weight: 1,
             max_concurrency: 2,
+            prompt_transport: HepaAdapterPromptTransport::PromptFile,
+            output_capture: HepaAdapterOutputCapture::AdapterFile,
         };
 
-        let error = spec
-            .validate()
-            .expect_err("secret-like env names must fail");
+        let error = spec.validate().expect_err("manager env names must fail");
 
         assert_eq!(error.field, "required_env[0]");
-        assert!(error.message.contains("secret-like"));
+        assert!(error.message.contains("manager-only"));
+    }
+
+    #[test]
+    fn provider_key_env_names_are_allowed_for_worker_adapters() {
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi".to_string(),
+            roles: vec![HepaAdapterRole::Worker],
+            mode: HepaAdapterMode::Oneshot,
+            command: "pi -p --mode json".to_string(),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: vec!["pi".to_string()],
+            required_env: vec!["DEEPSEEK_API_KEY".to_string()],
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec!["docs".to_string()],
+            cost_class: HepaAdapterCostClass::PaidCloud,
+            resource_weight: 1,
+            max_concurrency: 2,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        };
+
+        spec.validate()
+            .expect("provider key names are adapter env allowlist entries");
     }
 }

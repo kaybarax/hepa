@@ -1,9 +1,13 @@
-use crate::spec::{HepaAdapterMode, HepaAdapterRole, HepaAdapterSpec, HepaAdapterTemplateContext};
+use crate::spec::{
+    HepaAdapterMode, HepaAdapterOutputCapture, HepaAdapterPromptTransport, HepaAdapterRole,
+    HepaAdapterSpec, HepaAdapterTemplateContext,
+};
 use hepa_core::monitor::{HepaMonitorPolicy, HepaMonitorStop, HepaMonitorStopKind};
 use std::{
     collections::BTreeMap,
     error::Error,
     fmt, fs,
+    io::Read,
     path::PathBuf,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -70,6 +74,10 @@ impl HepaOneshotAdapterExecutor {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| HepaAdapterExecutionError::new("command", "must not be empty"))?;
+        let mut args = args.to_vec();
+        if invocation.spec.prompt_transport == HepaAdapterPromptTransport::PromptArg {
+            args.push(invocation.prompt.clone());
+        }
         let workdir = rendered_workdir(invocation)?;
         if !workdir.is_dir() {
             return Err(HepaAdapterExecutionError::new(
@@ -77,19 +85,45 @@ impl HepaOneshotAdapterExecutor {
                 "lane worktree must exist before adapter launch",
             ));
         }
-        write_prompt_file(invocation)?;
+        if invocation.spec.prompt_transport == HepaAdapterPromptTransport::PromptFile {
+            write_prompt_file(invocation)?;
+        }
 
         let filtered_env = filtered_environment(invocation);
         let mut child = Command::new(program);
-        child.args(args).current_dir(&workdir).env_clear().envs(
+        child.args(&args).current_dir(&workdir).env_clear().envs(
             filtered_env
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
         child.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = child.spawn().map_err(|error| {
+        if invocation.spec.prompt_transport == HepaAdapterPromptTransport::Stdin {
+            child.stdin(Stdio::piped());
+        }
+        let mut child = child.spawn().map_err(|error| {
             HepaAdapterExecutionError::new("command", format!("failed to spawn adapter: {error}"))
         })?;
+        if invocation.spec.prompt_transport == HepaAdapterPromptTransport::Stdin {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                HepaAdapterExecutionError::new("stdin", "failed to open adapter stdin")
+            })?;
+            stdin
+                .write_all(invocation.prompt.as_bytes())
+                .map_err(|error| {
+                    HepaAdapterExecutionError::new(
+                        "stdin",
+                        format!("failed to write prompt to adapter stdin: {error}"),
+                    )
+                })?;
+            stdin.flush().map_err(|error| {
+                HepaAdapterExecutionError::new(
+                    "stdin",
+                    format!("failed to flush prompt to adapter stdin: {error}"),
+                )
+            })?;
+            drop(stdin);
+        }
         let output = wait_with_monitor(child, &invocation.monitor_policy)?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -98,6 +132,9 @@ impl HepaOneshotAdapterExecutor {
             .check_output(&stdout)
             .and_then(|_| invocation.monitor_policy.check_output(&stderr))
             .map_err(monitor_error)?;
+        if invocation.spec.output_capture == HepaAdapterOutputCapture::Stdout {
+            write_output_artifact(invocation, &stdout)?;
+        }
 
         Ok(HepaOneshotAdapterResult {
             adapter_id: invocation.spec.id.clone(),
@@ -110,6 +147,27 @@ impl HepaOneshotAdapterExecutor {
             stderr,
         })
     }
+}
+
+fn write_output_artifact(
+    invocation: &HepaOneshotAdapterInvocation,
+    output: &str,
+) -> Result<(), HepaAdapterExecutionError> {
+    let output_path = match invocation.role {
+        HepaAdapterRole::Worker => PathBuf::from(&invocation.context.output_file),
+        HepaAdapterRole::Reviewer => PathBuf::from(&invocation.context.review_output_file),
+    };
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            HepaAdapterExecutionError::new(
+                "output_file",
+                format!("failed to create parent: {error}"),
+            )
+        })?;
+    }
+    fs::write(&output_path, output).map_err(|error| {
+        HepaAdapterExecutionError::new("output_file", format!("failed to write output: {error}"))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,25 +207,59 @@ fn wait_with_monitor(
     mut child: std::process::Child,
     policy: &HepaMonitorPolicy,
 ) -> Result<std::process::Output, HepaAdapterExecutionError> {
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        HepaAdapterExecutionError::new("stdout", "failed to capture adapter stdout")
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        HepaAdapterExecutionError::new("stderr", "failed to capture adapter stderr")
+    })?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
     let started_at = Instant::now();
     loop {
-        if child
+        if let Some(status) = child
             .try_wait()
             .map_err(|error| HepaAdapterExecutionError::new("command", error.to_string()))?
-            .is_some()
         {
-            return child.wait_with_output().map_err(|error| {
-                HepaAdapterExecutionError::new("command", format!("failed to read output: {error}"))
+            let stdout = join_output_reader("stdout", stdout_reader)?;
+            let stderr = join_output_reader("stderr", stderr_reader)?;
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
             });
         }
         let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         if let Err(stop) = policy.check_elapsed(elapsed_ms) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = join_output_reader("stdout", stdout_reader);
+            let _ = join_output_reader("stderr", stderr_reader);
             return Err(monitor_error(stop));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn join_output_reader(
+    stream: &'static str,
+    reader: std::thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+) -> Result<Vec<u8>, HepaAdapterExecutionError> {
+    reader
+        .join()
+        .map_err(|_| HepaAdapterExecutionError::new(stream, "reader thread panicked"))?
+        .map_err(|error| {
+            HepaAdapterExecutionError::new(
+                stream,
+                format!("failed to read adapter {stream}: {error}"),
+            )
+        })
 }
 
 fn write_prompt_file(
@@ -245,6 +337,9 @@ fn rendered_workdir(
 
 fn filtered_environment(invocation: &HepaOneshotAdapterInvocation) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
+    if let Ok(path) = std::env::var("PATH") {
+        env.insert("PATH".to_string(), path);
+    }
     env.insert("HEPA_ADAPTER_ID".to_string(), invocation.spec.id.clone());
     env.insert(
         "HEPA_ADAPTER_ROLE".to_string(),
@@ -255,6 +350,11 @@ fn filtered_environment(invocation: &HepaOneshotAdapterInvocation) -> BTreeMap<S
             continue;
         }
         if let Some(value) = invocation.environment.get(key) {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    for (key, value) in &invocation.environment {
+        if key.starts_with("PI_") {
             env.insert(key.clone(), value.clone());
         }
     }
@@ -326,7 +426,10 @@ fn split_command_line(command: &str) -> Result<Vec<String>, HepaAdapterExecution
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterSandbox};
+    use crate::spec::{
+        ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterOutputCapture,
+        HepaAdapterPromptTransport, HepaAdapterSandbox,
+    };
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -387,7 +490,8 @@ printf 'worker stderr' >&2
             vec![
                 "ALLOWED_CONTEXT".to_string(),
                 "HEPA_ADAPTER_ID".to_string(),
-                "HEPA_ADAPTER_ROLE".to_string()
+                "HEPA_ADAPTER_ROLE".to_string(),
+                "PATH".to_string()
             ]
         );
 
@@ -534,11 +638,7 @@ env | sort > "$2"
                     vec![role.clone()],
                     command.clone(),
                     Some(command),
-                    vec![
-                        "ALLOWED_CONTEXT".to_string(),
-                        "MANAGER_ONLY_CONTEXT".to_string(),
-                        "HEPA_MANAGER_SESSION".to_string(),
-                    ],
+                    vec!["ALLOWED_CONTEXT".to_string()],
                 ),
                 role: role.clone(),
                 context: template_context(&worktree, &artifact_dir, &output_file),
@@ -636,6 +736,153 @@ cat "$prompt_file" >> "$output_file"
         );
         assert!(capture.contains("Implement the fixture task"));
         assert!(!result.command.contains("Implement the fixture task"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_can_feed_prompt_to_stdin_and_capture_stdout_artifact() {
+        let root = unique_test_dir("stdin-stdout");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("pi");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+prompt="$(cat)"
+printf '{"type":"session","cwd":"%s"}\n' "$(pwd)"
+printf '{"type":"agent_end","message":{"content":"%s"}}\n' "$prompt"
+printf 'fake pi stderr' >&2
+"#,
+        );
+        let output_file = artifact_dir.join("pi-events.jsonl");
+        let mut spec = adapter_spec(
+            "pi",
+            vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            format!("{} -p --mode json", script.display()),
+            Some(format!("{} -p --mode json", script.display())),
+            Vec::new(),
+        );
+        spec.prompt_transport = HepaAdapterPromptTransport::Stdin;
+        spec.output_capture = HepaAdapterOutputCapture::Stdout;
+        let invocation = HepaOneshotAdapterInvocation {
+            spec,
+            role: HepaAdapterRole::Worker,
+            context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "Worker prompt through stdin".to_string(),
+            environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy::default(),
+        };
+
+        let result = HepaOneshotAdapterExecutor::new()
+            .run(&invocation)
+            .expect("stdin/stdout adapter should run");
+        let artifact = fs::read_to_string(&output_file).expect("stdout artifact exists");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stderr.contains("fake pi stderr"));
+        assert!(artifact.contains("Worker prompt through stdin"));
+        assert!(!PathBuf::from(&invocation.context.prompt_file).exists());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_can_pass_prompt_as_single_command_argument() {
+        let root = unique_test_dir("prompt-arg");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("prompt-arg-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' "$#" > "$1"
+printf '%s\n' "$2" >> "$1"
+"#,
+        );
+        let output_file = artifact_dir.join("prompt-arg.txt");
+        let mut spec = adapter_spec(
+            "prompt-arg",
+            vec![HepaAdapterRole::Worker],
+            format!("{} {}", script.display(), output_file.display()),
+            None,
+            Vec::new(),
+        );
+        spec.prompt_transport = HepaAdapterPromptTransport::PromptArg;
+        let invocation = HepaOneshotAdapterInvocation {
+            spec,
+            role: HepaAdapterRole::Worker,
+            context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "Prompt with spaces and {literal braces}".to_string(),
+            environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy::default(),
+        };
+
+        let result = HepaOneshotAdapterExecutor::new()
+            .run(&invocation)
+            .expect("prompt-arg adapter should run");
+        let capture = fs::read_to_string(&output_file).expect("prompt arg capture");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(capture.starts_with("2\n"));
+        assert!(capture.contains("Prompt with spaces and {literal braces}"));
+        assert!(!result.command.contains("Prompt with spaces"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_drains_large_stdout_while_adapter_is_running() {
+        let root = unique_test_dir("large-stdout");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("chatty-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+i=0
+while [ "$i" -lt 12000 ]; do
+  printf '{"type":"message_update","chunk":"%064d"}\n' "$i"
+  i=$((i + 1))
+done
+printf '{"type":"agent_end","messages":[]}\n'
+"#,
+        );
+        let output_file = artifact_dir.join("chatty.jsonl");
+        let mut spec = adapter_spec(
+            "chatty",
+            vec![HepaAdapterRole::Worker],
+            format!("{} ignored", script.display()),
+            None,
+            Vec::new(),
+        );
+        spec.output_capture = HepaAdapterOutputCapture::Stdout;
+        let invocation = HepaOneshotAdapterInvocation {
+            spec,
+            role: HepaAdapterRole::Worker,
+            context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "large stdout should not deadlock".to_string(),
+            environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy {
+                timeout_ms: Some(5_000),
+                ..HepaMonitorPolicy::default()
+            },
+        };
+
+        let result = HepaOneshotAdapterExecutor::new()
+            .run(&invocation)
+            .expect("chatty adapter should not deadlock");
+        let artifact = fs::read_to_string(output_file).expect("chatty stdout artifact");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(artifact.contains("\"agent_end\""));
+        assert!(artifact.len() > 1_000_000);
 
         remove_test_dir(root);
     }
@@ -747,6 +994,8 @@ esac
             cost_class: HepaAdapterCostClass::Local,
             resource_weight: 1,
             max_concurrency: 1,
+            prompt_transport: crate::spec::HepaAdapterPromptTransport::PromptFile,
+            output_capture: crate::spec::HepaAdapterOutputCapture::AdapterFile,
         }
     }
 

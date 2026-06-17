@@ -34,6 +34,8 @@ impl HepaUserReviewerAdapterTemplate {
             cost_class: HepaAdapterCostClass::PaidCloud,
             resource_weight: 1,
             max_concurrency: self.max_concurrency,
+            prompt_transport: crate::spec::HepaAdapterPromptTransport::PromptFile,
+            output_capture: crate::spec::HepaAdapterOutputCapture::AdapterFile,
         };
         spec.validate()
             .map_err(HepaUserReviewerAdapterError::from)?;
@@ -117,7 +119,7 @@ mod tests {
         .expect_err("manager-only env must fail");
 
         assert_eq!(error.field, "required_env[0]");
-        assert!(error.message.contains("secret-like"));
+        assert!(error.message.contains("manager-only"));
     }
 
     #[test]

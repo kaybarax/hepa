@@ -1,5 +1,6 @@
 use hepa_adapters::builtin::{BUILTIN_ADAPTER_IDS, builtin_adapter_spec};
 use hepa_adapters::container::unrestricted_bypass_flag;
+use hepa_adapters::doctor::unsupported_hepa_flags;
 use hepa_adapters::spec::HepaAdapterRole;
 use hepa_core::env_allowlist::{HepaEnvAllowlist, HepaEnvRole, MANAGER_ONLY_CREDENTIALS};
 use std::collections::BTreeMap;
@@ -64,4 +65,17 @@ fn no_builtin_adapter_command_uses_bypass_flags() {
             );
         }
     }
+}
+
+#[test]
+fn pi_command_boundary_rejects_bypass_flags() {
+    let mut spec = builtin_adapter_spec("pi");
+    assert_eq!(unsupported_hepa_flags(&spec.command), Vec::<String>::new());
+
+    spec.command.push_str(" --no-sandbox");
+
+    assert_eq!(
+        unsupported_hepa_flags(&spec.command),
+        vec!["--no-sandbox".to_string()]
+    );
 }

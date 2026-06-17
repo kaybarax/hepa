@@ -65,20 +65,25 @@ hepa scheduler start
 hepa scheduler status
 hepa fleet status
 
-# Run one task with the fake adapter (safe defaults).
+# Run one task with the fake adapter (test-safe defaults).
 hepa run /path/to/repo "Fix login redirect" --agent fake
 
 # Inspect adapters and overall health.
 hepa adapter list
 hepa doctor
+
+# Install and use the default Pi harness.
+hepa adapter install pi
+export HEPA_DEFAULT_ADAPTER=pi
+export HEPA_PI_MODEL=deepseek/deepseek-chat
+export DEEPSEEK_API_KEY=...
+hepa run /path/to/repo "Fix login redirect" --agent pi
 ```
 
-> **Pi default harness — in progress (Phase P).** The Pi adapter (install via
-> `hepa adapter install pi`, run with `--agent pi`, pointed at DeepSeek or a
-> local Ollama model) is the planned batteries-included default. It is specified
-> in `hepa-pi-integration-design.md` and tracked as Phase P; until it lands, use
-> the fake adapter or a configured CLI adapter. The commands above reflect what
-> ships today.
+For a local Ollama route, set `HEPA_PI_MODEL=ollama/<model>`,
+`HEPA_PI_PROVIDER_KEY_ENV=`, and optionally `HEPA_PI_BASE_URL` to your loopback
+endpoint. Local Pi routes derive `cost_class=local`, so they satisfy
+`local-only` routing policy.
 
 Fleet commands accept `--control-root <path>` to target an isolated control
 root (used throughout the test suite).
@@ -92,15 +97,14 @@ changing authoritative state. See [docs/hermes-kanban.md](docs/hermes-kanban.md)
 
 ## Adapter Setup and Routing
 
-The **Pi adapter** is the planned batteries-included default harness (Phase P):
-once it lands, `hepa adapter install pi` installs it and you route it to any
-model — DeepSeek and other clouds directly, or local models via Ollama /
-LM Studio / vLLM. Because all execution and review route through the adapter
-contract, you can use Pi, Claude Code, Codex, custom, or local adapters
-interchangeably — no feature hard-requires a specific vendor CLI. Built-in
-adapters, the Pi setup, custom adapter requirements, version pinning, and
-`hepa adapter doctor` troubleshooting are documented in
-[docs/adapters.md](docs/adapters.md).
+The **Pi adapter** is the batteries-included default harness: `hepa adapter
+install pi` installs it and you route it to any model — DeepSeek and other
+clouds directly, or local models via Ollama / LM Studio / vLLM. Because all
+execution and review route through the adapter contract, you can use Pi, Claude
+Code, Codex, custom, or local adapters interchangeably — no feature hard-requires
+a specific vendor CLI. Built-in adapters, the Pi setup, custom adapter
+requirements, version pinning, and `hepa adapter doctor` troubleshooting are
+documented in [docs/adapters.md](docs/adapters.md).
 
 ## Safety
 

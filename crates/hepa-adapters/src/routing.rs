@@ -384,6 +384,8 @@ mod tests {
             cost_class,
             resource_weight: 1,
             max_concurrency: 1,
+            prompt_transport: crate::spec::HepaAdapterPromptTransport::PromptFile,
+            output_capture: crate::spec::HepaAdapterOutputCapture::AdapterFile,
         }
     }
 

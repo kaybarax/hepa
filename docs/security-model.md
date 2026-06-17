@@ -43,6 +43,24 @@ on the adapter's declared sandbox and the project's trust:
 The active sandbox posture is recorded in every run's timing artifacts, surfaced
 in the PR body, and projected onto the Hermes card.
 
+## Pi division of responsibility
+
+The Pi Coding Agent declares `sandbox=none`: Pi edits files and runs commands
+with the permissions of the Pi process. HEPA therefore owns confinement around
+Pi runs:
+
+- disposable lane worktrees scoped to the target repository;
+- per-role env allowlists that pass provider keys such as `DEEPSEEK_API_KEY`
+  while withholding manager credentials;
+- deterministic monitoring of commands, stderr/stdout, secret-like output, and
+  suspicious paths;
+- container mode for untrusted projects.
+
+HEPA composes `pi -p --mode json --model ...` without `--dangerously-*`,
+`--yolo`, `--no-sandbox`, or other unrestricted host-bypass flags. Pi is the
+default harness, not a hard dependency; non-Pi adapters keep the same safety
+boundaries.
+
 ## Mitigations
 
 - Worktree confinement (repository-scoped lanes, disposable worktrees).

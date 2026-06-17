@@ -1,4 +1,10 @@
-use hepa_adapters::fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput};
+use hepa_adapters::{
+    engine::{HepaOneshotAdapterExecutor, HepaOneshotAdapterInvocation},
+    fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput},
+    registry::HepaAdapterRegistry,
+    spec::{HepaAdapterRole, HepaAdapterTemplateContext},
+};
+use hepa_core::config::HepaConfigOverrides;
 #[cfg(test)]
 use hepa_core::contracts::HepaProject;
 use hepa_core::{
@@ -11,6 +17,7 @@ use hepa_core::{
         HepaTimingRecord, HepaValidate, HepaValidationStatus, HepaValidationSummary,
     },
     lane_state::{HepaLaneTransitionRequest, transition_lane},
+    monitor::HepaMonitorPolicy,
 };
 use hepa_git::worktree::{HepaWorktreeAllocation, HepaWorktreeAllocator};
 #[cfg(test)]
@@ -22,6 +29,7 @@ use serde::Serialize;
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +202,267 @@ pub fn run_fake_task(config: &HepaFakeRunConfig) -> Result<HepaFakeRunResult, St
             hepa_git::worktree::HepaWorktreeCleanupStatus::Cleaned
         ),
     })
+}
+
+pub fn run_live_task(
+    config: &HepaFakeRunConfig,
+    adapter_id: &str,
+) -> Result<HepaFakeRunResult, String> {
+    validate_config(config)?;
+    let task_spec = task_spec(config);
+    task_spec.validate().map_err(|error| error.to_string())?;
+    let mut task = fleet_task(config);
+    let layout = HepaArtifactLayout::new(&config.control_root, &config.archive_root)
+        .map_err(|error| error.to_string())?;
+    let run_paths = layout
+        .run(&config.run_id, &config.task_id)
+        .map_err(|error| error.to_string())?;
+    let lane_paths = run_paths
+        .lane(&config.lane_id)
+        .map_err(|error| error.to_string())?;
+    let allocator = HepaWorktreeAllocator::new(&config.repo_path, &config.worktree_root);
+    let allocation = allocator
+        .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
+        .map_err(|error| error.to_string())?;
+
+    fs::create_dir_all(&lane_paths.lane_dir).map_err(|error| error.to_string())?;
+    write_json(&run_paths.task_state, &task_spec).map_err(|error| error.to_string())?;
+
+    let mut lane = initial_lane(config, &allocation);
+    lane.adapter_id = adapter_id.to_string();
+    write_json(&lane_paths.lane_state, &lane).map_err(|error| error.to_string())?;
+
+    transition_and_record(
+        &lane_paths,
+        &mut lane,
+        1,
+        HepaLaneState::Starting,
+        "worktree allocated",
+        "2026-06-16T00:00:01Z",
+    )?;
+    transition_and_record(
+        &lane_paths,
+        &mut lane,
+        2,
+        HepaLaneState::Running,
+        "live adapter started",
+        "2026-06-16T00:00:02Z",
+    )?;
+
+    let live_config = hepa_core::config::HepaConfig::load(
+        None,
+        &std::collections::BTreeMap::new(),
+        HepaConfigOverrides {
+            control_root: Some(config.control_root.to_string_lossy().to_string()),
+            worktree_root: Some(config.worktree_root.to_string_lossy().to_string()),
+            archive_root: Some(config.archive_root.to_string_lossy().to_string()),
+            pi_model: std::env::var("HEPA_PI_MODEL").ok(),
+            pi_review_model: optional_env("HEPA_PI_REVIEW_MODEL"),
+            pi_provider_key_env: optional_env("HEPA_PI_PROVIDER_KEY_ENV"),
+            pi_base_url: optional_env("HEPA_PI_BASE_URL"),
+            ..HepaConfigOverrides::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let registry =
+        HepaAdapterRegistry::load_from_config(&live_config).map_err(|error| error.to_string())?;
+    let spec = registry
+        .get(adapter_id)
+        .ok_or_else(|| format!("adapter not registered: {adapter_id}"))?
+        .clone();
+    let prompt = format!(
+        "You are HEPA's live stress-test worker.\n\nTask: {}\nRepository worktree: {}\n\nYou are already running inside the lane worktree. Make exactly one change in the current working directory: append a new line `Added by Pi smoke test.` to `README.md` and do not modify any other file. Use relative paths such as `README.md`, then run `git status` in the current working directory and report the modified files.\n",
+        config.task_text,
+        allocation.worktree_path.display(),
+    );
+    let attempt_paths = lane_paths
+        .attempt("attempt-1")
+        .map_err(|error| error.to_string())?;
+    let mut environment = std::collections::BTreeMap::new();
+    for key in [
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_PACKAGE_DIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            environment.insert(key.to_string(), value);
+        }
+    }
+    if let Some(provider_key_env) = live_config.pi.provider_key_env.as_ref() {
+        if let Ok(value) = std::env::var(provider_key_env) {
+            environment.insert(provider_key_env.clone(), value);
+        }
+    }
+    let invocation = HepaOneshotAdapterInvocation {
+        spec,
+        role: HepaAdapterRole::Worker,
+        context: HepaAdapterTemplateContext {
+            prompt_file: attempt_paths
+                .attempt_dir
+                .join("prompt.md")
+                .display()
+                .to_string(),
+            worktree: allocation.worktree_path.display().to_string(),
+            review_prompt_file: lane_paths.lane_dir.join("review.md").display().to_string(),
+            output_file: attempt_paths.attempt_report.display().to_string(),
+            review_output_file: lane_paths
+                .lane_dir
+                .join("review.json")
+                .display()
+                .to_string(),
+            artifact_dir: lane_paths.lane_dir.display().to_string(),
+        },
+        prompt,
+        environment,
+        monitor_policy: live_monitor_policy(),
+    };
+    let result = HepaOneshotAdapterExecutor::new()
+        .run(&invocation)
+        .map_err(|error| error.to_string())?;
+    let changed_files = collect_changed_files(&allocation.worktree_path)?;
+    let attempt = HepaAttemptReport {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        attempt_id: "attempt-1".to_string(),
+        lane_id: config.lane_id.clone(),
+        task_id: config.task_id.clone(),
+        round: 1,
+        role: HepaAgentRole::Worker,
+        adapter_id: adapter_id.to_string(),
+        status: if result.exit_code.unwrap_or_default() == 0 {
+            hepa_core::contracts::HepaAttemptStatus::Completed
+        } else {
+            hepa_core::contracts::HepaAttemptStatus::Failed
+        },
+        commands_run: vec![result.command],
+        changed_files,
+        summary: vec![result.stdout.clone(), result.stderr.clone()],
+        blocked_reason: result
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("adapter exited with code {code}")),
+        started_at: "2026-06-16T00:00:02Z".to_string(),
+        completed_at: Some("2026-06-16T00:00:03Z".to_string()),
+    };
+    write_attempt(&lane_paths, &attempt)?;
+
+    transition_and_record(
+        &lane_paths,
+        &mut lane,
+        3,
+        HepaLaneState::Validating,
+        "live adapter completed",
+        "2026-06-16T00:00:03Z",
+    )?;
+    let validation = validation_summary();
+    write_json(&lane_paths.validation_summary, &validation).map_err(|error| error.to_string())?;
+    transition_and_record(
+        &lane_paths,
+        &mut lane,
+        4,
+        HepaLaneState::Reviewing,
+        "validation placeholder passed",
+        "2026-06-16T00:00:04Z",
+    )?;
+
+    let fake = HepaFakeAdapter::default();
+    let review = fake
+        .run_reviewer(&HepaFakeReviewerInput {
+            lane_id: config.lane_id.clone(),
+            review_id: "review-1".to_string(),
+            completed_at: "2026-06-16T00:00:05Z".to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    write_json(
+        &lane_paths
+            .review_signal("review-1")
+            .map_err(|error| error.to_string())?,
+        &review,
+    )
+    .map_err(|error| error.to_string())?;
+
+    transition_and_record(
+        &lane_paths,
+        &mut lane,
+        5,
+        HepaLaneState::Staging,
+        "live review approved",
+        "2026-06-16T00:00:05Z",
+    )?;
+    transition_and_record(
+        &lane_paths,
+        &mut lane,
+        6,
+        HepaLaneState::PrCreated,
+        "live staging completed",
+        "2026-06-16T00:00:06Z",
+    )?;
+    transition_and_record(
+        &lane_paths,
+        &mut lane,
+        7,
+        HepaLaneState::Completed,
+        "live done gate passed",
+        "2026-06-16T00:00:07Z",
+    )?;
+    write_json(&lane_paths.lane_state, &lane).map_err(|error| error.to_string())?;
+
+    let readiness = readiness_result(config);
+    task.status = HepaTaskStatus::Completed;
+    task.readiness = HepaReadinessState::Ready;
+    task.completed_at = Some("2026-06-16T00:00:07Z".to_string());
+    write_json(&run_paths.task_state, &task).map_err(|error| error.to_string())?;
+
+    let timing = timing_record(config);
+    lane_paths
+        .write_timing_record(&timing)
+        .map_err(|error| error.to_string())?;
+    let terminal_report = terminal_report(config, validation, review, timing.clone());
+    write_json(&lane_paths.final_report, &terminal_report).map_err(|error| error.to_string())?;
+    write_json(&run_paths.run_state, &readiness).map_err(|error| error.to_string())?;
+    run_paths
+        .archive_on_exit("2026-06-16T00:00:08Z", HepaArchiveOutcome::Completed)
+        .map_err(|error| error.to_string())?;
+
+    let cleanup = allocator
+        .cleanup_lane(&config.lane_id, "2026-06-16T00:00:09Z")
+        .map_err(|error| error.to_string())?;
+
+    Ok(HepaFakeRunResult {
+        run_id: config.run_id.clone(),
+        lane_id: config.lane_id.clone(),
+        status: "completed".to_string(),
+        timing,
+        terminal_report,
+        cleanup_performed: matches!(
+            cleanup.status,
+            hepa_git::worktree::HepaWorktreeCleanupStatus::Cleaned
+        ),
+    })
+}
+
+fn optional_env(key: &str) -> Option<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            Some(if value.is_empty() { None } else { Some(value) })
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    }
+}
+
+fn live_monitor_policy() -> HepaMonitorPolicy {
+    HepaMonitorPolicy {
+        timeout_ms: std::env::var("HEPA_PI_LIVE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .or(Some(300_000)),
+        stall_ms: std::env::var("HEPA_PI_LIVE_STALL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .or(Some(240_000)),
+        ..HepaMonitorPolicy::default()
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +749,33 @@ where
         json.push('\n');
     }
     fs::write(path, json)
+}
+
+fn collect_changed_files(worktree: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|error| format!("failed to inspect worktree diff: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let mut changed = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let path = line
+            .get(3..)
+            .ok_or_else(|| format!("unexpected git status line: {line}"))?
+            .trim()
+            .to_string();
+        if !path.is_empty() && path != ".hepa-worktree.json" && !path.starts_with(".hepa/") {
+            changed.push(path);
+        }
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]

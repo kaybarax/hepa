@@ -3,9 +3,11 @@ use crate::{
     engine::{HepaOneshotAdapterExecutor, HepaOneshotAdapterInvocation},
     external_worker::HepaExternalWorkerAdapterTemplate,
     local_worker::HepaLocalWorkerAdapterTemplate,
+    pi::parse_pi_json_events,
     spec::{
-        ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterMode, HepaAdapterRole,
-        HepaAdapterSandbox, HepaAdapterSpec, HepaAdapterTemplateContext,
+        ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterMode,
+        HepaAdapterOutputCapture, HepaAdapterPromptTransport, HepaAdapterRole, HepaAdapterSandbox,
+        HepaAdapterSpec, HepaAdapterTemplateContext,
     },
     user_reviewer::HepaUserReviewerAdapterTemplate,
     user_worker::HepaUserWorkerAdapterTemplate,
@@ -110,6 +112,66 @@ fn configured_oneshot_adapters_pass_fake_binary_invocation_output_status_and_art
             "{label} artifact is collected"
         );
     }
+
+    remove_test_dir(root);
+}
+
+#[test]
+fn pi_adapter_uses_fake_pi_binary_without_network_or_model() {
+    let root = unique_test_dir("fake-pi");
+    let worktree = root.join("worktree");
+    let artifact_dir = root.join("artifacts");
+    fs::create_dir_all(&worktree).expect("worktree dir");
+    fs::create_dir_all(&artifact_dir).expect("artifact dir");
+    let fake_pi = root.join("pi");
+    write_fake_pi(&fake_pi);
+    let output_file = artifact_dir.join("pi.jsonl");
+    let spec = HepaAdapterSpec {
+        schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+        id: "pi".to_string(),
+        display_name: "Pi Coding Agent".to_string(),
+        roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+        mode: HepaAdapterMode::Oneshot,
+        command: format!("{} -p --mode json --model ollama/test", fake_pi.display()),
+        review_command: Some(format!(
+            "{} -p --mode json --model ollama/test-review",
+            fake_pi.display()
+        )),
+        workdir: "{worktree}".to_string(),
+        required_commands: vec![fake_pi.to_string_lossy().to_string()],
+        required_env: Vec::new(),
+        sandbox: HepaAdapterSandbox::None,
+        supports_resume: true,
+        supports_json_output: true,
+        capabilities: vec![
+            "docs".to_string(),
+            "review".to_string(),
+            "local-only".to_string(),
+        ],
+        cost_class: HepaAdapterCostClass::Local,
+        resource_weight: 1,
+        max_concurrency: 2,
+        prompt_transport: HepaAdapterPromptTransport::Stdin,
+        output_capture: HepaAdapterOutputCapture::Stdout,
+    };
+    let invocation = HepaOneshotAdapterInvocation {
+        spec,
+        role: HepaAdapterRole::Reviewer,
+        context: template_context(&worktree, &artifact_dir, &output_file),
+        prompt: "review this lane".to_string(),
+        environment: BTreeMap::new(),
+        monitor_policy: HepaMonitorPolicy::default(),
+    };
+
+    let result = HepaOneshotAdapterExecutor::new()
+        .run(&invocation)
+        .expect("fake pi should run");
+    let artifact = fs::read_to_string(output_file).expect("pi artifact");
+    let parsed = parse_pi_json_events(&artifact).expect("fake pi emits Pi JSON events");
+
+    assert_eq!(result.exit_code, Some(0));
+    assert!(parsed.final_message.contains("review this lane"));
+    assert!(result.stderr.contains("fake pi stderr"));
 
     remove_test_dir(root);
 }
@@ -279,6 +341,8 @@ fn shell_command_spec(fake_bin: &Path) -> HepaAdapterSpec {
         cost_class: HepaAdapterCostClass::Local,
         resource_weight: 1,
         max_concurrency: 1,
+        prompt_transport: HepaAdapterPromptTransport::PromptFile,
+        output_capture: HepaAdapterOutputCapture::AdapterFile,
     }
 }
 
@@ -406,6 +470,24 @@ printf '{"adapter":"%s","status":"completed"}\n' "$(basename "$output_file" .jso
         .permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions).expect("fake adapter permissions");
+}
+
+fn write_fake_pi(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/bin/sh
+prompt="$(cat)"
+printf '{"type":"session","cwd":"%s"}\n' "$(pwd)"
+printf '{"type":"agent_start"}\n'
+printf '{"type":"tool_call","name":"fake-edit"}\n'
+printf '{"type":"agent_end","history":[{"role":"assistant","content":"fake pi handled: %s"}]}\n' "$prompt"
+printf 'fake pi stderr' >&2
+"#,
+    )
+    .expect("fake pi write");
+    let mut permissions = fs::metadata(path).expect("fake pi metadata").permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).expect("fake pi permissions");
 }
 
 fn run_split_command(command: &str) -> std::process::Output {
