@@ -182,7 +182,21 @@ impl HepaFleetRegistry {
         task_id: &str,
         updated_at: &str,
     ) -> Result<HepaFleetTask, HepaFleetError> {
-        self.set_task_status(task_id, HepaTaskStatus::Completed, updated_at)
+        let mut task = self.require_task(task_id)?;
+        if !task.status.can_transition_to(&HepaTaskStatus::Completed) {
+            return Err(HepaFleetError::new(
+                "status",
+                format!(
+                    "invalid task transition to {}",
+                    status_name(&HepaTaskStatus::Completed)
+                ),
+            ));
+        }
+        task.status = HepaTaskStatus::Completed;
+        task.updated_at = updated_at.to_string();
+        task.completed_at = Some(updated_at.to_string());
+        self.persist_task(&task)?;
+        Ok(task)
     }
 
     /// Resume a blocked task back into the queue.
