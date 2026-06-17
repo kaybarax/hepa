@@ -17,3 +17,16 @@ commit.
 
 The Phase 11 privacy scan found only pre-existing placeholder examples and
 redaction fixtures.
+
+## Release Gate Posture
+
+Phase 11 does not add a mandatory external service, live model, network call,
+Docker dependency, or Hermes availability requirement to the v1.0.0 release
+gate. The new capabilities are invoked through explicit CLI commands or adapter
+routes and keep existing fake, headless, and degraded-mode fixtures passing.
+
+The final Phase 11 gate run passed `cargo fmt --check`, `cargo test`,
+`cargo clippy --all-targets --all-features -- -D warnings`, runtime checks for
+`hepa timing trends <archive-root>` and
+`hepa fleet dashboard --output <dashboard-html> --control-root <control-root>`,
+and the repository privacy scan.
