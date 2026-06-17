@@ -710,6 +710,22 @@ fn expected_areas_from_task(task_text: &str) -> Vec<String> {
 }
 
 fn live_validation_commands(task_text: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    for command in [
+        "pnpm install --frozen-lockfile --offline",
+        "pnpm format:check",
+        "npx vitest run login-form.test.tsx",
+        "git diff --check",
+    ] {
+        if task_text.contains(command) {
+            commands.push(command.to_string());
+        }
+    }
+    if !commands.is_empty() {
+        commands.dedup();
+        return commands;
+    }
+
     if task_text.contains("login-form.test.tsx") {
         vec!["npx vitest run login-form.test.tsx".to_string()]
     } else if task_text.to_ascii_lowercase().contains("no-tests-detected") {
@@ -788,6 +804,10 @@ fn run_safe_validation_command(
 ) -> Result<(i32, String, String), String> {
     let argv = match command {
         "npx vitest run login-form.test.tsx" => vec!["npx", "vitest", "run", "login-form.test.tsx"],
+        "pnpm install --frozen-lockfile --offline" => {
+            vec!["pnpm", "install", "--frozen-lockfile", "--offline"]
+        }
+        "pnpm format:check" => vec!["pnpm", "format:check"],
         "git diff --check" => vec!["git", "diff", "--check"],
         _ => return Err(format!("unsupported live validation command: {command}")),
     };
@@ -1611,6 +1631,30 @@ mod tests {
                 .acceptance_criteria
                 .iter()
                 .any(|criterion| criterion.contains("pull request creation"))
+        );
+    }
+
+    #[test]
+    fn live_task_spec_derives_pnpm_monorepo_validation_commands() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update AGENTS.md from the roadmap. Run pnpm install --frozen-lockfile --offline and pnpm format:check.".to_string(),
+            timing: true,
+        };
+        let task_spec = live_task_spec(&config);
+
+        assert_eq!(
+            task_spec.validation_commands,
+            vec![
+                "pnpm install --frozen-lockfile --offline",
+                "pnpm format:check"
+            ]
         );
     }
 
