@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod config;
 pub mod conflict_planner;
 pub mod contracts;
+pub mod env_allowlist;
 pub mod fleet_monitor;
 pub mod fleet_registry;
 pub mod lane_state;
