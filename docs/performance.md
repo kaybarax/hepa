@@ -1,0 +1,40 @@
+# HEPA Performance
+
+HEPA's performance story is the one-loop model: a single agent loop per attempt,
+no default containers, and at most two short manager passes on the happy path.
+
+## One-loop model
+
+| Metric | HOCA reference | HEPA target |
+| --- | --- | --- |
+| Agent loops per attempt | 2 | 1 |
+| Containers per round | 2 default | 0 default; container mode opt-in |
+| Dependency installs per round | up to 3 | 0–1 with shared cache |
+| Orchestration overhead | full wrapper sessions | at most 2 short manager passes |
+| Small task, capable adapter, idea→PR | tens of minutes | under 10 minutes, overhead < 10% |
+| Human notifications per task | per-run/noisy | exactly 1 terminal done/block |
+| Board observability | optional bridge | default Hermes card/dashboard |
+
+Every run records timing telemetry: per-phase durations and counters for agent
+loops, manager passes, worker-profile LLM calls, reviewer passes, install
+events, and container count, plus the active sandbox posture.
+
+## Targets
+
+Validated against the Phase 0.4 HOCA reference baseline on the same task and
+hardware. Every performance claim requires benchmark evidence — never memory or
+estimates.
+
+## Benchmark harness usage
+
+```bash
+# Summarize a single run's timing record.
+hepa bench --timing path/to/timing.json
+```
+
+The benchmark harness reads timing artifacts, aggregates medians, and compares
+against the HOCA reference baselines (Phase 10). Structural performance budget
+tests assert the one-loop invariants (zero per-attempt wrapper spawns, zero
+worker-profile calls on the happy path, bounded manager passes, install skip on
+unchanged lockfile, no container starts in default mode) so a regression that
+reintroduces overhead fails CI.
