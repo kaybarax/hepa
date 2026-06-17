@@ -61,6 +61,15 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                 receipt.log_path.display()
             ))
         }
+        [command, rest @ ..]
+            if command == "lane"
+                && matches!(
+                    rest.first().map(String::as_str),
+                    Some("list" | "show" | "logs" | "stop")
+                ) =>
+        {
+            fleet::lane_command(rest)
+        }
         [command, ..] if command == "lane" => Err("unknown lane command".to_string()),
         [command, subcommand] if command == "kanban" && subcommand == "sync" => {
             let mut store = HepaUnavailableHermesCardStore::new("Hermes CLI/API unavailable");

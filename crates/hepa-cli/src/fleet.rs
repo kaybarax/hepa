@@ -301,6 +301,76 @@ pub fn task_command(args: &[String]) -> Result<String, String> {
     }
 }
 
+/// Dispatch `hepa lane <list|show|logs|stop>`. `lane send` is handled by the
+/// tmux steering path in `main`.
+pub fn lane_command(args: &[String]) -> Result<String, String> {
+    let (subcommand, rest) = args
+        .split_first()
+        .ok_or_else(|| "usage: hepa lane <list|show|logs|send|stop>".to_string())?;
+    let (control_root, flags) = take_control_root(rest)?;
+    let registry = HepaFleetRegistry::new(&control_root);
+    let tasks = registry.list_tasks().map_err(|error| error.to_string())?;
+
+    match subcommand.as_str() {
+        "list" => {
+            let mut lines = Vec::new();
+            for task in &tasks {
+                for lane_id in &task.lane_ids {
+                    lines.push(format!(
+                        "{lane_id} task={} status={:?}",
+                        task.task_id, task.status
+                    ));
+                }
+            }
+            if lines.is_empty() {
+                return Ok("HEPA lane list: no lanes".to_string());
+            }
+            lines.sort();
+            Ok(format!("HEPA lane list:\n{}", lines.join("\n")))
+        }
+        "show" => {
+            let lane_id = positional(&flags, 0, "lane id")?;
+            match tasks
+                .iter()
+                .find(|task| task.lane_ids.iter().any(|id| id == &lane_id))
+            {
+                Some(task) => Ok(format!(
+                    "HEPA lane show: {lane_id} task={} status={:?}",
+                    task.task_id, task.status
+                )),
+                None => Err(format!("lane not found: {lane_id}")),
+            }
+        }
+        "logs" => {
+            let lane_id = positional(&flags, 0, "lane id")?;
+            let log_path = control_root
+                .join("fleet")
+                .join("lanes")
+                .join(&lane_id)
+                .join("lane.log");
+            Ok(format!(
+                "HEPA lane logs: {lane_id} log={}",
+                log_path.display()
+            ))
+        }
+        "stop" => {
+            let lane_id = positional(&flags, 0, "lane id")?;
+            let task = tasks
+                .iter()
+                .find(|task| task.lane_ids.iter().any(|id| id == &lane_id))
+                .ok_or_else(|| format!("lane not found: {lane_id}"))?;
+            let updated = registry
+                .block_task(&task.task_id, &cli_timestamp())
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA lane stop: {lane_id} task={} -> {:?}",
+                updated.task_id, updated.status
+            ))
+        }
+        other => Err(format!("unknown lane command: {other}")),
+    }
+}
+
 fn scheduler_state_path(control_root: &Path) -> PathBuf {
     control_root.join("fleet").join("scheduler-state")
 }
@@ -508,6 +578,55 @@ mod tests {
         let sync = task_command(&s(&["sync-kanban", "--control-root", &control])).expect("sync");
         assert!(sync.contains("tasks=1"));
         assert!(sync.contains("degraded"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn lane_list_show_logs_and_stop() {
+        let root = unique_test_dir("lane");
+        let control = root.to_str().expect("path is UTF-8").to_string();
+        let registry = HepaFleetRegistry::new(&root);
+        // A ready task claimed into a lane gives us a lane to inspect.
+        let mut task = HepaFleetTask {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Task".to_string(),
+            description: String::new(),
+            status: HepaTaskStatus::Ready,
+            readiness: HepaReadinessState::Ready,
+            dependencies: Vec::new(),
+            lane_ids: Vec::new(),
+            external_card_id: None,
+            priority: 1,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+            completed_at: None,
+        };
+        registry.create_task(&task).expect("create");
+        task = registry
+            .claim_task_into_lane("task-1", "lane-1", "t1")
+            .expect("claim");
+        assert_eq!(task.lane_ids, vec!["lane-1".to_string()]);
+
+        assert!(
+            lane_command(&s(&["list", "--control-root", &control]))
+                .expect("list")
+                .contains("lane-1")
+        );
+        assert!(
+            lane_command(&s(&["show", "lane-1", "--control-root", &control]))
+                .expect("show")
+                .contains("task=task-1")
+        );
+        assert!(
+            lane_command(&s(&["logs", "lane-1", "--control-root", &control]))
+                .expect("logs")
+                .contains("lane.log")
+        );
+        let stop = lane_command(&s(&["stop", "lane-1", "--control-root", &control])).expect("stop");
+        assert!(stop.contains("Blocked"));
 
         std::fs::remove_dir_all(&root).ok();
     }
