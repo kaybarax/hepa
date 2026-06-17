@@ -49,14 +49,26 @@ impl HepaAdapterDoctorReport {
         let checks = self
             .checks
             .iter()
-            .map(|check| format!("{}={}", check.adapter_id, check.status.as_str()))
+            .map(|check| {
+                format!(
+                    "{}={}",
+                    redact_detail(&check.adapter_id),
+                    check.status.as_str()
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ");
         let actions = self
             .checks
             .iter()
             .filter(|check| check.status != HepaAdapterCheckStatus::Ok)
-            .map(|check| format!("{}: {}", check.adapter_id, redact_detail(&check.action)))
+            .map(|check| {
+                format!(
+                    "{}: {}",
+                    redact_detail(&check.adapter_id),
+                    redact_detail(&check.action)
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         let diagnostics = self
@@ -66,7 +78,7 @@ impl HepaAdapterDoctorReport {
             .map(|check| {
                 format!(
                     "{}: command={} auth={} version={} template={} sandbox={} max_concurrency={}",
-                    check.adapter_id,
+                    redact_detail(&check.adapter_id),
                     redact_detail(&check.command_presence),
                     redact_detail(&check.auth_state),
                     redact_detail(&check.version_state),
@@ -494,7 +506,7 @@ fn is_private_path_like(value: &str) -> bool {
         ["/", "tmp", "/"].concat(),
     ]
     .iter()
-    .any(|prefix| value.starts_with(prefix))
+    .any(|prefix| value.contains(prefix))
 }
 
 fn is_account_like(value: &str) -> bool {
@@ -643,12 +655,12 @@ mod tests {
         let report = HepaAdapterDoctorReport {
             status: HepaAdapterDoctorStatus::Degraded,
             checks: vec![HepaAdapterDoctorCheck {
-                adapter_id: "shell-command".to_string(),
+                adapter_id: account.clone(),
                 status: HepaAdapterCheckStatus::Failed,
-                command_presence: "failed".to_string(),
-                auth_state: "not_detectable".to_string(),
-                version_state: "unknown".to_string(),
-                invocation_template: "ok".to_string(),
+                command_presence: format!("missing:{private_path}"),
+                auth_state: format!("missing_env:{account}"),
+                version_state: format!("drift:{private_path}"),
+                invocation_template: format!("invalid:{account}"),
                 sandbox_posture: "agent-native".to_string(),
                 concurrency_cap: 1,
                 action: format!("inspect {private_path} for {account}"),
@@ -660,6 +672,11 @@ mod tests {
         assert!(!summary.contains(&account));
         assert!(summary.contains("<PRIVATE_PATH>"));
         assert!(summary.contains("<ACCOUNT>"));
+        assert!(summary.contains("<ACCOUNT>=failed"));
+        assert!(summary.contains("command=<PRIVATE_PATH>"));
+        assert!(summary.contains("auth=<ACCOUNT>"));
+        assert!(summary.contains("version=<PRIVATE_PATH>"));
+        assert!(summary.contains("template=<ACCOUNT>"));
     }
 
     #[test]
