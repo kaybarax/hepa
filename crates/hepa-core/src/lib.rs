@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod config;
 pub mod contracts;
+pub mod fleet_registry;
 pub mod lane_state;
 pub mod monitor;
 pub mod notifications;
