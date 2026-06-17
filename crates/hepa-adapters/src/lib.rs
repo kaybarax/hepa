@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod custom;
 pub mod doctor;
 pub mod engine;
 pub mod fake;
