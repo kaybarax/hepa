@@ -343,7 +343,7 @@ pub fn run_live_task(
         },
         commands_run: vec![result.command],
         changed_files: changed_files.clone(),
-        summary: vec![result.stdout.clone(), result.stderr.clone()],
+        summary: live_attempt_summary(&allocation.worktree_path, &result.stdout, &result.stderr),
         blocked_reason: result
             .exit_code
             .filter(|code| *code != 0)
@@ -1091,6 +1091,19 @@ fn sanitize_validation_output(worktree: &Path, text: &str) -> String {
     line
 }
 
+fn live_attempt_summary(worktree: &Path, stdout: &str, stderr: &str) -> Vec<String> {
+    vec![
+        format!(
+            "worker stdout: {}",
+            sanitize_validation_output(worktree, stdout)
+        ),
+        format!(
+            "worker stderr: {}",
+            sanitize_validation_output(worktree, stderr)
+        ),
+    ]
+}
+
 fn commit_title(task_text: &str) -> String {
     let mut title = task_text
         .split('.')
@@ -1654,6 +1667,21 @@ mod tests {
         assert!(sanitized.contains("<VALIDATION_RUNTIME>"));
         assert!(!sanitized.contains("/tmp/hepa-validation"));
         assert!(!sanitized.contains(".hepa/worktrees/lane-cli-fake"));
+    }
+
+    #[test]
+    fn live_attempt_summary_redacts_pi_event_paths() {
+        let worktree = PathBuf::from("/tmp/hepa-validation/.hepa/worktrees/lane-cli-fake");
+        let stdout = format!(
+            "{{\"type\":\"session\",\"cwd\":\"{}\"}}\n{{\"type\":\"agent_start\"}}",
+            worktree.display()
+        );
+        let summary = live_attempt_summary(&worktree, &stdout, "");
+
+        assert_eq!(summary.len(), 2);
+        assert!(summary[0].contains("<VALIDATION_RUNTIME>"));
+        assert!(!summary[0].contains("/tmp/hepa-validation"));
+        assert!(!summary[0].contains(".hepa/worktrees/lane-cli-fake"));
     }
 
     fn init_repo(repo: &Path) {
