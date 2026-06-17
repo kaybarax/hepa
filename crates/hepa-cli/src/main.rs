@@ -208,7 +208,7 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             let lane_id = options.lane_id;
             let allocator = HepaWorktreeAllocator::new(&repo_path, &worktree_root);
             let allocation = allocator
-                .allocate_lane_with_metadata(&lane_id, &cli_timestamp())
+                .allocate_lane_with_metadata(&lane_id, cli_timestamp())
                 .map_err(|error| error.to_string())?;
             let artifact_dir = control_root
                 .join("runs/run-cli-interactive/tasks/task-cli-interactive/lanes")
