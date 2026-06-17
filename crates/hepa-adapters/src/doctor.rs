@@ -350,7 +350,7 @@ fn check_invocation_template(
     }
 }
 
-fn unsupported_hepa_flags(command: &str) -> Vec<String> {
+pub fn unsupported_hepa_flags(command: &str) -> Vec<String> {
     let mut tokens = command.split_whitespace();
     let Some(binary) = tokens.next() else {
         return Vec::new();

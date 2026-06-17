@@ -61,6 +61,7 @@ impl HepaOneshotAdapterExecutor {
         }
 
         let command = rendered_command(invocation)?;
+        reject_unsupported_hepa_flags(&command)?;
         invocation
             .monitor_policy
             .check_command(&command)
@@ -216,6 +217,21 @@ fn rendered_command(
             }),
     }
     .map_err(|error| HepaAdapterExecutionError::new("command", error.to_string()))
+}
+
+fn reject_unsupported_hepa_flags(command: &str) -> Result<(), HepaAdapterExecutionError> {
+    let unsupported_flags = crate::doctor::unsupported_hepa_flags(command);
+    if unsupported_flags.is_empty() {
+        Ok(())
+    } else {
+        Err(HepaAdapterExecutionError::blocked(
+            "invocation_template",
+            format!(
+                "unsupported HEPA-composed flag(s): {}",
+                unsupported_flags.join(",")
+            ),
+        ))
+    }
 }
 
 fn rendered_workdir(
@@ -450,6 +466,42 @@ exit 7
         assert_eq!(result.exit_code, Some(7));
         assert_eq!(result.stdout, "failure stdout");
         assert_eq!(result.stderr, "failure stderr");
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_blocks_unsupported_hepa_composed_flags_before_spawn() {
+        let root = unique_test_dir("unsupported-flags");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let output_file = artifact_dir.join("unsupported.json");
+        let invocation = HepaOneshotAdapterInvocation {
+            spec: adapter_spec(
+                "shell-command",
+                vec![HepaAdapterRole::Worker],
+                "hepa-shell-adapter --prompt-file {prompt_file} --worktree {worktree} --artifact-dir {artifact_dir} --json-output {output_file} --mystery-flag"
+                    .to_string(),
+                None,
+                Vec::new(),
+            ),
+            role: HepaAdapterRole::Worker,
+            context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "Worker prompt from task spec".to_string(),
+            environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy::default(),
+        };
+
+        let error = HepaOneshotAdapterExecutor::new()
+            .run(&invocation)
+            .expect_err("unsupported HEPA-composed flags must fail before spawn");
+
+        assert_eq!(error.field, "invocation_template");
+        assert_eq!(error.status.as_deref(), Some("blocked"));
+        assert!(error.message.contains("--mystery-flag"));
+        assert!(!PathBuf::from(&invocation.context.prompt_file).exists());
 
         remove_test_dir(root);
     }
