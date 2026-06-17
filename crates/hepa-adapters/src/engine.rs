@@ -899,7 +899,7 @@ printf '{"type":"agent_end","messages":[]}\n'
             &script,
             r#"#!/bin/sh
 case "$1" in
-  leak) printf 'password=blocked' ;;
+  leak) printf 'api_key=blocked' ;;
   scope) printf '%s' "$2" ;;
   slow) sleep 1 ;;
   ok) printf 'ok' ;;

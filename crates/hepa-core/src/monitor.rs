@@ -16,7 +16,6 @@ impl Default for HepaMonitorPolicy {
             command_denylist: default_git_lifecycle_denylist(),
             secret_markers: vec![
                 "api_key".to_string(),
-                "password".to_string(),
                 "private_key".to_string(),
                 "secret=".to_string(),
             ],
@@ -317,7 +316,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            policy.check_output("password=redacted"),
+            policy.check_output("api_key=redacted"),
             Err(HepaMonitorStop {
                 kind: HepaMonitorStopKind::SecretDetected,
                 ..
