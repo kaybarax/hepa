@@ -1,9 +1,11 @@
 //! CLI handlers for the fleet command groups (project/task/scheduler/fleet),
 //! all backed by the deterministic, temp-root-safe `HepaFleetRegistry`.
 
+use hepa_core::contracts::HepaLaneState;
 use hepa_core::contracts::{
     CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaProject, HepaReadinessState, HepaTaskStatus,
 };
+use hepa_core::fleet_monitor::{HepaFleetMonitor, HepaLaneObservation, HepaResourceSample};
 use hepa_core::fleet_registry::{
     HepaCostClass, HepaCostPolicy, HepaFleetRegistry, HepaMemoryPolicy, HepaRegisteredProject,
 };
@@ -301,6 +303,126 @@ pub fn task_command(args: &[String]) -> Result<String, String> {
     }
 }
 
+fn task_status_to_lane_state(status: &HepaTaskStatus) -> Option<HepaLaneState> {
+    match status {
+        HepaTaskStatus::Running => Some(HepaLaneState::Running),
+        HepaTaskStatus::Blocked => Some(HepaLaneState::Blocked),
+        HepaTaskStatus::Completed => Some(HepaLaneState::Completed),
+        HepaTaskStatus::Cancelled => Some(HepaLaneState::Cancelled),
+        _ => None,
+    }
+}
+
+/// Dispatch `hepa fleet <status|doctor|report|cleanup|reconcile>`.
+pub fn fleet_command(args: &[String]) -> Result<String, String> {
+    let (subcommand, rest) = args
+        .split_first()
+        .ok_or_else(|| "usage: hepa fleet <status|doctor|report|cleanup|reconcile>".to_string())?;
+    let (control_root, _flags) = take_control_root(rest)?;
+    let registry = HepaFleetRegistry::new(&control_root);
+    let tasks = registry.list_tasks().map_err(|error| error.to_string())?;
+    let projects = registry
+        .list_projects()
+        .map_err(|error| error.to_string())?;
+    let lanes: Vec<(String, HepaTaskStatus)> = tasks
+        .iter()
+        .flat_map(|task| {
+            task.lane_ids
+                .iter()
+                .map(move |lane| (lane.clone(), task.status.clone()))
+        })
+        .collect();
+
+    let observations: Vec<HepaLaneObservation> = tasks
+        .iter()
+        .flat_map(|task| {
+            task.lane_ids.iter().filter_map(move |lane_id| {
+                task_status_to_lane_state(&task.status).map(|lane_state| HepaLaneObservation {
+                    lane_id: lane_id.clone(),
+                    task_id: task.task_id.clone(),
+                    lane_state,
+                    process_alive: task.status == HepaTaskStatus::Running,
+                    branch_present: true,
+                    pr_status: None,
+                    validation_state: None,
+                    review_state: None,
+                    card_status: None,
+                    worktree_present: task.status == HepaTaskStatus::Running,
+                })
+            })
+        })
+        .collect();
+
+    match subcommand.as_str() {
+        "status" => {
+            let running = lanes
+                .iter()
+                .filter(|(_, status)| *status == HepaTaskStatus::Running)
+                .count();
+            Ok(format!(
+                "HEPA fleet status: projects={} tasks={} lanes={} running_lanes={}",
+                projects.len(),
+                tasks.len(),
+                lanes.len(),
+                running
+            ))
+        }
+        "doctor" => {
+            let control_ok = control_root.exists() || control_root.parent().is_some();
+            Ok(format!(
+                "HEPA fleet doctor: control_root_ok={} projects={} tasks={}",
+                control_ok,
+                projects.len(),
+                tasks.len()
+            ))
+        }
+        "report" => {
+            let snapshot = HepaFleetMonitor::refresh(
+                &observations,
+                HepaResourceSample {
+                    active_lanes: lanes.len() as u32,
+                    memory_mb: 0,
+                },
+            );
+            Ok(format!(
+                "HEPA fleet report: projects={} tasks={} lanes={} drifted_lanes={}",
+                projects.len(),
+                tasks.len(),
+                snapshot.lanes.len(),
+                snapshot.drifted_lanes.len()
+            ))
+        }
+        "cleanup" => {
+            let runtime_root = control_root.join("fleet").join("runtime");
+            let terminal_lanes: Vec<String> = tasks
+                .iter()
+                .filter(|task| {
+                    matches!(
+                        task.status,
+                        HepaTaskStatus::Completed | HepaTaskStatus::Cancelled
+                    )
+                })
+                .flat_map(|task| task.lane_ids.clone())
+                .collect();
+            let report = HepaFleetMonitor::cleanup_runtime(&runtime_root, &terminal_lanes)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA fleet cleanup: removed={} preserved={}",
+                report.removed_runtime_dirs.len(),
+                report.preserved_unrelated.len()
+            ))
+        }
+        "reconcile" => {
+            let report = HepaFleetMonitor::reconcile(&observations);
+            Ok(format!(
+                "HEPA fleet reconcile: actions={}",
+                report.actions.len()
+            ))
+        }
+        other => Err(format!("unknown fleet command: {other}")),
+    }
+}
+
 /// Dispatch `hepa lane <list|show|logs|stop>`. `lane send` is handled by the
 /// tmux steering path in `main`.
 pub fn lane_command(args: &[String]) -> Result<String, String> {
@@ -578,6 +700,57 @@ mod tests {
         let sync = task_command(&s(&["sync-kanban", "--control-root", &control])).expect("sync");
         assert!(sync.contains("tasks=1"));
         assert!(sync.contains("degraded"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fleet_status_doctor_report_cleanup_and_reconcile() {
+        let root = unique_test_dir("fleet");
+        let control = root.to_str().expect("path is UTF-8").to_string();
+        let registry = HepaFleetRegistry::new(&root);
+        let mut task = HepaFleetTask {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Task".to_string(),
+            description: String::new(),
+            status: HepaTaskStatus::Ready,
+            readiness: HepaReadinessState::Ready,
+            dependencies: Vec::new(),
+            lane_ids: Vec::new(),
+            external_card_id: None,
+            priority: 1,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+            completed_at: None,
+        };
+        registry.create_task(&task).expect("create");
+        task = registry
+            .claim_task_into_lane("task-1", "lane-1", "t1")
+            .expect("claim");
+        assert_eq!(task.status, HepaTaskStatus::Running);
+
+        let status = fleet_command(&s(&["status", "--control-root", &control])).expect("status");
+        assert!(status.contains("running_lanes=1"));
+
+        assert!(
+            fleet_command(&s(&["doctor", "--control-root", &control]))
+                .expect("doctor")
+                .contains("control_root_ok=true")
+        );
+        assert!(
+            fleet_command(&s(&["report", "--control-root", &control]))
+                .expect("report")
+                .contains("lanes=1")
+        );
+        // Running lane with no card produces a reconcile action.
+        let reconcile =
+            fleet_command(&s(&["reconcile", "--control-root", &control])).expect("reconcile");
+        assert!(reconcile.contains("actions=1"));
+
+        let cleanup = fleet_command(&s(&["cleanup", "--control-root", &control])).expect("cleanup");
+        assert!(cleanup.contains("removed=0"));
 
         std::fs::remove_dir_all(&root).ok();
     }
