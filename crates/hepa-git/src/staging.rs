@@ -424,10 +424,13 @@ fn line_has_secret_assignment(line: &str) -> bool {
         let Some(index) = line.find(separator) else {
             continue;
         };
-        let key = line[..index]
-            .trim()
-            .trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
-            .to_ascii_lowercase();
+        let key = line[..index].trim().trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | '`') || character.is_ascii_whitespace()
+        });
+        if !looks_like_secret_assignment_key(key) {
+            continue;
+        }
+        let key = key.to_ascii_lowercase();
         if FORBIDDEN_CONTENT_SECRET_KEYS
             .iter()
             .any(|fragment| key.contains(fragment))
@@ -436,6 +439,14 @@ fn line_has_secret_assignment(line: &str) -> bool {
         }
     }
     false
+}
+
+fn looks_like_secret_assignment_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 80
+        && key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
 }
 
 #[cfg(test)]
@@ -615,12 +626,34 @@ mod tests {
     }
 
     #[test]
+    fn stage_approved_files_blocks_secret_assignments_in_file_content() {
+        let repo = unique_test_dir("stage-content-secret");
+        init_repo(&repo);
+        fs::write(repo.join("config.md"), "api_key = example-value\n").expect("config write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["config.md".to_string()])
+            .expect_err("secret assignment content must be refused");
+
+        assert_eq!(error.rejections.len(), 1);
+        assert_eq!(error.rejections[0].path, "config.md");
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
     fn stage_approved_files_allows_normal_route_docs() {
         let repo = unique_test_dir("stage-content-route");
         init_repo(&repo);
         fs::write(
             repo.join("AGENTS.md"),
-            "Gateway routes REST under /api/v1/* and GraphQL under /graphql.\n",
+            "Gateway routes REST under /api/v1/* and GraphQL under /graphql.\n\n- **Secrets**: Managed via AWS Secrets Manager and GitHub Environment Secrets\n",
         )
         .expect("agents write");
         let staging = HepaSafeStaging::new(&repo);
