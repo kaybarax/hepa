@@ -1,6 +1,6 @@
 use hepa_core::contracts::{
     CONTRACT_SCHEMA_VERSION, HepaFindingSeverity, HepaReviewFinding, HepaReviewSignal,
-    HepaReviewStatus, HepaValidate,
+    HepaReviewStatus, HepaValidate, to_stable_json,
 };
 use serde::Deserialize;
 use std::{error::Error, fmt};
@@ -24,6 +24,14 @@ pub struct HepaReviewerOutputError {
 pub enum HepaReviewerNormalizationRoute {
     DeterministicParser,
     ReviewerProfileFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaReviewerNormalizationResult {
+    pub signal: HepaReviewSignal,
+    pub route: HepaReviewerNormalizationRoute,
+    pub fallback_reason: Option<String>,
+    pub normalized_output_json: String,
 }
 
 impl HepaReviewerOutputError {
@@ -105,16 +113,42 @@ pub fn normalize_reviewer_output_by_exception(
         HepaReviewerOutputInput,
         HepaReviewerOutputError,
     ) -> Result<HepaReviewSignal, HepaReviewerOutputError>,
-) -> Result<(HepaReviewSignal, HepaReviewerNormalizationRoute), HepaReviewerOutputError> {
+) -> Result<HepaReviewerNormalizationResult, HepaReviewerOutputError> {
     match normalize_reviewer_output(input.clone()) {
-        Ok(signal) => Ok((signal, HepaReviewerNormalizationRoute::DeterministicParser)),
-        Err(error) => fallback(input, error).map(|signal| {
-            (
-                signal,
-                HepaReviewerNormalizationRoute::ReviewerProfileFallback,
-            )
-        }),
+        Ok(signal) => normalization_result(
+            signal,
+            HepaReviewerNormalizationRoute::DeterministicParser,
+            None,
+        ),
+        Err(error) => {
+            let fallback_reason = Some(format!("{}: {}", error.field, error.message));
+            fallback(input, error).and_then(|signal| {
+                signal
+                    .validate()
+                    .map_err(|error| HepaReviewerOutputError::new(error.field, error.message))?;
+                normalization_result(
+                    signal,
+                    HepaReviewerNormalizationRoute::ReviewerProfileFallback,
+                    fallback_reason,
+                )
+            })
+        }
     }
+}
+
+fn normalization_result(
+    signal: HepaReviewSignal,
+    route: HepaReviewerNormalizationRoute,
+    fallback_reason: Option<String>,
+) -> Result<HepaReviewerNormalizationResult, HepaReviewerOutputError> {
+    let normalized_output_json = to_stable_json(&signal)
+        .map_err(|error| HepaReviewerOutputError::new("normalized_output", error.to_string()))?;
+    Ok(HepaReviewerNormalizationResult {
+        signal,
+        route,
+        fallback_reason,
+        normalized_output_json,
+    })
 }
 
 fn normalize_finding(
@@ -322,7 +356,7 @@ mod tests {
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&fallback_calls);
 
-        let (signal, route) = normalize_reviewer_output_by_exception(
+        let result = normalize_reviewer_output_by_exception(
             input(
                 "reviewer-a",
                 r#"{
@@ -338,8 +372,17 @@ mod tests {
         )
         .expect("clean output normalizes deterministically");
 
-        assert_eq!(signal.status, HepaReviewStatus::Approved);
-        assert_eq!(route, HepaReviewerNormalizationRoute::DeterministicParser);
+        assert_eq!(result.signal.status, HepaReviewStatus::Approved);
+        assert_eq!(
+            result.route,
+            HepaReviewerNormalizationRoute::DeterministicParser
+        );
+        assert_eq!(result.fallback_reason, None);
+        assert!(
+            result
+                .normalized_output_json
+                .contains("\"status\": \"approved\"")
+        );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -348,7 +391,7 @@ mod tests {
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&fallback_calls);
 
-        let (signal, route) = normalize_reviewer_output_by_exception(
+        let result = normalize_reviewer_output_by_exception(
             input("reviewer-a", r#"{"status": "not-a-status"}"#),
             move |input, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -367,10 +410,19 @@ mod tests {
         .expect("fallback normalizes malformed output");
 
         assert_eq!(
-            route,
+            result.route,
             HepaReviewerNormalizationRoute::ReviewerProfileFallback
         );
-        assert_eq!(signal.status, HepaReviewStatus::Failed);
+        assert_eq!(result.signal.status, HepaReviewStatus::Failed);
+        assert_eq!(
+            result.fallback_reason,
+            Some("status: unsupported review status: not-a-status".to_string())
+        );
+        assert!(
+            result
+                .normalized_output_json
+                .contains("reviewer-profile fallback normalized output")
+        );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
