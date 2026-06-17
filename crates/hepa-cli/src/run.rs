@@ -1516,6 +1516,24 @@ fn live_review_fanout(
     validation: &HepaValidationSummary,
     diff_context: &str,
 ) -> Result<LiveReviewOutcome, String> {
+    live_review_fanout_with_controlled_block(
+        config,
+        adapter_id,
+        changed_files,
+        validation,
+        diff_context,
+        live_force_review_block(),
+    )
+}
+
+fn live_review_fanout_with_controlled_block(
+    config: &HepaFakeRunConfig,
+    adapter_id: &str,
+    changed_files: &[String],
+    validation: &HepaValidationSummary,
+    diff_context: &str,
+    force_review_block: bool,
+) -> Result<LiveReviewOutcome, String> {
     let primary_adapter = format!("hepa-manager-live-review:primary:{adapter_id}");
     let policy_adapter = format!("hepa-manager-live-review:policy:{adapter_id}");
     let reviewers = vec![
@@ -1523,11 +1541,13 @@ fn live_review_fanout(
             primary_adapter.clone(),
             config.task_id.clone(),
             changed_files.to_vec(),
+            force_review_block,
         ),
         configured_live_reviewer(
             policy_adapter.clone(),
             config.task_id.clone(),
             changed_files.to_vec(),
+            force_review_block,
         ),
     ];
     let result = run_configured_reviewers_concurrently(
@@ -1576,9 +1596,10 @@ fn configured_live_reviewer(
     reviewer_adapter_id: String,
     task_id: String,
     changed_files: Vec<String>,
+    force_review_block: bool,
 ) -> HepaConfiguredReviewer {
     HepaConfiguredReviewer::new(reviewer_adapter_id.clone(), move |request| {
-        let signal = if live_force_review_block() {
+        let signal = if force_review_block {
             live_controlled_review_block_signal(
                 &request.lane_id,
                 &request.adapter_id,
@@ -3095,38 +3116,39 @@ mod tests {
             failure_type: None,
             summary: vec!["`git diff --check` exited 0.".to_string()],
         };
-        temp_env_var("HEPA_LIVE_FORCE_REVIEW_BLOCK", "1", || {
-            let outcome = live_review_fanout(
-                &config,
-                "pi",
-                &["README.md".to_string()],
-                &validation,
-                "diff --git a/README.md b/README.md",
-            )
-            .expect("fanout should produce a controlled block");
+        let outcome = live_review_fanout_with_controlled_block(
+            &config,
+            "pi",
+            &["README.md".to_string()],
+            &validation,
+            "diff --git a/README.md b/README.md",
+            true,
+        )
+        .expect("fanout should produce a controlled block");
 
-            assert!(!outcome.staging_allowed);
-            assert_eq!(outcome.reviewer_passes, 2);
-            assert!(
-                outcome
-                    .signals
-                    .iter()
-                    .all(|signal| signal.status == HepaReviewStatus::Blocked)
-            );
-            assert_eq!(outcome.arbitration.status, "manager_required");
-            assert!(outcome.blockers.iter().any(|blocker| {
+        assert!(!outcome.staging_allowed);
+        assert_eq!(outcome.reviewer_passes, 2);
+        assert!(
+            outcome
+                .signals
+                .iter()
+                .all(|signal| signal.status == HepaReviewStatus::Blocked)
+        );
+        assert_eq!(outcome.arbitration.status, "manager_required");
+        assert!(
+            outcome.blockers.iter().any(|blocker| {
                 blocker.contains("manager arbitration is required before staging")
-            }));
-            assert!(outcome.blockers.iter().any(|blocker| {
-                blocker.contains("review fanout policy required 2 approvals but received 0")
-            }));
-            assert!(outcome.signals.iter().any(|signal| {
-                signal
-                    .summary
-                    .iter()
-                    .any(|line| line.contains("inspect reviewer evidence"))
-            }));
-        });
+            })
+        );
+        assert!(outcome.blockers.iter().any(|blocker| {
+            blocker.contains("review fanout policy required 2 approvals but received 0")
+        }));
+        assert!(outcome.signals.iter().any(|signal| {
+            signal
+                .summary
+                .iter()
+                .any(|line| line.contains("inspect reviewer evidence"))
+        }));
     }
 
     #[test]
@@ -3332,22 +3354,6 @@ mod tests {
             .expect("clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("hepa-cli-{label}-{nonce}"))
-    }
-
-    fn temp_env_var<R>(key: &str, value: &str, test: impl FnOnce() -> R) -> R {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        let result = test();
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(key, previous);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-        result
     }
 
     fn remove_test_dir(root: PathBuf) {
