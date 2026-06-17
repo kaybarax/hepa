@@ -9,6 +9,7 @@ pub mod lane_state;
 pub mod monitor;
 pub mod notifications;
 pub mod readiness;
+pub mod redaction;
 pub mod resource_governor;
 pub mod scheduler;
 
