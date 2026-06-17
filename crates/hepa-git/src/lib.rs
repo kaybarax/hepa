@@ -1,4 +1,5 @@
 pub mod branches;
+pub mod staging;
 pub mod worktree;
 
 pub const CRATE_NAME: &str = "hepa-git";
