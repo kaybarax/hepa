@@ -233,6 +233,17 @@ pub fn map_task_to_hermes_card(
             "container_count".to_string(),
             HepaHermesFieldValue::Number(timing.counters.container_count.into()),
         );
+        let mut postures: Vec<String> = timing
+            .phases
+            .iter()
+            .filter_map(|phase| phase.sandbox_posture.clone())
+            .collect();
+        postures.sort();
+        postures.dedup();
+        fields.insert(
+            "sandbox_postures".to_string(),
+            HepaHermesFieldValue::List(postures),
+        );
         fields.insert(
             "repair_round_count".to_string(),
             HepaHermesFieldValue::Number(repair_rounds.len() as u64),

@@ -399,6 +399,16 @@ fn readiness_result(config: &HepaFakeRunConfig) -> HepaReadinessResult {
     }
 }
 
+/// Resolve the active sandbox posture recorded in every run. The fake adapter
+/// declares no native sandbox and a trusted project resolves to host-worktree.
+fn run_sandbox_posture() -> String {
+    use hepa_adapters::container::{HepaProjectTrust, resolve_sandbox_posture};
+    use hepa_adapters::spec::HepaAdapterSandbox;
+    resolve_sandbox_posture(HepaAdapterSandbox::None, HepaProjectTrust::Trusted)
+        .as_str()
+        .to_string()
+}
+
 fn timing_record(config: &HepaFakeRunConfig) -> HepaTimingRecord {
     HepaTimingRecord {
         schema_version: CONTRACT_SCHEMA_VERSION,
@@ -412,7 +422,7 @@ fn timing_record(config: &HepaFakeRunConfig) -> HepaTimingRecord {
                 role: Some(HepaAgentRole::Worker),
                 adapter_id: Some("fake".to_string()),
                 routing_reason: Some("default fake adapter".to_string()),
-                sandbox_posture: Some("host-worktree".to_string()),
+                sandbox_posture: Some(run_sandbox_posture()),
             },
             HepaTimingPhase {
                 name: "fake_review".to_string(),
@@ -422,7 +432,7 @@ fn timing_record(config: &HepaFakeRunConfig) -> HepaTimingRecord {
                 role: Some(HepaAgentRole::Reviewer),
                 adapter_id: Some("fake".to_string()),
                 routing_reason: Some("fake review fanout".to_string()),
-                sandbox_posture: Some("host-worktree".to_string()),
+                sandbox_posture: Some(run_sandbox_posture()),
             },
         ],
         counters: HepaTimingCounters {
@@ -505,6 +515,14 @@ mod tests {
         assert_eq!(result.timing.counters.agent_loops, 1);
         assert_eq!(result.timing.counters.worker_profile_llm_calls, 0);
         assert_eq!(result.timing.counters.container_count, 0);
+        // The active sandbox posture is recorded in every run's timing phases.
+        assert!(
+            result
+                .timing
+                .phases
+                .iter()
+                .all(|phase| phase.sandbox_posture.as_deref() == Some("host-worktree"))
+        );
         assert!(!config.worktree_root.join("lane-1").exists());
         let run_dir = config.control_root.join("runs/run-1");
         let lane_dir = run_dir.join("tasks/task-1/lanes/lane-1");

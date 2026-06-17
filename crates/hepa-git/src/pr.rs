@@ -384,6 +384,12 @@ pub fn build_pr_body(input: &HepaPrBodyInput) -> String {
     for adapter_line in adapter_phase_lines(report) {
         lines.push(adapter_line);
     }
+    let postures = sandbox_postures(report);
+    if postures.is_empty() {
+        lines.push("- Sandbox posture: not recorded".to_string());
+    } else {
+        lines.push(format!("- Sandbox posture: {}", postures.join(", ")));
+    }
 
     lines.push(String::new());
     lines.push("## Timing".to_string());
@@ -495,6 +501,20 @@ fn role_label(role: &HepaAgentRole) -> &'static str {
         HepaAgentRole::Worker => "worker",
         HepaAgentRole::Reviewer => "reviewer",
     }
+}
+
+fn sandbox_postures(report: &HepaTerminalTaskReport) -> Vec<String> {
+    let Some(timing) = &report.timing else {
+        return Vec::new();
+    };
+    let mut postures: Vec<String> = timing
+        .phases
+        .iter()
+        .filter_map(|phase| phase.sandbox_posture.clone())
+        .collect();
+    postures.sort();
+    postures.dedup();
+    postures
 }
 
 #[derive(Debug)]
@@ -863,6 +883,7 @@ mod tests {
         assert!(body.contains("Declared risk: medium"));
         assert!(body.contains("worker adapter: worker-fake"));
         assert!(body.contains("reviewer adapter: reviewer-fake"));
+        assert!(body.contains("Sandbox posture: host-worktree"));
         assert!(body.contains("manager passes: 2"));
         assert!(body.contains("Card: hermes-card-1"));
     }
