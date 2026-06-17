@@ -6,6 +6,7 @@ pub mod lane_state;
 pub mod monitor;
 pub mod notifications;
 pub mod readiness;
+pub mod scheduler;
 
 pub const CRATE_NAME: &str = "hepa-core";
 
