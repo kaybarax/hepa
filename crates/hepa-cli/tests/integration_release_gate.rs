@@ -95,6 +95,88 @@ fn task_spec() -> HepaTaskSpec {
 }
 
 #[test]
+fn review_fanout_with_two_reviewers_and_arbitration() {
+    use hepa_core::contracts::{HepaFindingSeverity, HepaReviewFinding, HepaReviewSignal};
+    use hepa_review::arbitration::{
+        apply_deterministic_downgrade_rules, evaluate_staging_after_arbitration,
+    };
+    use hepa_review::fanout::{
+        HepaConfiguredReviewer, HepaReviewFanoutInput, run_configured_reviewers_concurrently,
+    };
+
+    fn signal(
+        adapter: &str,
+        status: HepaReviewStatus,
+        findings: Vec<HepaReviewFinding>,
+    ) -> HepaReviewSignal {
+        HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: format!("review-{adapter}"),
+            lane_id: "lane-1".to_string(),
+            adapter_id: adapter.to_string(),
+            status,
+            findings,
+            summary: vec!["reviewed".to_string()],
+            completed_at: "2026-06-16T00:00:03Z".to_string(),
+        }
+    }
+
+    let reviewers = vec![
+        HepaConfiguredReviewer::new("fake-reviewer-a", |request| {
+            Ok(signal(
+                &request.adapter_id,
+                HepaReviewStatus::Approved,
+                Vec::new(),
+            ))
+        }),
+        HepaConfiguredReviewer::new("fake-reviewer-b", |request| {
+            let finding = HepaReviewFinding {
+                finding_id: "finding-1".to_string(),
+                severity: HepaFindingSeverity::Medium,
+                category: "style".to_string(),
+                evidence: "Out-of-scope nit.".to_string(),
+                in_scope: false,
+                release_risk: false,
+                recommended_action: "Optional cleanup.".to_string(),
+                file_ref: Some("README.md".to_string()),
+                line: Some(1),
+                message: "Minor style nit out of scope.".to_string(),
+                accepted: false,
+            };
+            Ok(signal(
+                &request.adapter_id,
+                HepaReviewStatus::ChangesRequested,
+                vec![finding],
+            ))
+        }),
+    ];
+
+    let result = run_configured_reviewers_concurrently(
+        HepaReviewFanoutInput {
+            lane_id: "lane-1".to_string(),
+            diff_context: "diff --git a/README.md".to_string(),
+            validation_summary: "passed".to_string(),
+            max_diff_bytes: 4096,
+        },
+        reviewers,
+    )
+    .expect("fanout runs concurrently");
+    assert_eq!(result.signals.len(), 2);
+
+    // Arbitrate the single finding: out-of-scope, non-release-risk -> downgraded.
+    let finding = result
+        .signals
+        .iter()
+        .flat_map(|signal| signal.findings.clone())
+        .next()
+        .expect("a finding to arbitrate");
+    let decision = apply_deterministic_downgrade_rules(finding).expect("arbitration");
+    let gate = evaluate_staging_after_arbitration(&[decision]).expect("staging gate");
+    // The settled, non-blocking finding allows staging.
+    assert!(gate.staging_allowed, "blockers: {:?}", gate.blockers);
+}
+
+#[test]
 fn fake_adapter_runs_through_every_gate_to_pr_readiness() {
     let repo = temp_dir("e2e");
     init_repo(&repo);
