@@ -102,6 +102,22 @@ A custom adapter must:
   parse failures are classified explicitly, never silently misparsed.
 - Never request a host permission-bypass flag.
 
+## Design-spec routing
+
+Design-first UI work can use a two-stage routing plan. The manager requests a
+`design` capability first; that adapter writes a sanitized HTML/CSS design spec
+artifact. HEPA then routes the implementation stage, usually to `frontend`, and
+the implementation prompt references the approved design artifact rather than
+embedding raw design output in command arguments.
+
+The design artifact is validated as `html-css`: it must include non-empty HTML
+and CSS, single-line metadata, and no active script content. The implementation
+stage remains an ordinary worker adapter run inside the same safety gates,
+monitor, env allowlist, worktree confinement, review, staging, and PR lifecycle.
+Pi, fake, custom, user-worker, local-worker, and shell-command may advertise
+`design`; projects can still route design and implementation to different
+adapters through normal capability routes.
+
 ## Version pinning
 
 Known-good invocation templates are pinned per adapter version
