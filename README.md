@@ -1,8 +1,16 @@
 # HEPA
 
-HEPA is an independent, Rust-first sibling of HOCA: a Hermes-coordinated,
-agent-agnostic engineering automation system. HOCA is used as a **read-only
-behavioral reference and parity-test source**, never as a runtime dependency.
+**HEPA — Hermes-Pi-Automata** (inspired by HOCA) is an independent, Rust-first
+engineering automation system: Hermes coordinates the fleet, and the **Pi Coding
+Agent** ([pi.dev](https://pi.dev), MIT) is the built-in default harness that does
+the actual coding — so cloud models (e.g. DeepSeek) and local models (e.g. via
+Ollama) work out of the box without wiring your own CLI.
+
+HEPA stays **agent-agnostic**: Pi is the default and namesake, **not** a hard
+requirement. Every implementation/review agent — Pi, Claude Code, Codex, custom,
+or local — routes through the same adapter contract, and no feature privileges
+any vendor outside the adapter layer. HOCA is used as a **read-only behavioral
+reference and parity-test source**, never as a runtime dependency.
 
 Hermes Kanban/dashboard is the default operator surface for HEPA v1.0.0, while
 HEPA's deterministic registry, lane records, artifacts, and state machine remain
@@ -65,6 +73,13 @@ hepa adapter list
 hepa doctor
 ```
 
+> **Pi default harness — in progress (Phase P).** The Pi adapter (install via
+> `hepa adapter install pi`, run with `--agent pi`, pointed at DeepSeek or a
+> local Ollama model) is the planned batteries-included default. It is specified
+> in `hepa-pi-integration-design.md` and tracked as Phase P; until it lands, use
+> the fake adapter or a configured CLI adapter. The commands above reflect what
+> ships today.
+
 Fleet commands accept `--control-root <path>` to target an isolated control
 root (used throughout the test suite).
 
@@ -77,10 +92,15 @@ changing authoritative state. See [docs/hermes-kanban.md](docs/hermes-kanban.md)
 
 ## Adapter Setup and Routing
 
-All execution and review route through the adapter contract — no feature
-hard-requires a specific vendor CLI. Built-in adapters, custom adapter
-requirements, version pinning, and `hepa adapter doctor` troubleshooting are
-documented in [docs/adapters.md](docs/adapters.md).
+The **Pi adapter** is the planned batteries-included default harness (Phase P):
+once it lands, `hepa adapter install pi` installs it and you route it to any
+model — DeepSeek and other clouds directly, or local models via Ollama /
+LM Studio / vLLM. Because all execution and review route through the adapter
+contract, you can use Pi, Claude Code, Codex, custom, or local adapters
+interchangeably — no feature hard-requires a specific vendor CLI. Built-in
+adapters, the Pi setup, custom adapter requirements, version pinning, and
+`hepa adapter doctor` troubleshooting are documented in
+[docs/adapters.md](docs/adapters.md).
 
 ## Safety
 
