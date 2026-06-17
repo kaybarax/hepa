@@ -10,6 +10,7 @@ pub mod hard_blockers;
 pub mod lane_state;
 pub mod monitor;
 pub mod notifications;
+pub mod perf_budget;
 pub mod readiness;
 pub mod redaction;
 pub mod resource_governor;
