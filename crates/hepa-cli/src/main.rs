@@ -136,6 +136,33 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             Ok(format_timing_summary(&timing))
         }
         [command, ..] if command == "timing" => Err("unknown timing command".to_string()),
+        [command] if command == "doctor" => {
+            let config = load_cli_config()?;
+            let registry = HepaAdapterRegistry::load_from_config(&config)
+                .map_err(|error| format!("failed to load adapter registry: {error}"))?;
+            let adapter_report =
+                HepaAdapterDoctorReport::from_registry(&registry, &HepaSystemAdapterDoctorProbe);
+            let kanban_report = HepaKanbanDoctorReport::from_checks([
+                HepaKanbanDoctorCheck::missing("cli", "Install or configure the Hermes CLI/API."),
+                HepaKanbanDoctorCheck::missing("api", "Configure Hermes API access."),
+            ]);
+            Ok(format!(
+                "HEPA doctor:\n[adapters]\n{}\n[kanban]\n{}",
+                adapter_report.to_redacted_summary(),
+                kanban_report.to_redacted_summary()
+            ))
+        }
+        [command, subcommand, path] if command == "bench" && subcommand == "--timing" => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("failed to read timing file: {error}"))?;
+            let timing: HepaTimingRecord = serde_json::from_str(&text)
+                .map_err(|error| format!("failed to parse timing file: {error}"))?;
+            Ok(format!("HEPA bench:\n{}", format_timing_summary(&timing)))
+        }
+        [command] if command == "bench" => Ok(
+            "HEPA bench: provide --timing <file> to summarize a run's timing record".to_string(),
+        ),
+        [command, ..] if command == "bench" => Err("unknown bench command".to_string()),
         [command, repo_path, task_text, flags @ ..] if command == "run" => {
             let options = parse_run_options(flags)?;
             let repo_path = std::path::PathBuf::from(repo_path);
@@ -630,6 +657,54 @@ mod tests {
         ]))
         .expect_err("missing agent value must error");
         assert!(error.contains("--agent requires a value"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn doctor_command_aggregates_adapter_and_kanban_health() {
+        let output = run_cli(&args(&["doctor"])).expect("doctor should run");
+        assert!(output.contains("HEPA doctor:"));
+        assert!(output.contains("[adapters]"));
+        assert!(output.contains("[kanban]"));
+    }
+
+    #[test]
+    fn bench_command_reports_usage_and_reads_timing() {
+        let usage = run_cli(&args(&["bench"])).expect("bench usage should run");
+        assert!(usage.contains("provide --timing"));
+
+        let root = unique_test_dir("bench");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        // Produce a timing artifact via a fake run, then summarize it via bench.
+        let result = run::run_fake_task(&run::HepaFakeRunConfig {
+            control_root: repo.join(".hepa/control"),
+            worktree_root: repo.join(".hepa/worktrees"),
+            archive_root: repo.join(".hepa/archive"),
+            repo_path: repo.clone(),
+            run_id: "run-bench".to_string(),
+            task_id: "task-bench".to_string(),
+            lane_id: "lane-bench".to_string(),
+            task_text: "Update docs".to_string(),
+            timing: true,
+        })
+        .expect("fake run");
+        let timing_path = root.join("timing.json");
+        std::fs::write(
+            &timing_path,
+            serde_json::to_string(&result.timing).expect("serialize timing"),
+        )
+        .expect("write timing");
+
+        let bench = run_cli(&args(&[
+            "bench",
+            "--timing",
+            timing_path.to_str().expect("path is UTF-8"),
+        ]))
+        .expect("bench should summarize timing");
+        assert!(bench.contains("HEPA bench:"));
+        assert!(bench.contains("agent_loops=1"));
 
         remove_test_dir(root);
     }
