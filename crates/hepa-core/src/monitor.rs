@@ -5,6 +5,7 @@ pub struct HepaMonitorPolicy {
     pub command_denylist: Vec<String>,
     pub secret_markers: Vec<String>,
     pub blocked_scope_refs: Vec<String>,
+    pub suspicious_path_markers: Vec<String>,
     pub timeout_ms: Option<u64>,
     pub stall_ms: Option<u64>,
 }
@@ -20,6 +21,7 @@ impl Default for HepaMonitorPolicy {
                 "secret=".to_string(),
             ],
             blocked_scope_refs: Vec::new(),
+            suspicious_path_markers: default_suspicious_path_markers(),
             timeout_ms: None,
             stall_ms: None,
         }
@@ -31,6 +33,7 @@ pub enum HepaMonitorStopKind {
     CommandPolicy,
     SecretDetected,
     ScopeViolation,
+    SuspiciousPath,
     Timeout,
     Stall,
 }
@@ -72,6 +75,28 @@ impl HepaMonitorPolicy {
                 return Err(HepaMonitorStop::new(
                     HepaMonitorStopKind::CommandPolicy,
                     denied.clone(),
+                ));
+            }
+        }
+        for marker in &self.suspicious_path_markers {
+            if command.contains(&marker.to_ascii_lowercase()) {
+                return Err(HepaMonitorStop::new(
+                    HepaMonitorStopKind::SuspiciousPath,
+                    marker.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a referenced file path for suspicious/secret-like access.
+    pub fn check_path(&self, path: &str) -> Result<(), HepaMonitorStop> {
+        let lowered = path.to_ascii_lowercase();
+        for marker in &self.suspicious_path_markers {
+            if lowered.contains(&marker.to_ascii_lowercase()) {
+                return Err(HepaMonitorStop::new(
+                    HepaMonitorStopKind::SuspiciousPath,
+                    marker.clone(),
                 ));
             }
         }
@@ -120,6 +145,25 @@ impl HepaMonitorPolicy {
         }
         Ok(())
     }
+}
+
+fn default_suspicious_path_markers() -> Vec<String> {
+    [
+        ".env",
+        "/.ssh/",
+        "id_rsa",
+        "id_ed25519",
+        ".aws/credentials",
+        ".gnupg",
+        ".npmrc",
+        ".netrc",
+        "/etc/shadow",
+        "/etc/passwd",
+        "private_key",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn default_git_lifecycle_denylist() -> Vec<String> {
@@ -278,5 +322,31 @@ mod tests {
 
         assert!(policy.check_command("reviewer && git diff --stat").is_ok());
         assert!(policy.check_command("worker && git status --short").is_ok());
+    }
+
+    #[test]
+    fn monitor_blocks_suspicious_file_paths() {
+        let policy = HepaMonitorPolicy::default();
+
+        for command in [
+            "cat ~/.ssh/id_rsa",
+            "cp .env /tmp/leak",
+            "less /etc/shadow",
+            "read .aws/credentials",
+        ] {
+            let stop = policy
+                .check_command(command)
+                .expect_err("suspicious path must be blocked");
+            assert_eq!(stop.kind, HepaMonitorStopKind::SuspiciousPath);
+        }
+
+        assert_eq!(
+            policy
+                .check_path("config/.env.local")
+                .expect_err("secret-like path")
+                .kind,
+            HepaMonitorStopKind::SuspiciousPath
+        );
+        assert!(policy.check_path("src/main.rs").is_ok());
     }
 }
