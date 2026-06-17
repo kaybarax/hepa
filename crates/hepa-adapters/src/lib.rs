@@ -17,3 +17,6 @@ pub const CRATE_NAME: &str = "hepa-adapters";
 pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
+
+#[cfg(test)]
+mod configured_adapter_fake_bins;
