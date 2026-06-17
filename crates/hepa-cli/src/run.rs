@@ -338,6 +338,9 @@ pub fn run_live_task(
     )?;
     let validation_started = Instant::now();
     let mut validation = run_live_validation(&allocation.worktree_path, &task_spec);
+    if live_force_first_validation_failure() && validation.status == HepaValidationStatus::Passed {
+        validation = force_validation_failure_for_repair_stress(validation);
+    }
     let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
     write_json(&lane_paths.validation_summary, &validation).map_err(|error| error.to_string())?;
     if validation.status != HepaValidationStatus::Passed {
@@ -1283,6 +1286,40 @@ fn run_live_validation(worktree: &Path, task_spec: &HepaTaskSpec) -> HepaValidat
         failure_type: (!all_passed).then(|| "validation_failed".to_string()),
         summary,
     }
+}
+
+fn live_force_first_validation_failure() -> bool {
+    matches!(
+        std::env::var("HEPA_LIVE_FORCE_FIRST_VALIDATION_FAILURE")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn force_validation_failure_for_repair_stress(
+    mut validation: HepaValidationSummary,
+) -> HepaValidationSummary {
+    for command in &mut validation.commands {
+        if command.exit_code == 0 {
+            command.exit_code = 1;
+            break;
+        }
+    }
+    if validation.commands.is_empty() {
+        validation.commands.push(HepaValidationCommandResult {
+            command: "git diff --check".to_string(),
+            exit_code: 1,
+            duration_ms: 0,
+        });
+    }
+    validation.status = HepaValidationStatus::Failed;
+    validation.failure_type = Some("rs4_controlled_validation_failure".to_string());
+    validation.summary.push(
+        "RS-4 controlled repair trigger forced the first validation result after the real command completed, so Ralph-V2 can prove a bounded failure-aware repair round."
+            .to_string(),
+    );
+    validation
 }
 
 fn run_safe_validation_command(
@@ -2497,6 +2534,37 @@ mod tests {
                 "pnpm install --frozen-lockfile --offline",
                 "pnpm format:check"
             ]
+        );
+    }
+
+    #[test]
+    fn live_controlled_repair_trigger_rewrites_validation_summary() {
+        let validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 0,
+                duration_ms: 4,
+            }],
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["`git diff --check` exited 0.".to_string()],
+        };
+
+        let forced = force_validation_failure_for_repair_stress(validation);
+
+        assert_eq!(forced.status, HepaValidationStatus::Failed);
+        assert_eq!(
+            forced.failure_type.as_deref(),
+            Some("rs4_controlled_validation_failure")
+        );
+        assert_eq!(forced.commands[0].exit_code, 1);
+        assert!(
+            forced
+                .summary
+                .iter()
+                .any(|line| line.contains("RS-4 controlled repair trigger"))
         );
     }
 
