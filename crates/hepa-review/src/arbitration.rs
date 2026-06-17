@@ -116,9 +116,12 @@ pub fn summarize_arbitration_results(
     decisions: &[HepaArbitratedFinding],
 ) -> Result<HepaArbitrationSummary, HepaArbitrationError> {
     if decisions.is_empty() {
-        return Err(HepaArbitrationError {
-            field: "decisions".to_string(),
-            message: "at least one arbitration decision is required".to_string(),
+        return Ok(HepaArbitrationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: "settled".to_string(),
+            records: Vec::new(),
+            pr_body_lines: Vec::new(),
+            card_status: "arbitration=settled records=0 accepted=0".to_string(),
         });
     }
 
@@ -156,9 +159,9 @@ pub fn evaluate_staging_after_arbitration(
     decisions: &[HepaArbitratedFinding],
 ) -> Result<HepaReviewStagingGate, HepaArbitrationError> {
     if decisions.is_empty() {
-        return Err(HepaArbitrationError {
-            field: "decisions".to_string(),
-            message: "at least one arbitration decision is required".to_string(),
+        return Ok(HepaReviewStagingGate {
+            staging_allowed: true,
+            blockers: Vec::new(),
         });
     }
 
@@ -268,6 +271,21 @@ fn severity_rank(severity: &HepaFindingSeverity) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_arbitration_means_clean_review_and_allows_staging() {
+        let summary = summarize_arbitration_results(&[]).expect("empty review is settled");
+        let gate = evaluate_staging_after_arbitration(&[]).expect("empty review stages");
+
+        assert_eq!(summary.status, "settled");
+        assert_eq!(summary.records, Vec::new());
+        assert_eq!(
+            summary.card_status,
+            "arbitration=settled records=0 accepted=0"
+        );
+        assert!(gate.staging_allowed);
+        assert_eq!(gate.blockers, Vec::<String>::new());
+    }
 
     #[test]
     fn downgrades_out_of_scope_non_release_risk_findings_deterministically() {
