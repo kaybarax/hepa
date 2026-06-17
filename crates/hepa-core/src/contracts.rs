@@ -601,6 +601,7 @@ pub enum HepaPhaseStatus {
 pub struct HepaTimingCounters {
     pub agent_loops: u32,
     pub manager_passes: u32,
+    pub worker_profile_llm_calls: u32,
     pub reviewer_passes: u32,
     pub install_events: u32,
     pub container_count: u32,
@@ -873,6 +874,7 @@ mod tests {
                 counters: HepaTimingCounters {
                     agent_loops: 1,
                     manager_passes: 0,
+                    worker_profile_llm_calls: 0,
                     reviewer_passes: 0,
                     install_events: 0,
                     container_count: 0,
@@ -1043,6 +1045,7 @@ mod tests {
             counters: HepaTimingCounters {
                 agent_loops: 1,
                 manager_passes: 1,
+                worker_profile_llm_calls: 0,
                 reviewer_passes: 2,
                 install_events: 1,
                 container_count: 0,
@@ -1057,6 +1060,7 @@ mod tests {
         assert!(json.contains("\"sandbox_posture\": \"host-worktree\""));
         assert!(json.contains("\"agent_loops\": 1"));
         assert!(json.contains("\"manager_passes\": 1"));
+        assert!(json.contains("\"worker_profile_llm_calls\": 0"));
         assert!(json.contains("\"install_events\": 1"));
         assert!(json.contains("\"container_count\": 0"));
     }

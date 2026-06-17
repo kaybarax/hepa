@@ -259,10 +259,11 @@ fn format_timing_summary(timing: &HepaTimingRecord) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "HEPA timing: run={} agent_loops={} manager_passes={} install_events={} container_count={} phases=[{}]",
+        "HEPA timing: run={} agent_loops={} manager_passes={} worker_profile_llm_calls={} install_events={} container_count={} phases=[{}]",
         timing.run_id,
         timing.counters.agent_loops,
         timing.counters.manager_passes,
+        timing.counters.worker_profile_llm_calls,
         timing.counters.install_events,
         timing.counters.container_count,
         phases
@@ -482,6 +483,7 @@ mod tests {
             counters: HepaTimingCounters {
                 agent_loops: 1,
                 manager_passes: 1,
+                worker_profile_llm_calls: 0,
                 reviewer_passes: 0,
                 install_events: 0,
                 container_count: 0,
@@ -502,6 +504,7 @@ mod tests {
 
         assert!(output.contains("HEPA timing: run=run-1"));
         assert!(output.contains("agent_loops=1"));
+        assert!(output.contains("worker_profile_llm_calls=0"));
         assert!(output.contains("worker_attempt=1.250s"));
         assert!(output.contains("routing=default fake adapter"));
         assert!(output.contains("sandbox=host-worktree"));
@@ -526,6 +529,7 @@ mod tests {
         assert!(output.contains("HEPA timing: run=run-cli-fake"));
         assert!(output.contains("agent_loops=1"));
         assert!(output.contains("manager_passes=1"));
+        assert!(output.contains("worker_profile_llm_calls=0"));
         assert!(output.contains("container_count=0"));
         assert!(output.contains("fake_worker=1.000s"));
         assert!(output.contains("fake_review=1.000s"));

@@ -847,6 +847,7 @@ mod tests {
             counters: HepaTimingCounters {
                 agent_loops: 1,
                 manager_passes: 1,
+                worker_profile_llm_calls: 0,
                 reviewer_passes: 0,
                 install_events: 0,
                 container_count: 0,

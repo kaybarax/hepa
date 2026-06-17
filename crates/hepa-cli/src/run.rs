@@ -428,6 +428,7 @@ fn timing_record(config: &HepaFakeRunConfig) -> HepaTimingRecord {
         counters: HepaTimingCounters {
             agent_loops: 1,
             manager_passes: 1,
+            worker_profile_llm_calls: 0,
             reviewer_passes: 1,
             install_events: 0,
             container_count: 0,
@@ -501,6 +502,7 @@ mod tests {
         assert_eq!(result.status, "completed");
         assert!(result.cleanup_performed);
         assert_eq!(result.timing.counters.agent_loops, 1);
+        assert_eq!(result.timing.counters.worker_profile_llm_calls, 0);
         assert_eq!(result.timing.counters.container_count, 0);
         assert!(!config.worktree_root.join("lane-1").exists());
         let run_dir = config.control_root.join("runs/run-1");

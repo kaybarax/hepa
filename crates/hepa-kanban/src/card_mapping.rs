@@ -212,6 +212,10 @@ pub fn map_task_to_hermes_card(
             HepaHermesFieldValue::Number(timing.counters.manager_passes.into()),
         );
         fields.insert(
+            "worker_profile_llm_calls".to_string(),
+            HepaHermesFieldValue::Number(timing.counters.worker_profile_llm_calls.into()),
+        );
+        fields.insert(
             "install_events".to_string(),
             HepaHermesFieldValue::Number(timing.counters.install_events.into()),
         );
@@ -653,6 +657,7 @@ mod tests {
             counters: HepaTimingCounters {
                 agent_loops: 1,
                 manager_passes: 1,
+                worker_profile_llm_calls: 0,
                 reviewer_passes: 1,
                 install_events: 0,
                 container_count: 0,
@@ -726,6 +731,10 @@ mod tests {
         );
         assert_eq!(
             payload.fields.get("install_events"),
+            Some(&HepaHermesFieldValue::Number(0))
+        );
+        assert_eq!(
+            payload.fields.get("worker_profile_llm_calls"),
             Some(&HepaHermesFieldValue::Number(0))
         );
         assert_eq!(
