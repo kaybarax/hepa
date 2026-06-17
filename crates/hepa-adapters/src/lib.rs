@@ -13,6 +13,7 @@ pub mod shell_command;
 pub mod spec;
 pub mod user_reviewer;
 pub mod user_worker;
+pub mod version_pinning;
 
 pub const CRATE_NAME: &str = "hepa-adapters";
 
