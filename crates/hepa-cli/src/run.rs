@@ -328,6 +328,7 @@ pub fn run_live_task(
         started_at: "2026-06-16T00:00:02Z",
         completed_at: "2026-06-16T00:00:03Z",
     })?;
+    lane.attempt_count = 1;
     if live_force_secret_path_change() {
         inject_secret_path_fixture(&allocation.worktree_path)?;
         attempt_outcome.changed_files = collect_changed_files(&allocation.worktree_path)?;
@@ -481,6 +482,7 @@ pub fn run_live_task(
         validation = repair_result.validation;
         attempt_outcome.duration_seconds += repair_result.worker_duration_seconds;
         attempt_outcome.changed_files = repair_result.changed_files;
+        lane.attempt_count = 2;
         write_json(&lane_paths.validation_summary, &validation)
             .map_err(|error| error.to_string())?;
         if validation.status != HepaValidationStatus::Passed {
@@ -574,10 +576,10 @@ pub fn run_live_task(
         transition_and_record(
             &lane_paths,
             &mut lane,
-            5,
+            7,
             HepaLaneState::Blocked,
             "live review fanout blocked",
-            "2026-06-16T00:00:05Z",
+            "2026-06-16T00:00:07Z",
         )?;
         return finish_blocked_live_run(FinishBlockedInput {
             config,
@@ -1391,6 +1393,15 @@ fn live_force_git_lifecycle_violation() -> bool {
     )
 }
 
+fn live_force_review_block() -> bool {
+    matches!(
+        std::env::var("HEPA_LIVE_FORCE_REVIEW_BLOCK")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 fn controlled_git_lifecycle_block() -> Result<hepa_core::hard_blockers::HepaBlockedStatus, String> {
     let stop = HepaMonitorPolicy::default()
         .check_command("adapter && git commit -m rs-5-2-violation")
@@ -1567,7 +1578,14 @@ fn configured_live_reviewer(
     changed_files: Vec<String>,
 ) -> HepaConfiguredReviewer {
     HepaConfiguredReviewer::new(reviewer_adapter_id.clone(), move |request| {
-        let signal = if changed_files.is_empty() {
+        let signal = if live_force_review_block() {
+            live_controlled_review_block_signal(
+                &request.lane_id,
+                &request.adapter_id,
+                &task_id,
+                &changed_files,
+            )
+        } else if changed_files.is_empty() {
             live_no_diff_review_signal(&request.lane_id, &request.adapter_id, &task_id)
         } else if request.adapter_id.contains(":primary:") {
             live_primary_review_signal(
@@ -1588,6 +1606,55 @@ fn configured_live_reviewer(
         };
         Ok(signal)
     })
+}
+
+fn live_controlled_review_block_signal(
+    lane_id: &str,
+    adapter_id: &str,
+    task_id: &str,
+    changed_files: &[String],
+) -> HepaReviewSignal {
+    let route = if adapter_id.contains(":primary:") {
+        "primary"
+    } else {
+        "policy"
+    };
+    HepaReviewSignal {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        review_id: format!("review-rs5-block-{route}"),
+        lane_id: lane_id.to_string(),
+        adapter_id: adapter_id.to_string(),
+        status: HepaReviewStatus::Blocked,
+        findings: vec![HepaReviewFinding {
+            finding_id: format!("rs5-review-blocked-escalation-{route}"),
+            severity: HepaFindingSeverity::High,
+            category: "review-blocked-escalation".to_string(),
+            evidence: format!(
+                "Controlled RS-5.3 reviewer verdict blocked task {task_id} after validation; changed_files={}.",
+                if changed_files.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    changed_files.join(", ")
+                }
+            ),
+            in_scope: true,
+            release_risk: true,
+            recommended_action:
+                "Human manager must inspect the reviewer finding, decide whether to repair or override, then re-run HEPA before staging."
+                    .to_string(),
+            file_ref: changed_files.first().cloned(),
+            line: None,
+            message: "Review-blocked escalation requires human manager guidance before staging."
+                .to_string(),
+            accepted: true,
+        }],
+        summary: vec![
+            "Controlled RS-5.3 reviewer verdict blocked the lane before staging.".to_string(),
+            "Escalation: inspect reviewer evidence, choose repair or documented override, and re-run."
+                .to_string(),
+        ],
+        completed_at: "2026-06-16T00:00:05Z".to_string(),
+    }
 }
 
 fn live_primary_review_signal(
@@ -1713,6 +1780,7 @@ fn arbitrate_live_finding(finding: HepaReviewFinding) -> Result<HepaArbitratedFi
         return Ok(arbitrated);
     }
     match arbitrated.finding.finding_id.as_str() {
+        id if id.starts_with("rs5-review-blocked-escalation-") => Ok(arbitrated),
         "rs3-manager-accept-low" => apply_manager_arbitration(
             arbitrated,
             HepaManagerArbitrationAction::Accept,
@@ -2449,7 +2517,13 @@ fn collect_live_diff(worktree: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hepa_kanban::{card_mapping::HepaHermesFieldValue, sync::HepaMemoryHermesCardStore};
+    use hepa_kanban::{
+        card_mapping::{
+            HepaHermesCardMappingInput, HepaHermesCommentKind, HepaHermesFieldValue,
+            map_task_to_hermes_card,
+        },
+        sync::HepaMemoryHermesCardStore,
+    };
     use std::{
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
@@ -2997,6 +3071,195 @@ mod tests {
     }
 
     #[test]
+    fn live_controlled_review_block_requires_human_escalation_before_staging() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 0,
+                duration_ms: 7,
+            }],
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["`git diff --check` exited 0.".to_string()],
+        };
+        temp_env_var("HEPA_LIVE_FORCE_REVIEW_BLOCK", "1", || {
+            let outcome = live_review_fanout(
+                &config,
+                "pi",
+                &["README.md".to_string()],
+                &validation,
+                "diff --git a/README.md b/README.md",
+            )
+            .expect("fanout should produce a controlled block");
+
+            assert!(!outcome.staging_allowed);
+            assert_eq!(outcome.reviewer_passes, 2);
+            assert!(
+                outcome
+                    .signals
+                    .iter()
+                    .all(|signal| signal.status == HepaReviewStatus::Blocked)
+            );
+            assert_eq!(outcome.arbitration.status, "manager_required");
+            assert!(outcome.blockers.iter().any(|blocker| {
+                blocker.contains("manager arbitration is required before staging")
+            }));
+            assert!(outcome.blockers.iter().any(|blocker| {
+                blocker.contains("review fanout policy required 2 approvals but received 0")
+            }));
+            assert!(outcome.signals.iter().any(|signal| {
+                signal
+                    .summary
+                    .iter()
+                    .any(|line| line.contains("inspect reviewer evidence"))
+            }));
+        });
+    }
+
+    #[test]
+    fn review_blocked_run_projects_blocked_reason_to_hermes_card_payload() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let reason = "Live review fanout blocked the lane; staging and PR were not attempted: rs5-review-blocked-escalation-primary: manager arbitration is required before staging; review fanout policy required 2 approvals but received 0";
+        let validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 0,
+                duration_ms: 7,
+            }],
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["`git diff --check` exited 0.".to_string()],
+        };
+        let signal = live_controlled_review_block_signal(
+            "lane-live",
+            "hepa-manager-live-review:primary:pi",
+            "task-live",
+            &["README.md".to_string()],
+        );
+        let decision = arbitrate_live_finding(signal.findings[0].clone())
+            .expect("controlled finding should require manager arbitration");
+        let arbitration = summarize_arbitration_results(&[decision])
+            .expect("arbitration summary should serialize to card");
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 1.0,
+            validation_duration_seconds: 0.1,
+            review_duration_seconds: 0.1,
+            reviewer_passes: 1,
+            terminal_phase: LivePipelinePhase::ReviewFailed,
+            repair_timing: None,
+        });
+        let task = HepaFleetTask {
+            status: HepaTaskStatus::Blocked,
+            readiness: HepaReadinessState::Blocked,
+            external_card_id: Some("hermes-card-rs5-3".to_string()),
+            ..fleet_task(&config)
+        };
+        let lane = HepaLane {
+            state: HepaLaneState::Blocked,
+            adapter_id: "pi".to_string(),
+            attempt_count: 1,
+            updated_at: "2026-06-16T00:00:05Z".to_string(),
+            ..completed_lane(&config)
+        };
+        let readiness = HepaReadinessResult {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: config.task_id.clone(),
+            status: HepaReadinessStatus::Blocked,
+            blockers: vec![reason.to_string()],
+            questions: Vec::new(),
+            checked_at: "2026-06-16T00:00:05Z".to_string(),
+        };
+        let terminal_report = HepaTerminalTaskReport {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: config.task_id.clone(),
+            lane_id: config.lane_id.clone(),
+            status: HepaTerminalStatus::Blocked,
+            pr_url: None,
+            validation: Some(validation.clone()),
+            review_signals: vec![signal.clone()],
+            arbitration: Some(arbitration),
+            timing: Some(timing.clone()),
+            summary: vec![reason.to_string()],
+            human_attention_required: true,
+            completed_at: "2026-06-16T00:00:05Z".to_string(),
+        };
+
+        let payload = map_task_to_hermes_card(&HepaHermesCardMappingInput {
+            project: HepaProject {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                project_id: "project-1".to_string(),
+                display_name: "HEPA Fixture Project".to_string(),
+                repo_ref: "<TARGET_REPO>".to_string(),
+                default_branch: "main".to_string(),
+                routing_policy_ref: None,
+                is_active: true,
+                created_at: "2026-06-16T00:00:00Z".to_string(),
+                updated_at: "2026-06-16T00:00:05Z".to_string(),
+            },
+            task_spec: live_task_spec(&config),
+            task,
+            lanes: vec![lane],
+            readiness: Some(readiness),
+            validation: Some(validation),
+            review_signals: vec![signal],
+            terminal_report: Some(terminal_report),
+            timing: Some(timing),
+            steering_records: Vec::new(),
+            blocked_questions: Vec::new(),
+        })
+        .expect("blocked review should project to card");
+
+        assert_eq!(
+            payload.fields.get("task_status"),
+            Some(&HepaHermesFieldValue::Text("blocked".to_string()))
+        );
+        assert_eq!(
+            payload.fields.get("readiness_state"),
+            Some(&HepaHermesFieldValue::Text("blocked".to_string()))
+        );
+        assert_eq!(
+            payload.fields.get("terminal_status"),
+            Some(&HepaHermesFieldValue::Text("blocked".to_string()))
+        );
+        assert!(payload.comments.iter().any(|comment| {
+            comment.kind == HepaHermesCommentKind::Readiness
+                && comment
+                    .body
+                    .contains("manager arbitration is required before staging")
+        }));
+        assert!(payload.comments.iter().any(|comment| comment.kind
+            == HepaHermesCommentKind::TerminalReport
+            && comment.body.contains("Human attention required: true")));
+    }
+
+    #[test]
     fn live_validation_output_redacts_lane_runtime_paths() {
         let worktree = PathBuf::from("/tmp/hepa-validation/.hepa/worktrees/lane-cli-fake");
         let output = format!(
@@ -3069,6 +3332,22 @@ mod tests {
             .expect("clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("hepa-cli-{label}-{nonce}"))
+    }
+
+    fn temp_env_var<R>(key: &str, value: &str, test: impl FnOnce() -> R) -> R {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        let result = test();
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(key, previous);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+        result
     }
 
     fn remove_test_dir(root: PathBuf) {
