@@ -69,6 +69,7 @@ version = "0.1.0"
 name = "hepa-review"
 version = "0.1.0"
 dependencies = [
+ "hepa-adapters",
  "hepa-core",
  "serde",
  "serde_json",

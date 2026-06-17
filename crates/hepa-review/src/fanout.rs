@@ -1,3 +1,4 @@
+use hepa_adapters::routing::{HepaReviewFanout, HepaReviewPassPolicy};
 use hepa_core::contracts::{HepaReviewSignal, HepaValidate};
 use std::{error::Error, fmt, sync::Arc, thread};
 
@@ -47,6 +48,15 @@ impl HepaConfiguredReviewer {
 pub struct HepaReviewFanoutResult {
     pub lane_id: String,
     pub signals: Vec<HepaReviewSignal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaReviewPassDecision {
+    pub required_approvals: u32,
+    pub approvals: u32,
+    pub passed: bool,
+    pub approved_adapters: Vec<String>,
+    pub non_approving_adapters: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +119,51 @@ pub fn run_configured_reviewers_concurrently(
         lane_id: input.lane_id,
         signals,
     })
+}
+
+pub fn apply_review_pass_policy(
+    policy: &HepaReviewFanout,
+    signals: &[HepaReviewSignal],
+) -> Result<HepaReviewPassDecision, HepaReviewFanoutError> {
+    policy
+        .validate()
+        .map_err(|error| HepaReviewFanoutError::new(error.field, error.message))?;
+    let mut approved_adapters = Vec::new();
+    let mut non_approving_adapters = Vec::new();
+    for adapter_id in &policy.adapters {
+        let approved = signals.iter().any(|signal| {
+            signal.adapter_id == *adapter_id
+                && matches!(
+                    signal.status,
+                    hepa_core::contracts::HepaReviewStatus::Approved
+                )
+        });
+        if approved {
+            approved_adapters.push(adapter_id.clone());
+        } else {
+            non_approving_adapters.push(adapter_id.clone());
+        }
+    }
+    let approvals = approved_adapters.len() as u32;
+    let passed = policy
+        .passes(approvals)
+        .map_err(|error| HepaReviewFanoutError::new(error.field, error.message))?;
+
+    Ok(HepaReviewPassDecision {
+        required_approvals: required_approvals(policy),
+        approvals,
+        passed,
+        approved_adapters,
+        non_approving_adapters,
+    })
+}
+
+fn required_approvals(policy: &HepaReviewFanout) -> u32 {
+    match policy.pass_policy {
+        HepaReviewPassPolicy::All => policy.adapters.len() as u32,
+        HepaReviewPassPolicy::Any => 1,
+        HepaReviewPassPolicy::AtLeast { required } => required,
+    }
 }
 
 fn validate_input(
@@ -229,13 +284,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn applies_routing_review_pass_policy_deterministically() {
+        let policy = HepaReviewFanout {
+            adapters: vec![
+                "reviewer-a".to_string(),
+                "reviewer-b".to_string(),
+                "reviewer-c".to_string(),
+            ],
+            pass_policy: HepaReviewPassPolicy::AtLeast { required: 2 },
+        };
+        let signals = vec![
+            signal_with_status("lane-1", "reviewer-c", HepaReviewStatus::ChangesRequested),
+            signal_with_status("lane-1", "reviewer-a", HepaReviewStatus::Approved),
+            signal_with_status("lane-1", "reviewer-b", HepaReviewStatus::Approved),
+        ];
+
+        let decision =
+            apply_review_pass_policy(&policy, &signals).expect("pass policy should apply");
+
+        assert!(decision.passed);
+        assert_eq!(decision.required_approvals, 2);
+        assert_eq!(decision.approvals, 2);
+        assert_eq!(
+            decision.approved_adapters,
+            vec!["reviewer-a".to_string(), "reviewer-b".to_string()]
+        );
+        assert_eq!(
+            decision.non_approving_adapters,
+            vec!["reviewer-c".to_string()]
+        );
+    }
+
     fn signal(lane_id: &str, adapter_id: &str) -> HepaReviewSignal {
+        signal_with_status(lane_id, adapter_id, HepaReviewStatus::Approved)
+    }
+
+    fn signal_with_status(
+        lane_id: &str,
+        adapter_id: &str,
+        status: HepaReviewStatus,
+    ) -> HepaReviewSignal {
         HepaReviewSignal {
             schema_version: CONTRACT_SCHEMA_VERSION,
             review_id: format!("review-{adapter_id}"),
             lane_id: lane_id.to_string(),
             adapter_id: adapter_id.to_string(),
-            status: HepaReviewStatus::Approved,
+            status,
             findings: Vec::new(),
             summary: vec!["approved".to_string()],
             completed_at: "2026-06-16T00:00:00Z".to_string(),
