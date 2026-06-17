@@ -3,17 +3,30 @@
 
 use hepa_core::contracts::HepaLaneState;
 use hepa_core::contracts::{
-    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaProject, HepaReadinessState, HepaTaskStatus,
+    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaLane, HepaProject, HepaReadinessResult,
+    HepaReadinessState, HepaReadinessStatus, HepaRiskLevel, HepaTaskSpec, HepaTaskStatus,
 };
 use hepa_core::fleet_monitor::{HepaFleetMonitor, HepaLaneObservation, HepaResourceSample};
 use hepa_core::fleet_registry::{
     HepaCostClass, HepaCostPolicy, HepaFleetRegistry, HepaMemoryPolicy, HepaRegisteredProject,
 };
-use hepa_core::scheduler::{
-    HepaActiveLaneSummary, HepaScheduler, HepaSchedulerLimits, HepaTickOutcome,
+use hepa_core::resource_governor::{
+    HepaLaneReservation, HepaResourceLimits, HepaScheduleCandidate,
 };
-use std::path::{Path, PathBuf};
+use hepa_core::scheduler::{
+    HepaActiveLaneSummary, HepaClaimOutcome, HepaScheduler, HepaSchedulerLimits, HepaTickOutcome,
+};
+use hepa_git::worktree::HepaWorktreeAllocator;
+use hepa_kanban::{
+    card_mapping::HepaHermesCardMappingInput,
+    sync::{HepaKanbanSyncEngine, HepaMemoryHermesCardStore},
+};
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// A single-line timestamp for CLI-driven record mutations.
 fn cli_timestamp() -> String {
@@ -182,7 +195,7 @@ pub fn project_command(args: &[String]) -> Result<String, String> {
 /// Dispatch `hepa task ...`.
 pub fn task_command(args: &[String]) -> Result<String, String> {
     let (subcommand, rest) = args.split_first().ok_or_else(|| {
-        "usage: hepa task <create|list|show|cancel|block|resume|prioritize|sync-kanban>".to_string()
+        "usage: hepa task <create|list|show|cancel|block|complete|resume|prioritize|sync-kanban>".to_string()
     })?;
     let (control_root, flags) = take_control_root(rest)?;
     let registry = HepaFleetRegistry::new(&control_root);
@@ -266,6 +279,15 @@ pub fn task_command(args: &[String]) -> Result<String, String> {
                 task.task_id, task.status
             ))
         }
+        "complete" => {
+            let task = registry
+                .complete_task(&positional(&flags, 0, "task id")?, &now)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HEPA task complete: {} -> {:?}",
+                task.task_id, task.status
+            ))
+        }
         "resume" => {
             let task = registry
                 .resume_task(&positional(&flags, 0, "task id")?, &now)
@@ -311,6 +333,220 @@ fn task_status_to_lane_state(status: &HepaTaskStatus) -> Option<HepaLaneState> {
         HepaTaskStatus::Cancelled => Some(HepaLaneState::Cancelled),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HepaFleetStressRunArtifact {
+    schema_version: u32,
+    run_id: String,
+    projects: usize,
+    tasks: usize,
+    claimed_lanes: Vec<HepaFleetStressLaneArtifact>,
+    resource_observations: Vec<String>,
+    governor_decisions: Vec<String>,
+    card_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HepaFleetStressLaneArtifact {
+    lane_id: String,
+    task_id: String,
+    project_id: String,
+    repo_ref: String,
+    branch: String,
+    worktree_ref: String,
+    card_id: String,
+    status: String,
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut json = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    json.push('\n');
+    fs::write(path, json).map_err(|error| error.to_string())
+}
+
+fn fleet_stress_run(control_root: &Path) -> Result<String, String> {
+    let registry = HepaFleetRegistry::new(control_root);
+    let projects = registry
+        .list_projects()
+        .map_err(|error| error.to_string())?;
+    let tasks = registry.list_tasks().map_err(|error| error.to_string())?;
+    if projects.len() < 3 || tasks.len() < 3 {
+        return Err(
+            "fleet stress-run requires at least three projects and three tasks".to_string(),
+        );
+    }
+
+    let mut scheduler = HepaScheduler::new();
+    scheduler.start();
+    let limits = HepaResourceLimits::new(3, 1);
+    let mut reservations: Vec<HepaLaneReservation> = Vec::new();
+    let mut lanes = Vec::new();
+    let run_dir = control_root.join("fleet/stress-runs/rs-7");
+    fs::create_dir_all(&run_dir).map_err(|error| error.to_string())?;
+
+    for (index, project) in projects.iter().enumerate() {
+        let Some(task) = tasks
+            .iter()
+            .find(|task| task.project_id == project.project.project_id)
+        else {
+            continue;
+        };
+        if task.status == HepaTaskStatus::Queued {
+            registry
+                .mark_task_ready(&task.task_id, &cli_timestamp())
+                .map_err(|error| error.to_string())?;
+        }
+        let lane_id = format!("rs7-lane-{}", project.project.project_id);
+        let candidate = HepaScheduleCandidate {
+            task_id: task.task_id.clone(),
+            adapter_id: if index == 0 {
+                "pi-paid-cloud".to_string()
+            } else {
+                "pi-local".to_string()
+            },
+            cost_class: if index == 0 {
+                HepaCostClass::Paid
+            } else {
+                HepaCostClass::Local
+            },
+            file_areas: vec![format!("repo:{}", project.project.project_id)],
+            conflict_group: Some(project.project.project_id.clone()),
+            touches_lockfile: project.project.project_id.contains("repo-b"),
+        };
+        let claim = scheduler
+            .claim_one(
+                &registry,
+                &limits,
+                &reservations,
+                &candidate,
+                &lane_id,
+                &cli_timestamp(),
+            )
+            .map_err(|error| error.to_string())?;
+        let HepaClaimOutcome::Claimed { lane } = claim else {
+            return Err(format!("scheduler did not claim {}", task.task_id));
+        };
+        reservations.push(lane);
+        let repo_path = PathBuf::from(&project.project.repo_ref);
+        let allocator = HepaWorktreeAllocator::new(&repo_path, repo_path.join(".hepa/worktrees"));
+        let allocation = allocator
+            .allocate_lane_with_metadata(&lane_id, cli_timestamp())
+            .map_err(|error| error.to_string())?;
+        let card_id = format!("hermes-card-rs7-{}", project.project.project_id);
+        let lane_record = HepaLane {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            lane_id: lane_id.clone(),
+            project_id: project.project.project_id.clone(),
+            task_id: task.task_id.clone(),
+            adapter_id: candidate.adapter_id.clone(),
+            state: HepaLaneState::Completed,
+            worktree_ref: format!("worktree:{lane_id}"),
+            branch: allocation.branch.clone(),
+            run_dir_ref: "control:fleet/stress-runs/rs-7".to_string(),
+            attempt_count: 1,
+            created_at: cli_timestamp(),
+            updated_at: cli_timestamp(),
+            completed_at: Some(cli_timestamp()),
+        };
+        let completed_task = registry
+            .complete_task(&task.task_id, &cli_timestamp())
+            .map_err(|error| error.to_string())?;
+        let task_spec = HepaTaskSpec {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: task.task_id.clone(),
+            project_id: project.project.project_id.clone(),
+            goal: task.title.clone(),
+            non_goals: vec!["Validation-only RS-7 fleet stress lane.".to_string()],
+            expected_areas: vec![format!("repo:{}", project.project.project_id)],
+            acceptance_criteria: vec!["Fleet lane reaches terminal state.".to_string()],
+            validation_commands: Vec::new(),
+            dependencies: Vec::new(),
+            target_branch: Some(project.project.default_branch.clone()),
+            risk_level: HepaRiskLevel::Low,
+            max_total_rounds: 1,
+            created_at: cli_timestamp(),
+        };
+        let readiness = HepaReadinessResult {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: task.task_id.clone(),
+            status: HepaReadinessStatus::Ready,
+            blockers: Vec::new(),
+            questions: Vec::new(),
+            checked_at: cli_timestamp(),
+        };
+        let card_payload =
+            hepa_kanban::card_mapping::map_task_to_hermes_card(&HepaHermesCardMappingInput {
+                project: project.project.clone(),
+                task_spec,
+                task: HepaFleetTask {
+                    external_card_id: Some(card_id.clone()),
+                    ..completed_task
+                },
+                lanes: vec![lane_record],
+                readiness: Some(readiness),
+                validation: None,
+                review_signals: Vec::new(),
+                terminal_report: None,
+                timing: None,
+                steering_records: Vec::new(),
+                blocked_questions: Vec::new(),
+            })
+            .map_err(|error| error.to_string())?;
+        write_json(&run_dir.join(format!("{lane_id}-card.json")), &card_payload)?;
+        lanes.push(HepaFleetStressLaneArtifact {
+            lane_id,
+            task_id: task.task_id.clone(),
+            project_id: project.project.project_id.clone(),
+            repo_ref: "<VALIDATION_REPO>".to_string(),
+            branch: allocation.branch,
+            worktree_ref: format!("worktree:{}", allocation.lane_id),
+            card_id,
+            status: "completed".to_string(),
+        });
+    }
+
+    let mut store = HepaMemoryHermesCardStore::default();
+    let sync_summary = HepaKanbanSyncEngine::new()
+        .sync_tasks(&[], &mut store)
+        .map_err(|error| error.to_string())?;
+    let artifact = HepaFleetStressRunArtifact {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        run_id: "rs-7-fleet-stress".to_string(),
+        projects: projects.len(),
+        tasks: tasks.len(),
+        card_ids: lanes.iter().map(|lane| lane.card_id.clone()).collect(),
+        claimed_lanes: lanes,
+        resource_observations: vec![
+            "max_parallel_lanes=3".to_string(),
+            "paid_lane_cap=1".to_string(),
+            format!("active_reservations={}", reservations.len()),
+            format!("kanban_memory_sync_status={:?}", sync_summary.status),
+        ],
+        governor_decisions: reservations
+            .iter()
+            .map(|reservation| {
+                format!(
+                    "{} adapter={} cost={:?} file_areas={}",
+                    reservation.lane_id,
+                    reservation.adapter_id,
+                    reservation.cost_class,
+                    reservation.file_areas.join(",")
+                )
+            })
+            .collect(),
+    };
+    write_json(&run_dir.join("summary.json"), &artifact)?;
+    Ok(format!(
+        "HEPA fleet stress-run: projects={} tasks={} lanes={} artifacts={}",
+        artifact.projects,
+        artifact.tasks,
+        artifact.claimed_lanes.len(),
+        run_dir.display()
+    ))
 }
 
 /// Dispatch `hepa fleet <status|doctor|report|cleanup|reconcile>`.
@@ -419,6 +655,7 @@ pub fn fleet_command(args: &[String]) -> Result<String, String> {
                 report.actions.len()
             ))
         }
+        "stress-run" => fleet_stress_run(&control_root),
         other => Err(format!("unknown fleet command: {other}")),
     }
 }

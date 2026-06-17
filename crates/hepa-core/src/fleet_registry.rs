@@ -176,6 +176,15 @@ impl HepaFleetRegistry {
         self.set_task_status(task_id, HepaTaskStatus::Cancelled, updated_at)
     }
 
+    /// Complete a task after its lane reaches a terminal done state.
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        self.set_task_status(task_id, HepaTaskStatus::Completed, updated_at)
+    }
+
     /// Resume a blocked task back into the queue.
     pub fn resume_task(
         &self,
@@ -268,6 +277,26 @@ impl HepaFleetRegistry {
     ) -> Result<HepaFleetTask, HepaFleetError> {
         let mut task = self.require_task(task_id)?;
         task.readiness = readiness;
+        task.updated_at = updated_at.to_string();
+        self.persist_task(&task)?;
+        Ok(task)
+    }
+
+    /// Mark a queued task ready for scheduler claim after readiness checks pass.
+    pub fn mark_task_ready(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        let mut task = self.require_task(task_id)?;
+        if task.status != HepaTaskStatus::Queued {
+            return Err(HepaFleetError::new(
+                "status",
+                "only queued tasks can be marked ready",
+            ));
+        }
+        task.status = HepaTaskStatus::Ready;
+        task.readiness = HepaReadinessState::Ready;
         task.updated_at = updated_at.to_string();
         self.persist_task(&task)?;
         Ok(task)
