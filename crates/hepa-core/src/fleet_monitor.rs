@@ -74,6 +74,30 @@ fn expected_card_status(lane_state: &HepaLaneState) -> Vec<&'static str> {
     }
 }
 
+fn is_terminal_lane(lane_state: &HepaLaneState) -> bool {
+    matches!(
+        lane_state,
+        HepaLaneState::Completed
+            | HepaLaneState::Cleaned
+            | HepaLaneState::Failed
+            | HepaLaneState::Cancelled
+    )
+}
+
+/// A repair the reconciler wants applied to bring board/state back in sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HepaReconcileAction {
+    MarkLaneStale { lane_id: String },
+    RecreateCard { lane_id: String, task_id: String },
+    PruneWorktree { lane_id: String },
+    FinalizeTerminalLane { lane_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaReconciliationReport {
+    pub actions: Vec<HepaReconcileAction>,
+}
+
 /// Deterministic fleet monitor.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HepaFleetMonitor;
@@ -110,6 +134,53 @@ impl HepaFleetMonitor {
             resource_sample,
             drifted_lanes,
         }
+    }
+
+    /// Reconcile board/state drift into concrete repair actions: stale leases,
+    /// missing cards, orphaned worktrees, and terminal lanes. Actions are
+    /// deterministically ordered.
+    pub fn reconcile(observations: &[HepaLaneObservation]) -> HepaReconciliationReport {
+        let mut actions = Vec::new();
+        for observation in observations {
+            let terminal = is_terminal_lane(&observation.lane_state);
+            if !terminal && !observation.process_alive {
+                actions.push(HepaReconcileAction::MarkLaneStale {
+                    lane_id: observation.lane_id.clone(),
+                });
+            }
+            if !terminal && observation.card_status.is_none() {
+                actions.push(HepaReconcileAction::RecreateCard {
+                    lane_id: observation.lane_id.clone(),
+                    task_id: observation.task_id.clone(),
+                });
+            }
+            if terminal && observation.worktree_present {
+                actions.push(HepaReconcileAction::PruneWorktree {
+                    lane_id: observation.lane_id.clone(),
+                });
+            }
+            if terminal
+                && observation.card_status.as_deref().is_some_and(|status| {
+                    !expected_card_status(&observation.lane_state)
+                        .contains(&status.trim().to_ascii_lowercase().as_str())
+                })
+            {
+                actions.push(HepaReconcileAction::FinalizeTerminalLane {
+                    lane_id: observation.lane_id.clone(),
+                });
+            }
+        }
+        actions.sort_by_key(action_key);
+        HepaReconciliationReport { actions }
+    }
+}
+
+fn action_key(action: &HepaReconcileAction) -> (u8, String) {
+    match action {
+        HepaReconcileAction::MarkLaneStale { lane_id } => (0, lane_id.clone()),
+        HepaReconcileAction::RecreateCard { lane_id, .. } => (1, lane_id.clone()),
+        HepaReconcileAction::PruneWorktree { lane_id } => (2, lane_id.clone()),
+        HepaReconcileAction::FinalizeTerminalLane { lane_id } => (3, lane_id.clone()),
     }
 }
 
@@ -151,6 +222,63 @@ mod tests {
             Some("passed")
         );
         assert_eq!(snapshot.resource_sample.memory_mb, 2048);
+    }
+
+    #[test]
+    fn reconcile_repairs_stale_missing_orphan_and_terminal_drift() {
+        // Stale lease: active lane with a dead process.
+        let mut stale = observation("lane-stale", HepaLaneState::Running);
+        stale.process_alive = false;
+        stale.card_status = Some("in_progress".to_string());
+
+        // Missing card: active lane with no board card.
+        let missing = observation("lane-missing", HepaLaneState::Running);
+
+        // Orphaned worktree: terminal lane still holding a worktree.
+        let mut orphan = observation("lane-orphan", HepaLaneState::Completed);
+        orphan.worktree_present = true;
+        orphan.card_status = Some("done".to_string());
+
+        // Terminal lane whose card still says in_progress.
+        let mut terminal_drift = observation("lane-term", HepaLaneState::Completed);
+        terminal_drift.worktree_present = false;
+        terminal_drift.card_status = Some("in_progress".to_string());
+
+        let report = HepaFleetMonitor::reconcile(&[stale, missing, orphan, terminal_drift]);
+
+        assert!(
+            report
+                .actions
+                .contains(&HepaReconcileAction::MarkLaneStale {
+                    lane_id: "lane-stale".to_string()
+                })
+        );
+        assert!(report.actions.contains(&HepaReconcileAction::RecreateCard {
+            lane_id: "lane-missing".to_string(),
+            task_id: "task-lane-missing".to_string()
+        }));
+        assert!(
+            report
+                .actions
+                .contains(&HepaReconcileAction::PruneWorktree {
+                    lane_id: "lane-orphan".to_string()
+                })
+        );
+        assert!(
+            report
+                .actions
+                .contains(&HepaReconcileAction::FinalizeTerminalLane {
+                    lane_id: "lane-term".to_string()
+                })
+        );
+    }
+
+    #[test]
+    fn reconcile_leaves_healthy_lanes_untouched() {
+        let mut healthy = observation("lane-1", HepaLaneState::Running);
+        healthy.card_status = Some("in_progress".to_string());
+        let report = HepaFleetMonitor::reconcile(&[healthy]);
+        assert!(report.actions.is_empty());
     }
 
     #[test]
