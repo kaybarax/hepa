@@ -201,10 +201,10 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                 task_text: task_text.clone(),
                 timing: options.timing,
             };
-            let result = if options.agent == "pi" {
-                run::run_live_task(&run_config, "pi")?
-            } else {
+            let result = if options.agent == "fake" {
                 run::run_fake_task(&run_config)?
+            } else {
+                run::run_live_task(&run_config, &options.agent)?
             };
             if options.timing {
                 Ok(format_timing_summary(&result.timing))
@@ -712,6 +712,27 @@ mod tests {
         ]))
         .expect_err("missing agent value must error");
         assert!(error.contains("--agent requires a value"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn run_command_routes_non_fake_agents_to_live_adapter() {
+        let root = unique_test_dir("run-custom-live");
+        let repo = root.join("repo");
+        init_repo(&repo);
+
+        let error = run_cli(&args(&[
+            "run",
+            repo.to_str().expect("test path is UTF-8"),
+            "Update docs",
+            "--agent",
+            "custom",
+        ]))
+        .expect_err("custom should attempt live adapter execution");
+
+        assert!(error.contains("failed to spawn adapter"));
+        assert!(!repo.join(".hepa/control/runs/run-cli-fake/tasks/task-cli-fake/lanes/lane-cli-fake/final-report.json").exists());
 
         remove_test_dir(root);
     }
