@@ -34,14 +34,19 @@ impl HepaPiModelConfig {
     }
 
     pub fn cost_class(&self) -> HepaAdapterCostClass {
-        if is_local_model(&self.model)
-            || self.review_model.as_deref().is_some_and(is_local_model)
-            || self.base_url.as_deref().is_some_and(is_loopback_url)
-            || self.provider_key_env.is_none()
-        {
-            HepaAdapterCostClass::Local
-        } else {
+        let worker_model = format!("{}/{}", self.provider, self.model);
+        let worker_is_local = is_local_model(&worker_model)
+            || (self.base_url.as_deref().is_some_and(is_loopback_url)
+                && self.provider_key_env.is_none());
+        let reviewer_is_local = self
+            .review_model
+            .as_deref()
+            .map(is_local_model)
+            .unwrap_or(worker_is_local);
+        if self.provider_key_env.is_some() && (!worker_is_local || !reviewer_is_local) {
             HepaAdapterCostClass::PaidCloud
+        } else {
+            HepaAdapterCostClass::Local
         }
     }
 }
@@ -80,7 +85,13 @@ pub fn model_config_from_env(
     let provider_key_env = environment
         .get("HEPA_PI_PROVIDER_KEY_ENV")
         .cloned()
-        .or_else(|| env_key_for_model(&format!("{provider}/{model}")).map(str::to_string));
+        .or_else(|| env_key_for_model(&format!("{provider}/{model}")).map(str::to_string))
+        .or_else(|| {
+            review_model
+                .as_deref()
+                .and_then(env_key_for_model)
+                .map(str::to_string)
+        });
     let base_url = environment.get("HEPA_PI_BASE_URL").cloned();
     HepaPiModelConfig {
         provider,
@@ -93,19 +104,27 @@ pub fn model_config_from_env(
 
 pub fn adapter_spec_from_config(config: &HepaPiConfig) -> HepaAdapterSpec {
     let (provider, model) = split_provider_model(&config.model);
-    let review_model = config
+    let (review_provider, review_model) = config
         .review_model
         .as_deref()
         .map(split_provider_model)
         .unwrap_or_else(|| (provider.clone(), model.clone()));
+    let review_model_full = format!("{review_provider}/{review_model}");
     let model_config = HepaPiModelConfig {
         provider,
         model,
-        review_model: Some(review_model.1.clone()).filter(|value| !value.trim().is_empty()),
+        review_model: Some(review_model_full.clone()).filter(|value| !value.trim().is_empty()),
         provider_key_env: config
             .provider_key_env
             .clone()
-            .or_else(|| env_key_for_model(&config.model).map(str::to_string)),
+            .or_else(|| env_key_for_model(&config.model).map(str::to_string))
+            .or_else(|| {
+                config
+                    .review_model
+                    .as_deref()
+                    .and_then(env_key_for_model)
+                    .map(str::to_string)
+            }),
         base_url: config.base_url.clone(),
     };
     let mut spec = builtin_adapter_spec(PI_ADAPTER_ID);
@@ -115,11 +134,7 @@ pub fn adapter_spec_from_config(config: &HepaPiConfig) -> HepaAdapterSpec {
     );
     spec.review_command = Some(format!(
         "pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files --tools read,edit,write,bash,grep,find,ls -p --mode json --provider {} --model {}",
-        model_config.provider,
-        model_config
-            .review_model
-            .as_deref()
-            .unwrap_or(model_config.model.as_str())
+        review_provider, review_model
     ));
     spec.required_env = model_config.required_env();
     spec.cost_class = model_config.cost_class();
@@ -378,6 +393,36 @@ mod tests {
         );
         assert_eq!(spec.required_env, Vec::<String>::new());
         assert_eq!(spec.cost_class, HepaAdapterCostClass::Local);
+    }
+
+    #[test]
+    fn pi_adapter_spec_allows_local_worker_with_cloud_reviewer() {
+        let spec = adapter_spec_from_config(&HepaPiConfig {
+            model: "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+            review_model: Some("deepseek/deepseek-chat".to_string()),
+            provider_key_env: None,
+            base_url: Some("http://127.0.0.1:52415/v1".to_string()),
+        });
+
+        assert!(spec.command.contains("--provider local"));
+        assert!(
+            spec.command
+                .contains("--model mlx-community/Qwen3-30B-A3B-4bit")
+        );
+        assert!(
+            spec.review_command
+                .as_deref()
+                .unwrap()
+                .contains("--provider deepseek")
+        );
+        assert!(
+            spec.review_command
+                .as_deref()
+                .unwrap()
+                .contains("--model deepseek-chat")
+        );
+        assert_eq!(spec.required_env, vec!["DEEPSEEK_API_KEY".to_string()]);
+        assert_eq!(spec.cost_class, HepaAdapterCostClass::PaidCloud);
     }
 
     #[test]

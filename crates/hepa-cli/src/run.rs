@@ -1,6 +1,7 @@
 use hepa_adapters::{
     engine::{HepaOneshotAdapterExecutor, HepaOneshotAdapterInvocation},
     fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput},
+    pi::parse_pi_json_events,
     registry::HepaAdapterRegistry,
     routing::{HepaReviewFanout, HepaReviewPassPolicy},
     spec::{HepaAdapterOutputCapture, HepaAdapterRole, HepaAdapterTemplateContext},
@@ -48,6 +49,7 @@ use hepa_review::{
         HepaConfiguredReviewer, HepaReviewFanoutInput, aggregate_review_findings,
         apply_review_pass_policy, run_configured_reviewers_concurrently,
     },
+    parser::{HepaReviewerOutputInput, normalize_reviewer_output_by_exception},
     repair::{
         HepaRepairBriefInput, HepaRepairRoundPolicy, HepaRepairRoundState,
         enforce_repair_round_budget, rewrite_repair_prompt_from_evidence,
@@ -559,6 +561,10 @@ pub fn run_live_task(
     let review_outcome = live_review_fanout(
         config,
         adapter_id,
+        &spec,
+        &environment,
+        &lane_paths,
+        &allocation,
         &attempt_outcome.changed_files,
         &validation,
         &diff_context,
@@ -1574,6 +1580,184 @@ struct LiveReviewOutcome {
 }
 
 fn live_review_fanout(
+    config: &HepaFakeRunConfig,
+    adapter_id: &str,
+    spec: &hepa_adapters::spec::HepaAdapterSpec,
+    environment: &std::collections::BTreeMap<String, String>,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    allocation: &HepaWorktreeAllocation,
+    changed_files: &[String],
+    validation: &HepaValidationSummary,
+    diff_context: &str,
+) -> Result<LiveReviewOutcome, String> {
+    if live_adapter_review_enabled() {
+        return live_adapter_review(
+            config,
+            adapter_id,
+            spec,
+            environment,
+            lane_paths,
+            allocation,
+            changed_files,
+            validation,
+            diff_context,
+        );
+    }
+    live_deterministic_review_fanout(config, adapter_id, changed_files, validation, diff_context)
+}
+
+fn live_adapter_review_enabled() -> bool {
+    matches!(
+        std::env::var("HEPA_LIVE_REVIEW_MODE").ok().as_deref(),
+        Some("adapter" | "ADAPTER" | "live-adapter" | "LIVE_ADAPTER")
+    )
+}
+
+fn live_adapter_review(
+    config: &HepaFakeRunConfig,
+    adapter_id: &str,
+    spec: &hepa_adapters::spec::HepaAdapterSpec,
+    environment: &std::collections::BTreeMap<String, String>,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    allocation: &HepaWorktreeAllocation,
+    changed_files: &[String],
+    validation: &HepaValidationSummary,
+    diff_context: &str,
+) -> Result<LiveReviewOutcome, String> {
+    let review_id = "review-live-adapter";
+    let prompt = live_review_prompt(config, changed_files, validation, diff_context);
+    let review_output = lane_paths.lane_dir.join("review/live-adapter-output.jsonl");
+    let prompt_path = lane_paths.lane_dir.join("review/live-adapter-prompt.md");
+    if let Some(parent) = prompt_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&prompt_path, &prompt).map_err(|error| error.to_string())?;
+    let invocation = HepaOneshotAdapterInvocation {
+        spec: spec.clone(),
+        role: HepaAdapterRole::Reviewer,
+        context: HepaAdapterTemplateContext {
+            prompt_file: lane_paths.lane_dir.join("prompt.md").display().to_string(),
+            worktree: allocation.worktree_path.display().to_string(),
+            review_prompt_file: prompt_path.display().to_string(),
+            output_file: lane_paths
+                .lane_dir
+                .join("attempts/attempt-1/attempt.json")
+                .display()
+                .to_string(),
+            review_output_file: review_output.display().to_string(),
+            artifact_dir: lane_paths.lane_dir.display().to_string(),
+        },
+        prompt,
+        environment: environment.clone(),
+        monitor_policy: live_monitor_policy(),
+    };
+    let result = HepaOneshotAdapterExecutor::new()
+        .run(&invocation)
+        .map_err(|error| error.to_string())?;
+    let raw_review = adapter_review_payload(adapter_id, &result.stdout, &review_output)?;
+    let normalization = normalize_reviewer_output_by_exception(
+        HepaReviewerOutputInput {
+            review_id: review_id.to_string(),
+            lane_id: config.lane_id.clone(),
+            adapter_id: format!("live-reviewer:{adapter_id}"),
+            completed_at: "2026-06-16T00:00:06Z".to_string(),
+            raw_output: raw_review,
+        },
+        |input, error| {
+            Ok(HepaReviewSignal {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                review_id: input.review_id,
+                lane_id: input.lane_id,
+                adapter_id: input.adapter_id,
+                status: HepaReviewStatus::Failed,
+                findings: Vec::new(),
+                summary: vec![format!(
+                    "Live adapter reviewer output did not normalize: {}: {}",
+                    error.field, error.message
+                )],
+                completed_at: input.completed_at,
+            })
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let signal = normalization.signal;
+    let policy = HepaReviewFanout {
+        adapters: vec![signal.adapter_id.clone()],
+        pass_policy: HepaReviewPassPolicy::All,
+    };
+    let pass_decision = apply_review_pass_policy(&policy, std::slice::from_ref(&signal))
+        .map_err(|error| error.to_string())?;
+    let findings = aggregate_review_findings(std::slice::from_ref(&signal))
+        .map_err(|error| error.to_string())?;
+    let mut decisions = Vec::new();
+    for finding in findings {
+        decisions.push(arbitrate_live_finding(finding.finding)?);
+    }
+    let arbitration =
+        summarize_arbitration_results(&decisions).map_err(format_arbitration_error)?;
+    let staging_gate =
+        evaluate_staging_after_arbitration(&decisions).map_err(format_arbitration_error)?;
+    let mut blockers = staging_gate.blockers;
+    if !pass_decision.passed {
+        blockers.push(format!(
+            "live adapter reviewer required {} approval but received {}",
+            pass_decision.required_approvals, pass_decision.approvals
+        ));
+    }
+    blockers.sort();
+    Ok(LiveReviewOutcome {
+        reviewer_passes: 1,
+        signals: vec![signal],
+        arbitration,
+        staging_allowed: blockers.is_empty(),
+        blockers,
+    })
+}
+
+fn live_review_prompt(
+    config: &HepaFakeRunConfig,
+    changed_files: &[String],
+    validation: &HepaValidationSummary,
+    diff_context: &str,
+) -> String {
+    format!(
+        "You are HEPA's live reviewer.\n\nTask:\n{}\n\nChanged files:\n{}\n\nValidation status: {:?}\n\nDiff context:\n{}\n\nReturn only a JSON object with this schema: {{\"status\":\"approved|changes_requested|blocked|failed\",\"summary\":[\"...\"],\"findings\":[{{\"severity\":\"low|medium|high|critical\",\"category\":\"...\",\"evidence\":\"...\",\"in_scope\":true,\"release_risk\":false,\"recommended_action\":\"...\",\"file_ref\":null,\"line\":null,\"message\":\"...\",\"accepted\":true}}]}}.\nIf there are no blocking issues, use status approved and an empty findings array. Do not create commits, branches, tags, pull requests, or Git remotes.",
+        sanitized_task_text(config),
+        if changed_files.is_empty() {
+            "<none>".to_string()
+        } else {
+            changed_files.join(", ")
+        },
+        validation.status,
+        diff_context
+    )
+}
+
+fn adapter_review_payload(
+    adapter_id: &str,
+    stdout: &str,
+    output_file: &Path,
+) -> Result<String, String> {
+    let raw = if stdout.trim().is_empty() {
+        fs::read_to_string(output_file).unwrap_or_default()
+    } else {
+        stdout.to_string()
+    };
+    if adapter_id == "pi" {
+        let parsed = parse_pi_json_events(&raw).map_err(|error| error.to_string())?;
+        return extract_json_object(&parsed.final_message)
+            .ok_or_else(|| "Pi reviewer final message did not contain a JSON object".to_string());
+    }
+    Ok(extract_json_object(&raw).unwrap_or(raw))
+}
+
+fn extract_json_object(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end >= start).then(|| raw[start..=end].to_string())
+}
+
+fn live_deterministic_review_fanout(
     config: &HepaFakeRunConfig,
     adapter_id: &str,
     changed_files: &[String],
@@ -3123,7 +3307,7 @@ mod tests {
             summary: vec!["`git diff --check` exited 0.".to_string()],
         };
 
-        let outcome = live_review_fanout(
+        let outcome = live_deterministic_review_fanout(
             &config,
             "pi",
             &["README.md".to_string()],
@@ -3153,6 +3337,62 @@ mod tests {
         assert!(dispositions.contains(&"downgraded"));
         assert!(outcome.arbitration.card_status.contains("arbitration="));
         assert!(outcome.blockers.is_empty());
+    }
+
+    #[test]
+    fn live_review_prompt_requires_json_and_preserves_git_lifecycle() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 0,
+                duration_ms: 7,
+            }],
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["`git diff --check` exited 0.".to_string()],
+        };
+
+        let prompt = live_review_prompt(
+            &config,
+            &["README.md".to_string()],
+            &validation,
+            "diff --git a/README.md b/README.md",
+        );
+
+        assert!(prompt.contains("Return only a JSON object"));
+        assert!(prompt.contains("\"status\":\"approved|changes_requested|blocked|failed\""));
+        assert!(prompt.contains("Do not create commits"));
+        assert!(prompt.contains("pull requests"));
+    }
+
+    #[test]
+    fn adapter_review_payload_extracts_json_from_pi_final_message() {
+        let root = unique_test_dir("adapter-review-payload");
+        let output_file = root.join("review.jsonl");
+        let stdout = r#"{"type":"agent_start"}
+{"type":"agent_end","message":{"content":"Here is the review:\n{\"status\":\"approved\",\"summary\":[\"ok\"],\"findings\":[]}"}}"#;
+
+        let payload = adapter_review_payload("pi", stdout, &output_file)
+            .expect("Pi final JSON should extract");
+
+        assert_eq!(
+            payload,
+            "{\"status\":\"approved\",\"summary\":[\"ok\"],\"findings\":[]}"
+        );
+        remove_test_dir(root);
     }
 
     #[test]
