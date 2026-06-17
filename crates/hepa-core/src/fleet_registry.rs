@@ -1,4 +1,4 @@
-use crate::contracts::{HepaProject, HepaValidate};
+use crate::contracts::{HepaFleetTask, HepaProject, HepaTaskStatus, HepaValidate};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -111,6 +111,120 @@ impl HepaFleetRegistry {
         Ok(projects)
     }
 
+    fn tasks_dir(&self) -> PathBuf {
+        self.control_root.join("fleet").join("tasks")
+    }
+
+    fn task_path(&self, task_id: &str) -> PathBuf {
+        self.tasks_dir().join(format!("{task_id}.json"))
+    }
+
+    /// Create a fleet task. Dependencies and readiness state ride along on the
+    /// contract record.
+    pub fn create_task(&self, task: &HepaFleetTask) -> Result<(), HepaFleetError> {
+        task.validate()
+            .map_err(|error| HepaFleetError::new(error.field, error.message))?;
+        require_safe_segment("task_id", &task.task_id)?;
+        fs::create_dir_all(self.tasks_dir())?;
+        write_stable_json(&self.task_path(&task.task_id), task)
+    }
+
+    /// Show a task, or `None` if absent.
+    pub fn show_task(&self, task_id: &str) -> Result<Option<HepaFleetTask>, HepaFleetError> {
+        let path = self.task_path(task_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(read_json(&path)?))
+    }
+
+    /// List tasks in stable `task_id` order.
+    pub fn list_tasks(&self) -> Result<Vec<HepaFleetTask>, HepaFleetError> {
+        let mut tasks: Vec<HepaFleetTask> = self.read_records(&self.tasks_dir())?;
+        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        Ok(tasks)
+    }
+
+    /// Block a task, recording the requested status transition.
+    pub fn block_task(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        self.set_task_status(task_id, HepaTaskStatus::Blocked, updated_at)
+    }
+
+    /// Cancel a task.
+    pub fn cancel_task(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        self.set_task_status(task_id, HepaTaskStatus::Cancelled, updated_at)
+    }
+
+    /// Resume a blocked task back into the queue.
+    pub fn resume_task(
+        &self,
+        task_id: &str,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        self.set_task_status(task_id, HepaTaskStatus::Queued, updated_at)
+    }
+
+    /// Set a task's scheduling priority. Terminal tasks cannot be reprioritized.
+    pub fn prioritize_task(
+        &self,
+        task_id: &str,
+        priority: u32,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        let mut task = self.require_task(task_id)?;
+        if matches!(
+            task.status,
+            HepaTaskStatus::Completed | HepaTaskStatus::Cancelled
+        ) {
+            return Err(HepaFleetError::new(
+                "status",
+                "terminal tasks cannot be reprioritized",
+            ));
+        }
+        task.priority = priority;
+        task.updated_at = updated_at.to_string();
+        self.persist_task(&task)?;
+        Ok(task)
+    }
+
+    fn set_task_status(
+        &self,
+        task_id: &str,
+        next: HepaTaskStatus,
+        updated_at: &str,
+    ) -> Result<HepaFleetTask, HepaFleetError> {
+        let mut task = self.require_task(task_id)?;
+        if !task.status.can_transition_to(&next) {
+            return Err(HepaFleetError::new(
+                "status",
+                format!("invalid task transition to {}", status_name(&next)),
+            ));
+        }
+        task.status = next;
+        task.updated_at = updated_at.to_string();
+        self.persist_task(&task)?;
+        Ok(task)
+    }
+
+    fn require_task(&self, task_id: &str) -> Result<HepaFleetTask, HepaFleetError> {
+        self.show_task(task_id)?
+            .ok_or_else(|| HepaFleetError::new("task_id", "task not found"))
+    }
+
+    fn persist_task(&self, task: &HepaFleetTask) -> Result<(), HepaFleetError> {
+        task.validate()
+            .map_err(|error| HepaFleetError::new(error.field, error.message))?;
+        write_stable_json(&self.task_path(&task.task_id), task)
+    }
+
     fn read_records<T>(&self, dir: &Path) -> Result<Vec<T>, HepaFleetError>
     where
         T: for<'de> Deserialize<'de>,
@@ -162,6 +276,18 @@ impl From<io::Error> for HepaFleetError {
 impl From<serde_json::Error> for HepaFleetError {
     fn from(error: serde_json::Error) -> Self {
         Self::new("serde_json", error.to_string())
+    }
+}
+
+fn status_name(status: &HepaTaskStatus) -> &'static str {
+    match status {
+        HepaTaskStatus::Draft => "draft",
+        HepaTaskStatus::Queued => "queued",
+        HepaTaskStatus::Ready => "ready",
+        HepaTaskStatus::Running => "running",
+        HepaTaskStatus::Blocked => "blocked",
+        HepaTaskStatus::Cancelled => "cancelled",
+        HepaTaskStatus::Completed => "completed",
     }
 }
 
@@ -219,7 +345,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::CONTRACT_SCHEMA_VERSION;
+    use crate::contracts::{CONTRACT_SCHEMA_VERSION, HepaReadinessState};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn project(project_id: &str, repo_ref: &str) -> HepaRegisteredProject {
@@ -298,6 +424,104 @@ mod tests {
             registry.register_project(&registration)
         };
         assert!(zero_parallel.is_err());
+
+        remove_test_dir(root);
+    }
+
+    fn task(task_id: &str) -> HepaFleetTask {
+        HepaFleetTask {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: task_id.to_string(),
+            project_id: "project-1".to_string(),
+            title: "Demo task".to_string(),
+            description: "Demo task description".to_string(),
+            status: HepaTaskStatus::Queued,
+            readiness: HepaReadinessState::NotReady,
+            dependencies: Vec::new(),
+            lane_ids: Vec::new(),
+            external_card_id: None,
+            priority: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn create_list_and_show_tasks() {
+        let root = unique_test_dir("tasks");
+        let registry = HepaFleetRegistry::new(&root);
+
+        registry.create_task(&task("task-b")).expect("create b");
+        registry.create_task(&task("task-a")).expect("create a");
+
+        let ids: Vec<String> = registry
+            .list_tasks()
+            .expect("list")
+            .into_iter()
+            .map(|task| task.task_id)
+            .collect();
+        assert_eq!(ids, vec!["task-a".to_string(), "task-b".to_string()]);
+        assert!(registry.show_task("task-a").expect("show").is_some());
+        assert!(registry.show_task("absent").expect("show").is_none());
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn task_lifecycle_block_resume_prioritize_and_cancel() {
+        let root = unique_test_dir("lifecycle");
+        let registry = HepaFleetRegistry::new(&root);
+        registry.create_task(&task("task-1")).expect("create");
+
+        let blocked = registry
+            .block_task("task-1", "2026-06-16T00:01:00Z")
+            .expect("block");
+        assert_eq!(blocked.status, HepaTaskStatus::Blocked);
+
+        let resumed = registry
+            .resume_task("task-1", "2026-06-16T00:02:00Z")
+            .expect("resume");
+        assert_eq!(resumed.status, HepaTaskStatus::Queued);
+
+        let prioritized = registry
+            .prioritize_task("task-1", 9, "2026-06-16T00:03:00Z")
+            .expect("prioritize");
+        assert_eq!(prioritized.priority, 9);
+
+        let cancelled = registry
+            .cancel_task("task-1", "2026-06-16T00:04:00Z")
+            .expect("cancel");
+        assert_eq!(cancelled.status, HepaTaskStatus::Cancelled);
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn invalid_transitions_and_terminal_reprioritize_are_rejected() {
+        let root = unique_test_dir("invalid");
+        let registry = HepaFleetRegistry::new(&root);
+        registry.create_task(&task("task-1")).expect("create");
+        registry
+            .cancel_task("task-1", "2026-06-16T00:01:00Z")
+            .expect("cancel");
+
+        // Cancelled is terminal: cannot block or reprioritize.
+        assert!(
+            registry
+                .block_task("task-1", "2026-06-16T00:02:00Z")
+                .is_err()
+        );
+        assert!(
+            registry
+                .prioritize_task("task-1", 5, "2026-06-16T00:02:00Z")
+                .is_err()
+        );
+        assert!(
+            registry
+                .block_task("absent", "2026-06-16T00:02:00Z")
+                .is_err()
+        );
 
         remove_test_dir(root);
     }
