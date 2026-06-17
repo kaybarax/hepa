@@ -270,11 +270,7 @@ pub fn run_live_task(
         .get(adapter_id)
         .ok_or_else(|| format!("adapter not registered: {adapter_id}"))?
         .clone();
-    let prompt = format!(
-        "You are HEPA's live stress-test worker.\n\nTask: {}\nRepository worktree: {}\n\nYou are already running inside the lane worktree. Make exactly one change in the current working directory: append a new line `Added by Pi smoke test.` to `README.md` and do not modify any other file. Use relative paths such as `README.md`, then run `git status` in the current working directory and report the modified files.\n",
-        config.task_text,
-        allocation.worktree_path.display(),
-    );
+    let prompt = live_worker_prompt(&config.task_text, &allocation.worktree_path);
     let attempt_paths = lane_paths
         .attempt("attempt-1")
         .map_err(|error| error.to_string())?;
@@ -463,6 +459,13 @@ fn live_monitor_policy() -> HepaMonitorPolicy {
             .or(Some(240_000)),
         ..HepaMonitorPolicy::default()
     }
+}
+
+fn live_worker_prompt(task_text: &str, worktree_path: &Path) -> String {
+    format!(
+        "You are HEPA's live stress-test worker.\n\nTask:\n{task_text}\n\nRepository worktree: {}\n\nExecution rules:\n- You are already running inside the lane worktree.\n- Make only the changes needed to satisfy the task.\n- Use relative paths when reading or editing files.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Run the smallest relevant validation command requested by the task when practical.\n- Finish by reporting changed files, validation results, and any blockers.\n",
+        worktree_path.display(),
+    )
 }
 
 #[cfg(test)]
@@ -893,6 +896,20 @@ mod tests {
         );
 
         remove_test_dir(root);
+    }
+
+    #[test]
+    fn live_worker_prompt_uses_requested_task_without_smoke_edit() {
+        let prompt = live_worker_prompt(
+            "Add a focused reset-password form test and run yarn test.",
+            Path::new("/tmp/hepa-lane"),
+        );
+
+        assert!(prompt.contains("Add a focused reset-password form test"));
+        assert!(prompt.contains("HEPA owns the Git lifecycle"));
+        assert!(prompt.contains("Run the smallest relevant validation command"));
+        assert!(!prompt.contains("Added by Pi smoke test"));
+        assert!(!prompt.contains("Make exactly one change"));
     }
 
     fn init_repo(repo: &Path) {
