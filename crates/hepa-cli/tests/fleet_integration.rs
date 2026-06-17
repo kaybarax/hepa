@@ -139,6 +139,72 @@ fn temp_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hepa-fleet-it-{label}-{nonce}"))
 }
 
+fn card_mapping_input() -> HepaHermesCardMappingInput {
+    HepaHermesCardMappingInput {
+        project: HepaProject {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            project_id: "project-1".to_string(),
+            display_name: "Demo".to_string(),
+            repo_ref: "<TARGET_REPO>".to_string(),
+            default_branch: "main".to_string(),
+            routing_policy_ref: None,
+            is_active: true,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+        },
+        task_spec: HepaTaskSpec {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            goal: "Update docs".to_string(),
+            non_goals: Vec::new(),
+            expected_areas: Vec::new(),
+            acceptance_criteria: vec!["docs updated".to_string()],
+            validation_commands: vec!["true".to_string()],
+            dependencies: Vec::new(),
+            target_branch: Some("main".to_string()),
+            risk_level: HepaRiskLevel::Low,
+            max_total_rounds: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+        },
+        task: ready_task("task-1", "project-1"),
+        lanes: Vec::new(),
+        readiness: None,
+        validation: None,
+        review_signals: Vec::new(),
+        terminal_report: None,
+        timing: None,
+        steering_records: Vec::new(),
+        blocked_questions: Vec::new(),
+    }
+}
+
+#[test]
+fn hermes_bridge_degrades_then_catches_up_when_available() {
+    use hepa_kanban::sync::{HepaKanbanSyncStatus, HepaUnavailableHermesCardStore};
+
+    let input = card_mapping_input();
+    let engine = HepaKanbanSyncEngine::new();
+
+    // Missing Hermes: sync degrades and skips without failing local operation.
+    let mut unavailable = HepaUnavailableHermesCardStore::new("Hermes CLI/API unavailable");
+    let degraded = engine
+        .sync_tasks(std::slice::from_ref(&input), &mut unavailable)
+        .expect("degraded sync should not fail");
+    assert_eq!(degraded.status, HepaKanbanSyncStatus::Degraded);
+    assert_eq!(degraded.created, 0);
+    assert_eq!(degraded.skipped, 1);
+
+    // Hermes available later: the same task syncs (catch-up).
+    let mut store = HepaMemoryHermesCardStore::default();
+    let caught_up = engine
+        .sync_tasks(&[input], &mut store)
+        .expect("catch-up sync should create the card");
+    assert_eq!(caught_up.status, HepaKanbanSyncStatus::Synced);
+    assert_eq!(caught_up.created, 1);
+    assert_eq!(store.card_count(), 1);
+}
+
 #[test]
 fn two_projects_serialize_conflicts_and_enforce_cost_caps() {
     use hepa_core::resource_governor::HepaLaneReservation;
