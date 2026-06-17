@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    fmt, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -50,6 +50,13 @@ impl HepaSafeStaging {
                     path: path.clone(),
                     reason,
                 });
+                continue;
+            }
+            if let Some(reason) = self.classify_staging_content(path)? {
+                rejections.push(HepaStagingRejection {
+                    path: path.clone(),
+                    reason,
+                });
             }
         }
         if !rejections.is_empty() {
@@ -79,6 +86,24 @@ impl HepaSafeStaging {
         staged.sort();
         staged.dedup();
         Ok(staged)
+    }
+
+    fn classify_staging_content(
+        &self,
+        path: &str,
+    ) -> Result<Option<HepaStagingRejectionReason>, HepaStagingError> {
+        let full_path = self.repo_root.join(path);
+        if !full_path.exists() {
+            // Deletions are safe to stage after path screening.
+            return Ok(None);
+        }
+        let metadata = fs::metadata(&full_path)?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&full_path)?;
+        let content = String::from_utf8_lossy(&bytes);
+        Ok(classify_staging_content(&content))
     }
 
     fn git_status<const N: usize>(&self, args: [&str; N]) -> Result<(), HepaStagingError> {
@@ -117,6 +142,8 @@ pub enum HepaStagingRejectionReason {
     RuntimePath,
     /// Secret-like filename, suffix, or credential directory.
     SecretLike,
+    /// File content contains a local absolute path, raw token, or secret assignment.
+    ContentPrivacy,
 }
 
 impl HepaStagingRejectionReason {
@@ -126,6 +153,9 @@ impl HepaStagingRejectionReason {
             HepaStagingRejectionReason::PathTraversal => "path traversal is not allowed",
             HepaStagingRejectionReason::RuntimePath => "HEPA runtime paths must not be staged",
             HepaStagingRejectionReason::SecretLike => "secret-like paths must not be staged",
+            HepaStagingRejectionReason::ContentPrivacy => {
+                "file content contains private path or secret-like material"
+            }
         }
     }
 }
@@ -232,6 +262,38 @@ const FORBIDDEN_SECRET_PATHS: &[&str] = &[
 
 const CREDENTIAL_STORE_DIRECTORIES: &[&str] = &[".aws", ".azure", ".docker", ".gnupg", ".ssh"];
 
+const FORBIDDEN_CONTENT_PATH_MARKERS: &[&str] =
+    &["/Users/", "/home/", "C:\\Users\\", "C:/Users/", "\\Users\\"];
+
+const FORBIDDEN_CONTENT_ARTIFACT_MARKERS: &[&str] = &[
+    "</content>",
+    "<parameter name=\"filePath\"",
+    "<parameter name=\"file_path\"",
+];
+
+const FORBIDDEN_CONTENT_TOKEN_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "sk-",
+    "AKIA",
+];
+
+const FORBIDDEN_CONTENT_SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "private_key",
+    "secret",
+    "token",
+];
+
 /// Classify an approved-file path, returning the first refusal reason found.
 fn classify_staging_path(path: &str) -> Option<HepaStagingRejectionReason> {
     let trimmed = path.trim();
@@ -313,6 +375,67 @@ fn is_secret_like_path(path: &str) -> bool {
     parts
         .iter()
         .any(|part| CREDENTIAL_STORE_DIRECTORIES.contains(part))
+}
+
+fn classify_staging_content(content: &str) -> Option<HepaStagingRejectionReason> {
+    if FORBIDDEN_CONTENT_PATH_MARKERS
+        .iter()
+        .any(|marker| content.contains(marker))
+        || FORBIDDEN_CONTENT_ARTIFACT_MARKERS
+            .iter()
+            .any(|marker| content.contains(marker))
+    {
+        return Some(HepaStagingRejectionReason::ContentPrivacy);
+    }
+
+    if content.split_whitespace().any(token_has_forbidden_prefix) {
+        return Some(HepaStagingRejectionReason::ContentPrivacy);
+    }
+
+    if content.lines().any(line_has_secret_assignment) {
+        return Some(HepaStagingRejectionReason::ContentPrivacy);
+    }
+
+    None
+}
+
+fn token_has_forbidden_prefix(token: &str) -> bool {
+    let core_start = token.find(|character: char| character.is_ascii_alphanumeric());
+    let core_end = token
+        .rfind(|character: char| character.is_ascii_alphanumeric())
+        .map(|index| index + 1);
+    let Some(core_start) = core_start else {
+        return false;
+    };
+    let Some(core_end) = core_end else {
+        return false;
+    };
+    if core_start >= core_end {
+        return false;
+    }
+    let core = &token[core_start..core_end];
+    FORBIDDEN_CONTENT_TOKEN_PREFIXES
+        .iter()
+        .any(|prefix| core.starts_with(prefix) && core.len() > prefix.len())
+}
+
+fn line_has_secret_assignment(line: &str) -> bool {
+    for separator in ['=', ':'] {
+        let Some(index) = line.find(separator) else {
+            continue;
+        };
+        let key = line[..index]
+            .trim()
+            .trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
+        if FORBIDDEN_CONTENT_SECRET_KEYS
+            .iter()
+            .any(|fragment| key.contains(fragment))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -435,6 +558,78 @@ mod tests {
         assert_eq!(error.rejections[0].path, ".env");
         // The safe file is not partially staged.
         assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_blocks_private_paths_in_file_content() {
+        let repo = unique_test_dir("stage-content-path");
+        init_repo(&repo);
+        fs::write(
+            repo.join("AGENTS.md"),
+            "Generated footer: /Users/example/workspace/project/AGENTS.md\n",
+        )
+        .expect("agents write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["AGENTS.md".to_string()])
+            .expect_err("private local path content must be refused");
+
+        assert_eq!(error.rejections.len(), 1);
+        assert_eq!(error.rejections[0].path, "AGENTS.md");
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_blocks_generated_artifact_footer_content() {
+        let repo = unique_test_dir("stage-content-footer");
+        init_repo(&repo);
+        fs::write(
+            repo.join("AGENTS.md"),
+            "Useful project instructions\n</content>\n<parameter name=\"filePath\">AGENTS.md\n",
+        )
+        .expect("agents write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["AGENTS.md".to_string()])
+            .expect_err("generated artifact footer content must be refused");
+
+        assert_eq!(error.rejections.len(), 1);
+        assert_eq!(error.rejections[0].path, "AGENTS.md");
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_allows_normal_route_docs() {
+        let repo = unique_test_dir("stage-content-route");
+        init_repo(&repo);
+        fs::write(
+            repo.join("AGENTS.md"),
+            "Gateway routes REST under /api/v1/* and GraphQL under /graphql.\n",
+        )
+        .expect("agents write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&["AGENTS.md".to_string()])
+            .expect("route docs should not look like private paths");
+
+        assert_eq!(report.staged_files, vec!["AGENTS.md".to_string()]);
 
         remove_test_dir(repo);
     }
