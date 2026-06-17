@@ -177,6 +177,62 @@ fn review_fanout_with_two_reviewers_and_arbitration() {
 }
 
 #[test]
+fn repair_loop_forces_a_failure_aware_round_two_rewrite() {
+    use hepa_core::contracts::HepaValidationCommandResult;
+    use hepa_review::repair::{
+        HepaRepairBriefInput, HepaRepairRoundPolicy, HepaRepairRoundState,
+        enforce_repair_round_budget, rewrite_repair_prompt_from_evidence,
+    };
+
+    // Round 1 failed with a failing validation command.
+    let failing = HepaValidationCommandResult {
+        command: "cargo test".to_string(),
+        exit_code: 101,
+        duration_ms: 120,
+    };
+    let prior_prompt = "Implement the login redirect fix.".to_string();
+
+    // The budget allows a round-2 repair.
+    let decision = enforce_repair_round_budget(
+        HepaRepairRoundPolicy {
+            max_repair_rounds: 2,
+            max_total_attempts: 4,
+        },
+        HepaRepairRoundState {
+            next_repair_round: 2,
+            total_attempts_after_next: 3,
+        },
+    )
+    .expect("budget");
+    assert!(decision.allowed);
+
+    // The round-2 brief is rewritten from failure evidence.
+    let brief = rewrite_repair_prompt_from_evidence(HepaRepairBriefInput {
+        lane_id: "lane-1".to_string(),
+        repair_round: 2,
+        prior_prompt: prior_prompt.clone(),
+        failing_commands: vec![failing],
+        review_findings: Vec::new(),
+        diff_state: "diff --git a/src/login.rs".to_string(),
+        files_touched: vec!["src/login.rs".to_string()],
+    })
+    .expect("repair brief");
+
+    assert_eq!(brief.repair_round, 2);
+    assert!(brief.prompt.contains("Round: 2"));
+    // Failure-aware: the new brief cites the failing command and differs from the
+    // prior prompt.
+    assert!(brief.prompt.contains("cargo test"));
+    assert!(
+        brief
+            .evidence
+            .iter()
+            .any(|line| line.contains("cargo test"))
+    );
+    assert_ne!(brief.prompt, prior_prompt);
+}
+
+#[test]
 fn fake_adapter_runs_through_every_gate_to_pr_readiness() {
     let repo = temp_dir("e2e");
     init_repo(&repo);
