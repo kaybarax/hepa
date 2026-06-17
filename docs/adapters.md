@@ -35,7 +35,7 @@ not.
 | `user-worker` | worker | agent-native | user worker adapter |
 | `user-reviewer` | reviewer | agent-native | user reviewer adapter |
 | `local-worker` | worker, reviewer | agent-native | local model worker |
-| `external-worker` | worker | agent-native | external status worker |
+| `external-worker` | worker | none | external status worker |
 
 List them with:
 
@@ -117,6 +117,33 @@ monitor, env allowlist, worktree confinement, review, staging, and PR lifecycle.
 Pi, fake, custom, user-worker, local-worker, and shell-command may advertise
 `design`; projects can still route design and implementation to different
 adapters through normal capability routes.
+
+## External mode status reporting
+
+`external` mode adapters are for work that runs somewhere HEPA does not own,
+such as an external queue or another service. They do not execute the normal
+implementation loop and they never own Git lifecycle. HEPA polls their
+configured status command, writes a prompt file describing the lane/task, and
+requires a JSON status artifact:
+
+```json
+{
+  "schema_version": 1,
+  "adapter_id": "external-worker",
+  "external_ref": "queue-item-42",
+  "lane_id": "lane-1",
+  "status": "running",
+  "summary": ["External worker is still running."],
+  "updated_at": "2026-06-18T00:00:00Z"
+}
+```
+
+Allowed statuses are `queued`, `running`, `completed`, `blocked`, and `failed`.
+The report is validated for schema, single-line fields, and sensitive-reference
+redaction before HEPA treats it as status evidence. The deterministic monitor
+still blocks unsafe command templates, secret output, and adapter attempts to
+run manager-owned Git lifecycle commands. Hermes cards may display the external
+status, but HEPA's lane state remains authoritative.
 
 ## Version pinning
 

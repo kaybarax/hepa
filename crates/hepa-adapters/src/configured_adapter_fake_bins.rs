@@ -1,7 +1,10 @@
 use crate::{
     custom::HepaCustomAdapterTemplate,
     engine::{HepaOneshotAdapterExecutor, HepaOneshotAdapterInvocation},
-    external_worker::HepaExternalWorkerAdapterTemplate,
+    external_worker::{
+        HepaExternalStatusPollRequest, HepaExternalStatusPoller, HepaExternalWorkStatus,
+        HepaExternalWorkerAdapterTemplate,
+    },
     local_worker::HepaLocalWorkerAdapterTemplate,
     pi::parse_pi_json_events,
     spec::{
@@ -18,7 +21,6 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -193,21 +195,21 @@ fn external_worker_passes_fake_binary_status_reporting_and_artifact_collection()
     }
     .into_spec()
     .expect("external worker spec");
-    let command = spec
-        .render_worker_command(&template_context(&worktree, &artifact_dir, &output_file))
-        .expect("external command renders");
-    let output = run_split_command(&command);
+    let result = HepaExternalStatusPoller::new()
+        .poll(&HepaExternalStatusPollRequest {
+            spec,
+            context: template_context(&worktree, &artifact_dir, &output_file),
+            prompt: "Report external status for lane-1.".to_string(),
+            environment: BTreeMap::new(),
+            monitor_policy: HepaMonitorPolicy::default(),
+        })
+        .expect("external status poller should run fake binary");
 
-    assert!(output.status.success());
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(external_status(output.status.code()), "reported");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("fake stdout"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("fake stderr"));
-    assert!(
-        fs::read_to_string(&output_file)
-            .expect("artifact exists")
-            .contains("external-worker")
-    );
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.report.adapter_id, "external-worker");
+    assert_eq!(result.report.status, HepaExternalWorkStatus::Completed);
+    assert!(result.stdout.contains("fake stdout"));
+    assert!(result.stderr.contains("fake stderr"));
 
     remove_test_dir(root);
 }
@@ -461,7 +463,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf 'fake stdout'
 printf 'fake stderr' >&2
-printf '{"adapter":"%s","status":"completed"}\n' "$(basename "$output_file" .json)" > "$output_file"
+printf '{"schema_version":1,"adapter_id":"external-worker","external_ref":"queue-item-42","lane_id":"lane-1","status":"completed","summary":["External worker completed."],"updated_at":"2026-06-18T00:00:00Z","adapter":"%s"}\n' "$(basename "$output_file" .json)" > "$output_file"
 "#,
     )
     .expect("fake adapter write");
@@ -488,23 +490,6 @@ printf 'fake pi stderr' >&2
     let mut permissions = fs::metadata(path).expect("fake pi metadata").permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions).expect("fake pi permissions");
-}
-
-fn run_split_command(command: &str) -> std::process::Output {
-    let parts = command.split_whitespace().collect::<Vec<_>>();
-    let (program, args) = parts.split_first().expect("command has program");
-    Command::new(program)
-        .args(args)
-        .output()
-        .expect("fake external command should run")
-}
-
-fn external_status(exit_code: Option<i32>) -> &'static str {
-    if exit_code == Some(0) {
-        "reported"
-    } else {
-        "blocked"
-    }
 }
 
 fn unique_test_dir(label: &str) -> PathBuf {
