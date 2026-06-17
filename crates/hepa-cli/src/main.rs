@@ -6,7 +6,7 @@ use hepa_adapters::{
     registry::HepaAdapterRegistry,
 };
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
-use hepa_core::contracts::HepaTimingRecord;
+use hepa_core::contracts::{HepaLaneState, HepaTimingRecord};
 use hepa_kanban::doctor::{HepaKanbanDoctorCheck, HepaKanbanDoctorReport};
 use hepa_kanban::spec_import::import_markdown_spec;
 use hepa_kanban::sync::{
@@ -35,19 +35,29 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             "HEPA workspace initialized ({})",
             hepa_core::crate_name()
         )),
-        [command, subcommand, lane_id, message] if command == "lane" && subcommand == "send" => {
+        [command, subcommand, lane_id, message, flags @ ..]
+            if command == "lane" && subcommand == "send" =>
+        {
+            let options = parse_lane_send_options(flags)?;
             let receipt = HepaTmuxInteractiveLauncher
                 .send(
                     &HepaLaneSteeringRequest {
                         lane_id: lane_id.clone(),
                         message: message.clone(),
+                        manager_approved: options.manager_approved,
+                        dry_run: options.dry_run,
+                        lane_state: options.lane_state,
+                        artifact_dir: options.artifact_dir,
                     },
                     tmux,
                 )
                 .map_err(|error| error.to_string())?;
             Ok(format!(
-                "HEPA lane send queued: lane={} session={}",
-                receipt.lane_id, receipt.session_id
+                "HEPA lane send {}: lane={} session={} log={}",
+                if receipt.sent { "queued" } else { "dry-run" },
+                receipt.lane_id,
+                receipt.session_id,
+                receipt.log_path.display()
             ))
         }
         [command, ..] if command == "lane" => Err("unknown lane command".to_string()),
@@ -150,6 +160,83 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
     }
 }
 
+struct HepaLaneSendOptions {
+    manager_approved: bool,
+    dry_run: bool,
+    lane_state: HepaLaneState,
+    artifact_dir: std::path::PathBuf,
+}
+
+fn parse_lane_send_options(flags: &[String]) -> Result<HepaLaneSendOptions, String> {
+    let mut manager_approved = false;
+    let mut dry_run = false;
+    let mut lane_state = None;
+    let mut artifact_dir = None;
+    let mut index = 0;
+    while index < flags.len() {
+        match flags[index].as_str() {
+            "--manager-approved" => {
+                manager_approved = true;
+                index += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
+            "--lane-state" => {
+                let Some(value) = flags.get(index + 1) else {
+                    return Err("--lane-state requires a value".to_string());
+                };
+                lane_state = Some(parse_lane_state(value)?);
+                index += 2;
+            }
+            "--artifact-dir" => {
+                let Some(value) = flags.get(index + 1) else {
+                    return Err("--artifact-dir requires a value".to_string());
+                };
+                artifact_dir = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            flag => return Err(format!("unknown lane send flag: {flag}")),
+        }
+    }
+    if !manager_approved {
+        return Err("manager approval is required: pass --manager-approved".to_string());
+    }
+    let lane_state =
+        lane_state.ok_or_else(|| "lane state is required: pass --lane-state".to_string())?;
+    let artifact_dir = artifact_dir
+        .ok_or_else(|| "artifact logging is required: pass --artifact-dir".to_string())?;
+    Ok(HepaLaneSendOptions {
+        manager_approved,
+        dry_run,
+        lane_state,
+        artifact_dir,
+    })
+}
+
+fn parse_lane_state(value: &str) -> Result<HepaLaneState, String> {
+    match value {
+        "draft_spec" => Ok(HepaLaneState::DraftSpec),
+        "ready" => Ok(HepaLaneState::Ready),
+        "allocated" => Ok(HepaLaneState::Allocated),
+        "starting" => Ok(HepaLaneState::Starting),
+        "running" => Ok(HepaLaneState::Running),
+        "validating" => Ok(HepaLaneState::Validating),
+        "reviewing" => Ok(HepaLaneState::Reviewing),
+        "repairing" => Ok(HepaLaneState::Repairing),
+        "staging" => Ok(HepaLaneState::Staging),
+        "pr_created" => Ok(HepaLaneState::PrCreated),
+        "ready_for_human" => Ok(HepaLaneState::ReadyForHuman),
+        "blocked" => Ok(HepaLaneState::Blocked),
+        "failed" => Ok(HepaLaneState::Failed),
+        "cancelled" => Ok(HepaLaneState::Cancelled),
+        "cleaned" => Ok(HepaLaneState::Cleaned),
+        "completed" => Ok(HepaLaneState::Completed),
+        _ => Err(format!("unknown lane state: {value}")),
+    }
+}
+
 fn load_cli_config() -> Result<HepaConfig, String> {
     HepaConfig::load_from_env_and_dotenv_file(".env", HepaConfigOverrides::default())
         .map_err(|error| format!("failed to load HEPA config: {error}"))
@@ -245,26 +332,92 @@ mod tests {
 
     #[test]
     fn lane_send_command_is_the_steering_primitive() {
+        let root = unique_test_dir("lane-send");
+        let artifact_dir = root.join("artifacts");
         let mut tmux = FakeTmux::default();
         let output = run_cli_with_tmux(
-            &args(&["lane", "send", "lane-1", "continue with tests"]),
+            &args(&[
+                "lane",
+                "send",
+                "lane-1",
+                "continue with tests",
+                "--manager-approved",
+                "--lane-state",
+                "running",
+                "--artifact-dir",
+                artifact_dir.to_str().expect("test path is UTF-8"),
+            ]),
             &mut tmux,
         )
         .expect("lane send should run");
 
-        assert_eq!(
-            output,
-            "HEPA lane send queued: lane=lane-1 session=hepa-lane-1"
-        );
+        assert!(output.contains("HEPA lane send queued: lane=lane-1 session=hepa-lane-1"));
+        assert!(output.contains("steering-log.jsonl"));
         assert_eq!(
             tmux.sent,
             vec![("hepa-lane-1".to_string(), "continue with tests".to_string())]
         );
+        let log = fs::read_to_string(artifact_dir.join("steering-log.jsonl"))
+            .expect("steering log is written");
+        assert!(log.contains("\"manager_approved\":true"));
+        assert!(log.contains("\"lane_state\":\"running\""));
         assert_eq!(
             run_cli_with_tmux(&args(&["lane", "nudge", "lane-1", "msg"]), &mut tmux)
                 .expect_err("other steering commands must not exist"),
             "unknown lane command"
         );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn lane_send_requires_approval_and_supports_dry_run() {
+        let root = unique_test_dir("lane-send-dry-run");
+        let artifact_dir = root.join("artifacts");
+        let mut tmux = FakeTmux::default();
+
+        assert_eq!(
+            run_cli_with_tmux(
+                &args(&[
+                    "lane",
+                    "send",
+                    "lane-1",
+                    "continue",
+                    "--lane-state",
+                    "running",
+                    "--artifact-dir",
+                    artifact_dir.to_str().expect("test path is UTF-8"),
+                ]),
+                &mut tmux,
+            )
+            .expect_err("approval should be required"),
+            "manager approval is required: pass --manager-approved"
+        );
+
+        let output = run_cli_with_tmux(
+            &args(&[
+                "lane",
+                "send",
+                "lane-1",
+                "continue",
+                "--manager-approved",
+                "--dry-run",
+                "--lane-state",
+                "running",
+                "--artifact-dir",
+                artifact_dir.to_str().expect("test path is UTF-8"),
+            ]),
+            &mut tmux,
+        )
+        .expect("dry-run should log but not send");
+
+        assert!(output.contains("HEPA lane send dry-run: lane=lane-1 session=hepa-lane-1"));
+        assert!(tmux.sent.is_empty());
+        let log = fs::read_to_string(artifact_dir.join("steering-log.jsonl"))
+            .expect("steering log is written");
+        assert!(log.contains("\"dry_run\":true"));
+
+        remove_test_dir(root);
     }
 
     #[test]

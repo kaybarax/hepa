@@ -1,7 +1,9 @@
+use hepa_core::{contracts::HepaLaneState, lane_state::HepaLaneStateExt};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
-    fmt, fs, io,
+    fmt, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -39,12 +41,29 @@ pub struct HepaInteractiveSessionReceipt {
 pub struct HepaLaneSteeringRequest {
     pub lane_id: String,
     pub message: String,
+    pub manager_approved: bool,
+    pub dry_run: bool,
+    pub lane_state: HepaLaneState,
+    pub artifact_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaLaneSteeringReceipt {
     pub lane_id: String,
     pub session_id: String,
+    pub sent: bool,
+    pub log_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaLaneSteeringRecord {
+    pub schema_version: u32,
+    pub lane_id: String,
+    pub session_id: String,
+    pub message: String,
+    pub manager_approved: bool,
+    pub dry_run: bool,
+    pub lane_state: HepaLaneState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -92,10 +111,28 @@ impl HepaTmuxInteractiveLauncher {
     ) -> Result<HepaLaneSteeringReceipt, HepaInteractiveSessionError> {
         request.validate()?;
         let session_id = interactive_session_id(&request.lane_id);
-        tmux.send_keys(&session_id, &request.message)?;
+        fs::create_dir_all(&request.artifact_dir).map_err(|error| {
+            HepaInteractiveSessionError::new("artifact_dir", format!("failed to create: {error}"))
+        })?;
+        let record = HepaLaneSteeringRecord {
+            schema_version: INTERACTIVE_SESSION_SCHEMA_VERSION,
+            lane_id: request.lane_id.clone(),
+            session_id: session_id.clone(),
+            message: request.message.clone(),
+            manager_approved: request.manager_approved,
+            dry_run: request.dry_run,
+            lane_state: request.lane_state.clone(),
+        };
+        let log_path = request.artifact_dir.join("steering-log.jsonl");
+        append_stable_json_line(&log_path, &record)?;
+        if !request.dry_run {
+            tmux.send_keys(&session_id, &request.message)?;
+        }
         Ok(HepaLaneSteeringReceipt {
             lane_id: request.lane_id.clone(),
             session_id,
+            sent: !request.dry_run,
+            log_path,
         })
     }
 }
@@ -222,7 +259,27 @@ impl HepaInteractiveSessionRequest {
 impl HepaLaneSteeringRequest {
     fn validate(&self) -> Result<(), HepaInteractiveSessionError> {
         require_artifact_id("lane_id", &self.lane_id)?;
-        require_single_line("message", &self.message)
+        require_single_line("message", &self.message)?;
+        reject_secret_content("message", &self.message)?;
+        if !self.manager_approved {
+            return Err(HepaInteractiveSessionError::new(
+                "manager_approved",
+                "manager approval is required before lane steering",
+            ));
+        }
+        if self.lane_state.is_terminal() {
+            return Err(HepaInteractiveSessionError::new(
+                "lane_state",
+                "terminal lanes cannot be steered",
+            ));
+        }
+        if self.artifact_dir.as_os_str().is_empty() {
+            return Err(HepaInteractiveSessionError::new(
+                "artifact_dir",
+                "artifact logging is required before lane steering",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -257,6 +314,32 @@ fn require_single_line(field: &str, value: &str) -> Result<(), HepaInteractiveSe
     Ok(())
 }
 
+fn reject_secret_content(field: &str, value: &str) -> Result<(), HepaInteractiveSessionError> {
+    let lowered = value.to_ascii_lowercase();
+    let token_prefix = ["ghp", "_"].concat();
+    if lowered.contains(&token_prefix)
+        || [
+            ".env",
+            "api_key",
+            "apikey",
+            "credential",
+            "id_rsa",
+            "password",
+            "private_key",
+            "secret",
+            "token=",
+        ]
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return Err(HepaInteractiveSessionError::new(
+            field,
+            "secret-like steering content is rejected",
+        ));
+    }
+    Ok(())
+}
+
 fn write_stable_json<T: Serialize>(
     path: &Path,
     value: &T,
@@ -269,6 +352,24 @@ fn write_stable_json<T: Serialize>(
     })
 }
 
+fn append_stable_json_line<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), HepaInteractiveSessionError> {
+    let json = serde_json::to_string(value)
+        .map_err(|error| HepaInteractiveSessionError::new("steering_log", error.to_string()))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            HepaInteractiveSessionError::new("steering_log", format!("failed to open: {error}"))
+        })?;
+    writeln!(file, "{json}").map_err(|error| {
+        HepaInteractiveSessionError::new("steering_log", format!("failed to write: {error}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +379,7 @@ mod tests {
     struct FakeTmux {
         launched: Vec<(String, String, PathBuf)>,
         captured: Vec<String>,
+        sent: Vec<(String, String)>,
         capture_output: String,
     }
 
@@ -306,9 +408,11 @@ mod tests {
 
         fn send_keys(
             &mut self,
-            _session_id: &str,
-            _message: &str,
+            session_id: &str,
+            message: &str,
         ) -> Result<(), HepaInteractiveSessionError> {
+            self.sent
+                .push((session_id.to_string(), message.to_string()));
             Ok(())
         }
     }
@@ -384,10 +488,15 @@ mod tests {
 
     #[test]
     fn lane_send_uses_lane_id_derived_tmux_session() {
+        let root = unique_test_dir("tmux-send");
         let mut tmux = FakeTmux::default();
         let request = HepaLaneSteeringRequest {
             lane_id: "lane_1".to_string(),
             message: "continue with the focused fix".to_string(),
+            manager_approved: true,
+            dry_run: false,
+            lane_state: HepaLaneState::Running,
+            artifact_dir: root.join("artifacts"),
         };
 
         let receipt = HepaTmuxInteractiveLauncher
@@ -396,6 +505,92 @@ mod tests {
 
         assert_eq!(receipt.lane_id, "lane_1");
         assert_eq!(receipt.session_id, "hepa-lane_1");
+        assert!(receipt.sent);
+        assert_eq!(
+            tmux.sent,
+            vec![(
+                "hepa-lane_1".to_string(),
+                "continue with the focused fix".to_string()
+            )]
+        );
+        let log = fs::read_to_string(receipt.log_path).expect("steering log");
+        assert!(log.contains("\"manager_approved\":true"));
+        assert!(log.contains("\"message\":\"continue with the focused fix\""));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn lane_send_dry_run_logs_without_sending_to_tmux() {
+        let root = unique_test_dir("tmux-send-dry-run");
+        let mut tmux = FakeTmux::default();
+        let request = HepaLaneSteeringRequest {
+            lane_id: "lane_1".to_string(),
+            message: "show current status".to_string(),
+            manager_approved: true,
+            dry_run: true,
+            lane_state: HepaLaneState::Running,
+            artifact_dir: root.join("artifacts"),
+        };
+
+        let receipt = HepaTmuxInteractiveLauncher
+            .send(&request, &mut tmux)
+            .expect("dry-run should log steering");
+
+        assert!(!receipt.sent);
+        assert!(tmux.sent.is_empty());
+        let log = fs::read_to_string(receipt.log_path).expect("steering log");
+        assert!(log.contains("\"dry_run\":true"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn lane_send_rejects_unapproved_secret_and_terminal_messages_before_tmux() {
+        let root = unique_test_dir("tmux-send-reject");
+        let mut tmux = FakeTmux::default();
+        let base = HepaLaneSteeringRequest {
+            lane_id: "lane_1".to_string(),
+            message: "continue".to_string(),
+            manager_approved: true,
+            dry_run: false,
+            lane_state: HepaLaneState::Running,
+            artifact_dir: root.join("artifacts"),
+        };
+
+        let mut unapproved = base.clone();
+        unapproved.manager_approved = false;
+        assert_eq!(
+            HepaTmuxInteractiveLauncher
+                .send(&unapproved, &mut tmux)
+                .expect_err("unapproved send must fail")
+                .field,
+            "manager_approved"
+        );
+
+        let mut secret = base.clone();
+        secret.message = "password=blocked".to_string();
+        assert_eq!(
+            HepaTmuxInteractiveLauncher
+                .send(&secret, &mut tmux)
+                .expect_err("secret-like content must fail")
+                .field,
+            "message"
+        );
+
+        let mut terminal = base;
+        terminal.lane_state = HepaLaneState::Completed;
+        assert_eq!(
+            HepaTmuxInteractiveLauncher
+                .send(&terminal, &mut tmux)
+                .expect_err("terminal lane must fail")
+                .field,
+            "lane_state"
+        );
+        assert!(tmux.sent.is_empty());
+        assert!(!root.join("artifacts").exists());
+
+        remove_test_dir(root);
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
