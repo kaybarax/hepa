@@ -1,3 +1,4 @@
+pub mod arbitration;
 pub mod fanout;
 pub mod parser;
 
