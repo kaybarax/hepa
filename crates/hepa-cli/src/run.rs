@@ -347,6 +347,41 @@ pub fn run_live_task(
     }
     let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
     write_json(&lane_paths.validation_summary, &validation).map_err(|error| error.to_string())?;
+    if let Some(secret_path) = first_secret_like_changed_path(&attempt_outcome.changed_files) {
+        transition_and_record(
+            &lane_paths,
+            &mut lane,
+            4,
+            HepaLaneState::Blocked,
+            "secret-like changed path blocked",
+            "2026-06-16T00:00:04Z",
+        )?;
+        return finish_blocked_live_run(FinishBlockedInput {
+            config,
+            task,
+            run_paths: &run_paths,
+            lane_paths: &lane_paths,
+            allocator: &allocator,
+            lane: &mut lane,
+            validation,
+            review_signals: Vec::new(),
+            arbitration: None,
+            timing: live_timing_record(LiveTimingInput {
+                config,
+                adapter_id,
+                worker_duration_seconds: attempt_outcome.duration_seconds,
+                validation_duration_seconds,
+                review_duration_seconds: 0.0,
+                reviewer_passes: 0,
+                terminal_phase: LivePipelinePhase::SafetyBlocked,
+                repair_timing: None,
+            }),
+            reason: format!(
+                "Secret-like path hard block before review/staging: {}",
+                redact_secret_like_path_for_report(&secret_path)
+            ),
+        });
+    }
     if validation.status != HepaValidationStatus::Passed {
         transition_and_record(
             &lane_paths,
@@ -1310,6 +1345,36 @@ fn live_force_secret_path_change() -> bool {
     )
 }
 
+fn first_secret_like_changed_path(changed_files: &[String]) -> Option<String> {
+    changed_files
+        .iter()
+        .find(|path| is_live_secret_like_path(path))
+        .cloned()
+}
+
+fn is_live_secret_like_path(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    name == ".env"
+        || name.starts_with(".env.")
+        || name == "id_rsa"
+        || name == "id_ed25519"
+        || name.ends_with(".pem")
+        || lower == ".ssh"
+        || lower.starts_with(".ssh/")
+        || lower.contains("/.ssh/")
+        || lower.contains("/secrets/")
+        || lower.ends_with("/credentials")
+}
+
+fn redact_secret_like_path_for_report(path: &str) -> String {
+    if is_live_secret_like_path(path) {
+        "<secret-like-path>".to_string()
+    } else {
+        redact_secrets(path)
+    }
+}
+
 fn inject_secret_path_fixture(worktree: &Path) -> Result<(), String> {
     let secret_dir = worktree.join(".ssh");
     fs::create_dir_all(&secret_dir)
@@ -1630,6 +1695,7 @@ fn format_arbitration_error(error: hepa_review::arbitration::HepaArbitrationErro
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LivePipelinePhase {
+    SafetyBlocked,
     ValidationFailed,
     ReviewFailed,
     PrFailed,
@@ -1727,7 +1793,10 @@ fn live_timing_record(input: LiveTimingInput<'_>) -> HepaTimingRecord {
             sandbox_posture: Some(run_sandbox_posture()),
         });
     }
-    if terminal_phase != LivePipelinePhase::ValidationFailed {
+    if !matches!(
+        terminal_phase,
+        LivePipelinePhase::ValidationFailed | LivePipelinePhase::SafetyBlocked
+    ) {
         phases.push(HepaTimingPhase {
             name: "live_review_fanout".to_string(),
             status: if terminal_phase == LivePipelinePhase::ReviewFailed {
@@ -2607,6 +2676,60 @@ mod tests {
             .expect_err("secret-like path must be rejected");
         assert!(error.to_string().contains("secret-like paths"));
         remove_test_dir(root);
+    }
+
+    #[test]
+    fn live_secret_path_block_redacts_report_path() {
+        let changed = vec!["docs/README.md".to_string(), ".ssh/id_rsa".to_string()];
+
+        let secret_path = first_secret_like_changed_path(&changed).expect("secret path");
+
+        assert_eq!(secret_path, ".ssh/id_rsa");
+        assert_eq!(
+            redact_secret_like_path_for_report(&secret_path),
+            "<secret-like-path>"
+        );
+    }
+
+    #[test]
+    fn live_timing_safety_block_stops_before_review() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Create a secret-like path fixture.".to_string(),
+            timing: true,
+        };
+
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 1.0,
+            validation_duration_seconds: 0.1,
+            review_duration_seconds: 0.0,
+            reviewer_passes: 0,
+            terminal_phase: LivePipelinePhase::SafetyBlocked,
+            repair_timing: None,
+        });
+
+        assert_eq!(timing.counters.reviewer_passes, 0);
+        assert!(
+            timing
+                .phases
+                .iter()
+                .all(|phase| phase.name != "live_review_fanout")
+        );
+        assert!(
+            timing
+                .phases
+                .iter()
+                .any(|phase| phase.name == "live_validation"
+                    && phase.status == HepaPhaseStatus::Completed)
+        );
     }
 
     #[test]
