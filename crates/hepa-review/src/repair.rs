@@ -20,6 +20,24 @@ pub struct HepaRepairBrief {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaRepairRoundPolicy {
+    pub max_repair_rounds: u32,
+    pub max_total_attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaRepairRoundState {
+    pub next_repair_round: u32,
+    pub total_attempts_after_next: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HepaRepairRoundDecision {
+    pub allowed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaRepairError {
     pub field: String,
     pub message: String,
@@ -68,6 +86,58 @@ pub fn rewrite_repair_prompt_from_evidence(
         repair_round: input.repair_round,
         prompt,
         evidence,
+    })
+}
+
+pub fn enforce_repair_round_budget(
+    policy: HepaRepairRoundPolicy,
+    state: HepaRepairRoundState,
+) -> Result<HepaRepairRoundDecision, HepaRepairError> {
+    if policy.max_repair_rounds == 0 {
+        return Err(HepaRepairError {
+            field: "max_repair_rounds".to_string(),
+            message: "must be greater than zero".to_string(),
+        });
+    }
+    if policy.max_total_attempts == 0 {
+        return Err(HepaRepairError {
+            field: "max_total_attempts".to_string(),
+            message: "must be greater than zero".to_string(),
+        });
+    }
+    if state.next_repair_round == 0 {
+        return Err(HepaRepairError {
+            field: "next_repair_round".to_string(),
+            message: "must be greater than zero".to_string(),
+        });
+    }
+    if state.next_repair_round > policy.max_repair_rounds {
+        return Ok(HepaRepairRoundDecision {
+            allowed: false,
+            reason: format!(
+                "repair round {} exceeds max repair rounds {}",
+                state.next_repair_round, policy.max_repair_rounds
+            ),
+        });
+    }
+    if state.total_attempts_after_next > policy.max_total_attempts {
+        return Ok(HepaRepairRoundDecision {
+            allowed: false,
+            reason: format!(
+                "total attempts {} exceeds max total attempts {}",
+                state.total_attempts_after_next, policy.max_total_attempts
+            ),
+        });
+    }
+    Ok(HepaRepairRoundDecision {
+        allowed: true,
+        reason: format!(
+            "repair round {} within max rounds {} and total attempts {} within max {}",
+            state.next_repair_round,
+            policy.max_repair_rounds,
+            state.total_attempts_after_next,
+            policy.max_total_attempts
+        ),
     })
 }
 
@@ -172,6 +242,67 @@ mod tests {
         assert!(brief.prompt.contains("src/lib.rs, tests/lib.rs"));
         assert!(brief.prompt.contains("Prior prompt summary"));
         assert_eq!(brief.evidence.len(), 2);
+    }
+
+    #[test]
+    fn enforces_max_rounds_and_total_attempts() {
+        let policy = HepaRepairRoundPolicy {
+            max_repair_rounds: 2,
+            max_total_attempts: 3,
+        };
+
+        let allowed = enforce_repair_round_budget(
+            policy.clone(),
+            HepaRepairRoundState {
+                next_repair_round: 2,
+                total_attempts_after_next: 3,
+            },
+        )
+        .expect("budget evaluates");
+        assert!(allowed.allowed);
+
+        let round_exhausted = enforce_repair_round_budget(
+            policy.clone(),
+            HepaRepairRoundState {
+                next_repair_round: 3,
+                total_attempts_after_next: 3,
+            },
+        )
+        .expect("budget evaluates");
+        assert!(!round_exhausted.allowed);
+        assert!(round_exhausted.reason.contains("exceeds max repair rounds"));
+
+        let attempts_exhausted = enforce_repair_round_budget(
+            policy,
+            HepaRepairRoundState {
+                next_repair_round: 2,
+                total_attempts_after_next: 4,
+            },
+        )
+        .expect("budget evaluates");
+        assert!(!attempts_exhausted.allowed);
+        assert!(
+            attempts_exhausted
+                .reason
+                .contains("exceeds max total attempts")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_repair_budget_limits() {
+        let error = enforce_repair_round_budget(
+            HepaRepairRoundPolicy {
+                max_repair_rounds: 0,
+                max_total_attempts: 3,
+            },
+            HepaRepairRoundState {
+                next_repair_round: 1,
+                total_attempts_after_next: 2,
+            },
+        )
+        .expect_err("zero max repair rounds fails");
+
+        assert_eq!(error.field, "max_repair_rounds");
     }
 
     fn finding() -> HepaReviewFinding {
