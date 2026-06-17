@@ -633,6 +633,11 @@ mod tests {
             findings: vec![HepaReviewFinding {
                 finding_id: "finding-1".to_string(),
                 severity: HepaFindingSeverity::Low,
+                category: "docs".to_string(),
+                evidence: "README.md line 12".to_string(),
+                in_scope: true,
+                release_risk: false,
+                recommended_action: "no action required".to_string(),
                 file_ref: Some("README.md".to_string()),
                 line: Some(12),
                 message: "Looks good".to_string(),

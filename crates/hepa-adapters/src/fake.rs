@@ -67,6 +67,11 @@ impl HepaFakeAdapter {
             findings: vec![HepaReviewFinding {
                 finding_id: "fake-review-1".to_string(),
                 severity: HepaFindingSeverity::Low,
+                category: "deterministic".to_string(),
+                evidence: "fake reviewer completed".to_string(),
+                in_scope: true,
+                release_risk: false,
+                recommended_action: "no action required".to_string(),
                 file_ref: None,
                 line: None,
                 message: "Deterministic fake review found no blocking issues.".to_string(),

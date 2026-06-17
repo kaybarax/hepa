@@ -1,4 +1,5 @@
 pub mod fanout;
+pub mod parser;
 
 pub const CRATE_NAME: &str = "hepa-review";
 

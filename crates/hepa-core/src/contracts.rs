@@ -469,6 +469,11 @@ pub enum HepaReviewStatus {
 pub struct HepaReviewFinding {
     pub finding_id: String,
     pub severity: HepaFindingSeverity,
+    pub category: String,
+    pub evidence: String,
+    pub in_scope: bool,
+    pub release_risk: bool,
+    pub recommended_action: String,
     pub file_ref: Option<String>,
     pub line: Option<u32>,
     pub message: String,
@@ -478,6 +483,9 @@ pub struct HepaReviewFinding {
 impl HepaValidate for HepaReviewFinding {
     fn validate(&self) -> HepaContractResult {
         require_single_line("finding_id", &self.finding_id)?;
+        require_non_empty("category", &self.category)?;
+        require_non_empty("evidence", &self.evidence)?;
+        require_non_empty("recommended_action", &self.recommended_action)?;
         if let Some(file_ref) = &self.file_ref {
             require_single_line("file_ref", file_ref)?;
             reject_secret_like_ref("file_ref", file_ref)?;
