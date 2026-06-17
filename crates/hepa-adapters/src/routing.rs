@@ -477,6 +477,44 @@ mod tests {
     }
 
     #[test]
+    fn local_only_project_policy_routes_across_builtin_local_cli_adapters() {
+        let adapters = crate::builtin::builtin_adapter_specs();
+        let policy = HepaRoutingPolicy {
+            schema_version: ROUTING_POLICY_SCHEMA_VERSION,
+            project_id: "project-1".to_string(),
+            project_policy: HepaProjectRoutingPolicy::LocalOnly,
+            default: "aider-local".to_string(),
+            capability_routes: BTreeMap::from([
+                ("docs".to_string(), "aider-local".to_string()),
+                ("frontend".to_string(), "opencode-local".to_string()),
+                ("review".to_string(), "local-worker".to_string()),
+            ]),
+            review_fanout: HepaReviewFanout {
+                adapters: vec!["aider-local".to_string(), "opencode-local".to_string()],
+                pass_policy: HepaReviewPassPolicy::Any,
+            },
+        };
+
+        policy
+            .validate_against_adapters(&adapters)
+            .expect("local-only policy should accept local CLI built-ins");
+        assert_eq!(
+            policy
+                .resolve_adapter_spec(Some("frontend"), &adapters)
+                .expect("frontend local route should resolve")
+                .id,
+            "opencode-local"
+        );
+        assert!(
+            policy
+                .review_fanout
+                .adapters
+                .iter()
+                .all(|id| adapters[id].cost_class == HepaAdapterCostClass::Local)
+        );
+    }
+
+    #[test]
     fn routing_decision_artifact_records_selected_route() {
         let policy = sample_policy();
         let adapters = sample_adapters(HepaAdapterCostClass::PaidCloud);

@@ -249,6 +249,12 @@ mod tests {
                 .map(|spec| spec.cost_class.clone()),
             Some(HepaAdapterCostClass::Local)
         );
+        for id in ["aider-local", "opencode-local"] {
+            let spec = registry.get(id).expect("local CLI adapter should load");
+            assert_eq!(spec.cost_class, HepaAdapterCostClass::Local);
+            assert!(spec.required_env.is_empty());
+            assert!(spec.capabilities.contains(&"local-only".to_string()));
+        }
         assert!(registry.list().into_iter().all(|spec| {
             !spec.required_env.iter().any(|key| {
                 key == "GITHUB_TOKEN"

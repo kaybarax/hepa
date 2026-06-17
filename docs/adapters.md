@@ -35,6 +35,8 @@ not.
 | `user-worker` | worker | agent-native | user worker adapter |
 | `user-reviewer` | reviewer | agent-native | user reviewer adapter |
 | `local-worker` | worker, reviewer | agent-native | local model worker |
+| `aider-local` | worker, reviewer | agent-native | local CLI harness wrapper |
+| `opencode-local` | worker, reviewer | agent-native | local CLI harness wrapper |
 | `external-worker` | worker | none | external status worker |
 
 List them with:
@@ -90,6 +92,25 @@ Pi output is newline-delimited JSON events. HEPA parses `agent_end` for the fina
 assistant message and tool activity; changed files are derived from `git status`
 in the lane worktree, not from Pi output. Malformed, truncated, or schema-drifted
 streams are explicit parse failures.
+
+## Local CLI adapters
+
+HEPA ships multiple local adapter templates for projects that require a fully
+local routing policy:
+
+- `local-worker` is the generic local harness template.
+- `aider-local` is a local CLI harness wrapper template for Aider-compatible
+  local model workflows.
+- `opencode-local` is a local CLI harness wrapper template for OpenCode-style
+  local model workflows.
+
+All three declare `cost_class=local`, require no provider-key environment
+variables, advertise `local-only`, and use adapter-native sandboxing inside the
+lane worktree. They are templates for local coding harnesses, not bare model API
+calls, so they still satisfy HEPA's adapter contract: the adapter process owns
+one coding loop and emits the normalized JSON artifact HEPA validates. A
+`local-only` project can route implementation and review fanout across these
+adapters while rejecting paid-cloud routes through the same routing validator.
 
 ## Custom adapter requirements
 

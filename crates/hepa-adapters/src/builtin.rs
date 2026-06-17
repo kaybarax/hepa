@@ -4,7 +4,7 @@ use crate::spec::{
 };
 use std::collections::BTreeMap;
 
-pub const BUILTIN_ADAPTER_IDS: [&str; 8] = [
+pub const BUILTIN_ADAPTER_IDS: [&str; 10] = [
     "pi",
     "fake",
     "shell-command",
@@ -12,14 +12,18 @@ pub const BUILTIN_ADAPTER_IDS: [&str; 8] = [
     "user-worker",
     "user-reviewer",
     "local-worker",
+    "aider-local",
+    "opencode-local",
     "external-worker",
 ];
 
-pub const BUILTIN_ADAPTER_LIST_ORDER: [&str; 8] = [
+pub const BUILTIN_ADAPTER_LIST_ORDER: [&str; 10] = [
+    "aider-local",
     "custom",
     "external-worker",
     "fake",
     "local-worker",
+    "opencode-local",
     "pi",
     "shell-command",
     "user-reviewer",
@@ -181,6 +185,58 @@ pub fn builtin_adapter_spec(id: &str) -> HepaAdapterSpec {
             resource_weight: 1,
             max_concurrency: 4,
         }),
+        "aider-local" => spec(AdapterSpecTemplate {
+            id: "aider-local",
+            display_name: "Aider Local CLI Adapter Template",
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: "hepa-aider-local-adapter --prompt-file {prompt_file} --worktree {worktree} --artifact-dir {artifact_dir} --json-output {output_file}",
+            review_command: Some(
+                "hepa-aider-local-adapter --review --prompt-file {review_prompt_file} --worktree {worktree} --artifact-dir {artifact_dir} --json-output {review_output_file}",
+            ),
+            required_commands: vec!["hepa-aider-local-adapter"],
+            sandbox: HepaAdapterSandbox::AgentNative,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec![
+                "frontend",
+                "backend",
+                "refactor",
+                "docs",
+                "test",
+                "review",
+                "local-only",
+            ],
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 2,
+            max_concurrency: 2,
+        }),
+        "opencode-local" => spec(AdapterSpecTemplate {
+            id: "opencode-local",
+            display_name: "OpenCode Local CLI Adapter Template",
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: "hepa-opencode-local-adapter --prompt-file {prompt_file} --worktree {worktree} --artifact-dir {artifact_dir} --json-output {output_file}",
+            review_command: Some(
+                "hepa-opencode-local-adapter --review --prompt-file {review_prompt_file} --worktree {worktree} --artifact-dir {artifact_dir} --json-output {review_output_file}",
+            ),
+            required_commands: vec!["hepa-opencode-local-adapter"],
+            sandbox: HepaAdapterSandbox::AgentNative,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec![
+                "frontend",
+                "design",
+                "backend",
+                "refactor",
+                "docs",
+                "review",
+                "local-only",
+            ],
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 2,
+            max_concurrency: 2,
+        }),
         "external-worker" => spec(AdapterSpecTemplate {
             id: "external-worker",
             display_name: "External Worker Adapter Template",
@@ -305,6 +361,22 @@ mod tests {
             specs["local-worker"].cost_class,
             HepaAdapterCostClass::Local
         );
+        for id in ["local-worker", "aider-local", "opencode-local"] {
+            let spec = &specs[id];
+            assert_eq!(spec.cost_class, HepaAdapterCostClass::Local);
+            assert!(
+                spec.required_env.is_empty(),
+                "{id} must not require cloud env"
+            );
+            assert!(
+                spec.capabilities.contains(&"local-only".to_string()),
+                "{id} must advertise local-only"
+            );
+            assert!(
+                spec.review_command.is_some(),
+                "{id} should support local review fanout"
+            );
+        }
         assert_eq!(specs["external-worker"].mode, HepaAdapterMode::External);
         assert!(
             specs
