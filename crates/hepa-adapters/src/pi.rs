@@ -271,6 +271,12 @@ fn extract_final_message(value: &serde_json::Value) -> Option<String> {
                 .and_then(serde_json::Value::as_array)
                 .and_then(|history| history.iter().rev().find_map(extract_message_text))
         })
+        .or_else(|| {
+            value
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|messages| messages.iter().rev().find_map(extract_message_text))
+        })
 }
 
 fn extract_message_text(value: &serde_json::Value) -> Option<String> {
@@ -286,6 +292,19 @@ fn extract_message_text(value: &serde_json::Value) -> Option<String> {
                 .get("text")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| {
+                    let text = items
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.trim().is_empty()).then_some(text)
+                })
         })
 }
 
@@ -331,6 +350,19 @@ mod tests {
         assert_eq!(
             classify_pi_output(raw),
             HepaAdapterOutputClassification::Parsed
+        );
+    }
+
+    #[test]
+    fn pi_event_stream_extracts_current_messages_shape() {
+        let raw = r#"{"type":"agent_start"}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"{\"status\":\"approved\",\"summary\":[\"ok\"],\"findings\":[]}"}]}]}"#;
+
+        let parsed = parse_pi_json_events(raw).expect("current Pi messages shape should parse");
+
+        assert_eq!(
+            parsed.final_message,
+            "{\"status\":\"approved\",\"summary\":[\"ok\"],\"findings\":[]}"
         );
     }
 
