@@ -562,17 +562,17 @@ pub fn run_live_task(
     )?;
     let review_started = Instant::now();
     let diff_context = collect_live_diff(&allocation.worktree_path)?;
-    let review_outcome = live_review_fanout(
+    let review_outcome = live_review_fanout(LiveReviewInput {
         config,
         adapter_id,
-        &spec,
-        &environment,
-        &lane_paths,
-        &allocation,
-        &attempt_outcome.changed_files,
-        &validation,
-        &diff_context,
-    )?;
+        spec: &spec,
+        environment: &environment,
+        lane_paths: &lane_paths,
+        allocation: &allocation,
+        changed_files: &attempt_outcome.changed_files,
+        validation: &validation,
+        diff_context: &diff_context,
+    })?;
     let review_duration_seconds = review_started.elapsed().as_secs_f64();
     for signal in &review_outcome.signals {
         write_json(
@@ -1585,31 +1585,29 @@ struct LiveReviewOutcome {
     reviewer_passes: u32,
 }
 
-fn live_review_fanout(
-    config: &HepaFakeRunConfig,
-    adapter_id: &str,
-    spec: &hepa_adapters::spec::HepaAdapterSpec,
-    environment: &std::collections::BTreeMap<String, String>,
-    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
-    allocation: &HepaWorktreeAllocation,
-    changed_files: &[String],
-    validation: &HepaValidationSummary,
-    diff_context: &str,
-) -> Result<LiveReviewOutcome, String> {
+struct LiveReviewInput<'a> {
+    config: &'a HepaFakeRunConfig,
+    adapter_id: &'a str,
+    spec: &'a hepa_adapters::spec::HepaAdapterSpec,
+    environment: &'a std::collections::BTreeMap<String, String>,
+    lane_paths: &'a hepa_core::artifacts::HepaLaneArtifactPaths,
+    allocation: &'a HepaWorktreeAllocation,
+    changed_files: &'a [String],
+    validation: &'a HepaValidationSummary,
+    diff_context: &'a str,
+}
+
+fn live_review_fanout(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, String> {
     if live_adapter_review_enabled() {
-        return live_adapter_review(
-            config,
-            adapter_id,
-            spec,
-            environment,
-            lane_paths,
-            allocation,
-            changed_files,
-            validation,
-            diff_context,
-        );
+        return live_adapter_review(input);
     }
-    live_deterministic_review_fanout(config, adapter_id, changed_files, validation, diff_context)
+    live_deterministic_review_fanout(
+        input.config,
+        input.adapter_id,
+        input.changed_files,
+        input.validation,
+        input.diff_context,
+    )
 }
 
 fn live_adapter_review_enabled() -> bool {
@@ -1619,60 +1617,70 @@ fn live_adapter_review_enabled() -> bool {
     )
 }
 
-fn live_adapter_review(
-    config: &HepaFakeRunConfig,
-    adapter_id: &str,
-    spec: &hepa_adapters::spec::HepaAdapterSpec,
-    environment: &std::collections::BTreeMap<String, String>,
-    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
-    allocation: &HepaWorktreeAllocation,
-    changed_files: &[String],
-    validation: &HepaValidationSummary,
-    diff_context: &str,
-) -> Result<LiveReviewOutcome, String> {
+fn live_adapter_review(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, String> {
     let review_id = "review-live-adapter";
-    let mut prompt = live_review_prompt(config, changed_files, validation, diff_context);
-    if adapter_id == "pi" && pi_review_model_needs_no_think_suffix(environment) {
+    let mut prompt = live_review_prompt(
+        input.config,
+        input.changed_files,
+        input.validation,
+        input.diff_context,
+    );
+    if input.adapter_id == "pi" && pi_review_model_needs_no_think_suffix(input.environment) {
         prompt.push_str(
             "\nAdapter-local reviewer note: answer directly with only the requested JSON object and do not emit hidden reasoning. /no_think\n",
         );
     }
-    let review_output = lane_paths.lane_dir.join("review/live-adapter-output.jsonl");
-    let prompt_path = lane_paths.lane_dir.join("review/live-adapter-prompt.md");
+    let review_output = input
+        .lane_paths
+        .lane_dir
+        .join("review/live-adapter-output.jsonl");
+    let prompt_path = input
+        .lane_paths
+        .lane_dir
+        .join("review/live-adapter-prompt.md");
     if let Some(parent) = prompt_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::write(&prompt_path, &prompt).map_err(|error| error.to_string())?;
     let invocation = HepaOneshotAdapterInvocation {
-        spec: spec.clone(),
+        spec: input.spec.clone(),
         role: HepaAdapterRole::Reviewer,
         context: HepaAdapterTemplateContext {
-            prompt_file: lane_paths.lane_dir.join("prompt.md").display().to_string(),
-            worktree: allocation.worktree_path.display().to_string(),
+            prompt_file: input
+                .lane_paths
+                .lane_dir
+                .join("prompt.md")
+                .display()
+                .to_string(),
+            worktree: input.allocation.worktree_path.display().to_string(),
             review_prompt_file: prompt_path.display().to_string(),
-            output_file: lane_paths
+            output_file: input
+                .lane_paths
                 .lane_dir
                 .join("attempts/attempt-1/attempt.json")
                 .display()
                 .to_string(),
             review_output_file: review_output.display().to_string(),
-            artifact_dir: lane_paths.lane_dir.display().to_string(),
+            artifact_dir: input.lane_paths.lane_dir.display().to_string(),
         },
         prompt,
-        environment: environment.clone(),
+        environment: input.environment.clone(),
         monitor_policy: live_monitor_policy(),
     };
-    let _local_generation_permit =
-        local_pi_generation_concurrency_permit(adapter_id, environment, HepaAdapterRole::Reviewer);
+    let _local_generation_permit = local_pi_generation_concurrency_permit(
+        input.adapter_id,
+        input.environment,
+        HepaAdapterRole::Reviewer,
+    );
     let result = HepaOneshotAdapterExecutor::new()
         .run(&invocation)
         .map_err(|error| error.to_string())?;
-    let raw_review = adapter_review_payload(adapter_id, &result.stdout, &review_output)?;
+    let raw_review = adapter_review_payload(input.adapter_id, &result.stdout, &review_output)?;
     let normalization = normalize_reviewer_output_by_exception(
         HepaReviewerOutputInput {
             review_id: review_id.to_string(),
-            lane_id: config.lane_id.clone(),
-            adapter_id: format!("live-reviewer:{adapter_id}"),
+            lane_id: input.config.lane_id.clone(),
+            adapter_id: format!("live-reviewer:{}", input.adapter_id),
             completed_at: "2026-06-16T00:00:06Z".to_string(),
             raw_output: raw_review,
         },
