@@ -10,9 +10,9 @@ use std::{error::Error, fmt};
 
 pub const PI_ADAPTER_ID: &str = "pi";
 pub const PI_COMMAND: &str = "pi";
-pub const PI_PINNED_VERSION: &str = "0.1.0";
+pub const PI_PINNED_VERSION: &str = "0.79.6";
 pub const PI_INSTALL_PACKAGE: &str = "@earendil-works/pi-coding-agent";
-pub const PI_PINNED_PACKAGE: &str = "@earendil-works/pi-coding-agent@0.1.0";
+pub const PI_PINNED_PACKAGE: &str = "@earendil-works/pi-coding-agent@0.79.6";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaPiModelConfig {
@@ -494,7 +494,8 @@ mod tests {
         let plan = HepaPiInstallPlan::npm_global();
 
         assert!(plan.command.contains(&"-g".to_string()));
-        assert!(plan.package.contains("@0.1.0"));
+        assert_eq!(plan.package, PI_PINNED_PACKAGE);
+        assert!(plan.package.ends_with(PI_PINNED_VERSION));
         assert!(!plan.command.iter().any(|part| part == "sudo"));
         assert!(plan.action_line().contains("explicitly"));
     }
