@@ -39,6 +39,7 @@ use hepa_kanban::{
     card_mapping::HepaHermesCardMappingInput,
     sync::{HepaHermesCardStore, HepaKanbanSyncEngine, HepaKanbanSyncSummary},
 };
+use hepa_memory::{HepaProjectMemory, HepaRewardSignal};
 use hepa_review::{
     arbitration::{
         HepaArbitratedFinding, HepaManagerArbitrationAction, apply_deterministic_downgrade_rules,
@@ -61,7 +62,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, MutexGuard, OnceLock},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +216,19 @@ pub fn run_fake_task(config: &HepaFakeRunConfig) -> Result<HepaFakeRunResult, St
     let terminal_report = terminal_report(config, validation, review, timing.clone());
     write_json(&lane_paths.final_report, &terminal_report).map_err(|error| error.to_string())?;
     write_json(&run_paths.run_state, &readiness).map_err(|error| error.to_string())?;
+    record_terminal_memory(TerminalMemoryInput {
+        control_root: &config.control_root,
+        project_id: "single-repo",
+        lane_id: &config.lane_id,
+        lane_state: &HepaLaneState::Completed,
+        adapter_id: "fake",
+        prompt_pattern: &config.task_text,
+        failure_pattern: None,
+        validation_pass: true,
+        reviewer_pass: true,
+        pr_readiness: true,
+        repair_convergence: true,
+    });
     run_paths
         .archive_on_exit("2026-06-16T00:00:08Z", HepaArchiveOutcome::Completed)
         .map_err(|error| error.to_string())?;
@@ -882,6 +896,22 @@ pub fn run_live_task(
         .map_err(|error| error.to_string())?;
     write_json(&lane_paths.final_report, &terminal_report).map_err(|error| error.to_string())?;
     write_json(&run_paths.run_state, &readiness).map_err(|error| error.to_string())?;
+    record_terminal_memory(TerminalMemoryInput {
+        control_root: &config.control_root,
+        project_id: &task_spec.project_id,
+        lane_id: &config.lane_id,
+        lane_state: &HepaLaneState::Completed,
+        adapter_id,
+        prompt_pattern: &config.task_text,
+        failure_pattern: None,
+        validation_pass: true,
+        reviewer_pass: true,
+        pr_readiness: true,
+        repair_convergence: repair_timing
+            .as_ref()
+            .map(|timing| timing.completed)
+            .unwrap_or(true),
+    });
     run_paths
         .archive_on_exit("2026-06-16T00:00:08Z", HepaArchiveOutcome::Completed)
         .map_err(|error| error.to_string())?;
@@ -1120,12 +1150,30 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         .cloned()
         .collect::<Vec<_>>();
     let diff_state = collect_live_diff(&allocation.worktree_path)?;
+    let review_findings = memory_failure_context(&config.control_root, &task_spec.project_id)
+        .into_iter()
+        .enumerate()
+        .map(|(index, evidence)| HepaReviewFinding {
+            finding_id: format!("memory-failure-pattern-{}", index + 1),
+            severity: HepaFindingSeverity::Low,
+            category: "memory-failure-context".to_string(),
+            evidence,
+            in_scope: true,
+            release_risk: false,
+            recommended_action: "Consult this prior failure pattern while preparing the repair."
+                .to_string(),
+            file_ref: None,
+            line: None,
+            message: "Prior HEPA memory failure pattern for this project.".to_string(),
+            accepted: true,
+        })
+        .collect::<Vec<_>>();
     let brief = rewrite_repair_prompt_from_evidence(HepaRepairBriefInput {
         lane_id: config.lane_id.clone(),
         repair_round,
         prior_prompt,
         failing_commands,
-        review_findings: Vec::new(),
+        review_findings,
         diff_state,
         files_touched: first_changed_files,
     })
@@ -2386,6 +2434,7 @@ fn finish_blocked_live_run(input: FinishBlockedInput<'_>) -> Result<HepaFakeRunR
     lane_paths
         .write_timing_record(&timing)
         .map_err(|error| error.to_string())?;
+    let failure_pattern = reason.clone();
     let terminal_report = HepaTerminalTaskReport {
         schema_version: CONTRACT_SCHEMA_VERSION,
         task_id: config.task_id.clone(),
@@ -2402,6 +2451,19 @@ fn finish_blocked_live_run(input: FinishBlockedInput<'_>) -> Result<HepaFakeRunR
     };
     write_json(&lane_paths.final_report, &terminal_report).map_err(|error| error.to_string())?;
     write_json(&run_paths.run_state, &readiness).map_err(|error| error.to_string())?;
+    record_terminal_memory(TerminalMemoryInput {
+        control_root: &config.control_root,
+        project_id: &task.project_id,
+        lane_id: &config.lane_id,
+        lane_state: &HepaLaneState::Blocked,
+        adapter_id: "live",
+        prompt_pattern: &config.task_text,
+        failure_pattern: Some(&failure_pattern),
+        validation_pass: false,
+        reviewer_pass: false,
+        pr_readiness: false,
+        repair_convergence: false,
+    });
     run_paths
         .archive_on_exit("2026-06-16T00:00:08Z", HepaArchiveOutcome::Blocked)
         .map_err(|error| error.to_string())?;
@@ -2420,6 +2482,93 @@ fn finish_blocked_live_run(input: FinishBlockedInput<'_>) -> Result<HepaFakeRunR
             hepa_git::worktree::HepaWorktreeCleanupStatus::Cleaned
         ),
     })
+}
+
+struct TerminalMemoryInput<'a> {
+    control_root: &'a Path,
+    project_id: &'a str,
+    lane_id: &'a str,
+    lane_state: &'a HepaLaneState,
+    adapter_id: &'a str,
+    prompt_pattern: &'a str,
+    failure_pattern: Option<&'a str>,
+    validation_pass: bool,
+    reviewer_pass: bool,
+    pr_readiness: bool,
+    repair_convergence: bool,
+}
+
+fn record_terminal_memory(input: TerminalMemoryInput<'_>) {
+    let Ok(memory) = project_memory(input.control_root, input.project_id) else {
+        return;
+    };
+    let _ = memory.ensure_context_packs();
+    let _ = memory.append_prompt_pattern(input.lane_state, input.prompt_pattern);
+    if let Some(failure_pattern) = input.failure_pattern {
+        let _ = memory.append_failure_pattern(input.lane_state, failure_pattern);
+    }
+    let _ = memory.append_adapter_lesson(
+        input.lane_state,
+        &format!(
+            "adapter={} terminal_state={:?}",
+            input.adapter_id, input.lane_state
+        ),
+    );
+    let _ = memory.record_reward(&HepaRewardSignal {
+        project_id: safe_memory_project_id(input.project_id),
+        lane_id: safe_memory_project_id(input.lane_id),
+        validation_pass: input.validation_pass,
+        reviewer_pass: input.reviewer_pass,
+        pr_readiness: input.pr_readiness,
+        ci_pass: input.pr_readiness,
+        human_merge: false,
+        repair_convergence: input.repair_convergence,
+        created_at: unix_timestamp_label(),
+    });
+}
+
+fn memory_failure_context(control_root: &Path, project_id: &str) -> Vec<String> {
+    project_memory(control_root, project_id)
+        .map(|memory| memory.retry_brief_failure_context())
+        .unwrap_or_default()
+}
+
+fn project_memory(control_root: &Path, project_id: &str) -> Result<HepaProjectMemory, String> {
+    HepaProjectMemory::new(
+        control_root.join("memory"),
+        safe_memory_project_id(project_id),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn safe_memory_project_id(value: &str) -> String {
+    let mut safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while safe.contains("..") {
+        safe = safe.replace("..", ".");
+    }
+    let safe = safe.trim_matches('.').trim_matches('_').to_string();
+    if safe.is_empty() {
+        "default-project".to_string()
+    } else {
+        safe
+    }
+}
+
+fn unix_timestamp_label() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("t{seconds}")
 }
 
 fn sanitize_validation_output(worktree: &Path, text: &str) -> String {
@@ -2926,6 +3075,60 @@ mod tests {
             assert!(artifact.exists(), "missing artifact {}", artifact.display());
         }
 
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn fake_terminal_run_records_memory_signals() {
+        let root = unique_test_dir("fake-memory");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let config = HepaFakeRunConfig {
+            repo_path: repo.clone(),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-memory".to_string(),
+            task_id: "task-memory".to_string(),
+            lane_id: "lane-memory".to_string(),
+            task_text: "Update docs without touching secrets".to_string(),
+            timing: true,
+        };
+
+        run_fake_task(&config).expect("fake run should complete");
+        let memory =
+            project_memory(&config.control_root, "single-repo").expect("memory should load");
+
+        let prompt_pack = memory
+            .read_pack(hepa_memory::HepaContextPack::PromptPatterns)
+            .expect("prompt pack exists");
+        assert!(prompt_pack.contains("Update docs without touching secrets"));
+        let adapter_pack = memory
+            .read_pack(hepa_memory::HepaContextPack::AdapterLessons)
+            .expect("adapter lessons exist");
+        assert!(adapter_pack.contains("adapter=fake"));
+        let rewards = memory.list_rewards();
+        assert_eq!(rewards.len(), 1);
+        assert!(rewards[0].validation_pass);
+        assert!(rewards[0].reviewer_pass);
+        assert!(rewards[0].pr_readiness);
+        assert!(rewards[0].repair_convergence);
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn repair_context_consults_project_failure_memory() {
+        let root = unique_test_dir("repair-memory");
+        let memory = project_memory(&root.join("control"), "project/with path")
+            .expect("sanitized project memory");
+        memory
+            .append_failure_pattern(&HepaLaneState::Failed, "rerun lint after generated docs")
+            .expect("append failure memory");
+
+        let context = memory_failure_context(&root.join("control"), "project/with path");
+
+        assert_eq!(context, vec!["rerun lint after generated docs".to_string()]);
         remove_test_dir(root);
     }
 

@@ -234,6 +234,16 @@ impl HepaProjectMemory {
         self.append_pattern(HepaContextPack::FailurePatterns, lane_state, pattern)
     }
 
+    /// Append an adapter lesson learned from a terminal lane outcome.
+    /// Returns whether a new entry was written.
+    pub fn append_adapter_lesson(
+        &self,
+        lane_state: &HepaLaneState,
+        lesson: &str,
+    ) -> Result<bool, HepaMemoryError> {
+        self.append_pattern(HepaContextPack::AdapterLessons, lane_state, lesson)
+    }
+
     fn append_pattern(
         &self,
         pack: HepaContextPack,
@@ -448,6 +458,16 @@ mod tests {
             .read_pack(HepaContextPack::FailurePatterns)
             .expect("failure pack exists");
         assert!(failures.contains("- lockfile drift breaks install"));
+
+        assert!(
+            memory
+                .append_adapter_lesson(&HepaLaneState::Completed, "fake adapter is deterministic")
+                .expect("lesson append")
+        );
+        let lessons = memory
+            .read_pack(HepaContextPack::AdapterLessons)
+            .expect("adapter lessons pack exists");
+        assert!(lessons.contains("- fake adapter is deterministic"));
 
         remove_test_dir(root);
     }

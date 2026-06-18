@@ -86,6 +86,7 @@ dependencies = [
  "hepa-core",
  "hepa-git",
  "hepa-kanban",
+ "hepa-memory",
  "hepa-review",
  "serde",
  "serde_json",
