@@ -2,7 +2,7 @@
 //! the fake adapter (no real CLIs/Docker/network), then compare to the Phase 0.4
 //! HOCA reference and validate the architecture targets.
 
-use hepa_core::bench::{aggregate_timing_records, compare_to_reference};
+use hepa_core::bench::{aggregate_timing_records, compare_to_reference, render_comparison_table};
 use hepa_core::contracts::HepaTimingRecord;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,16 +63,14 @@ fn run_and_read_timing(repo: &Path, task: &str) -> HepaTimingRecord {
     serde_json::from_str(&text).expect("parse timing record")
 }
 
-#[test]
-fn hepa_fake_adapter_matrix_meets_targets_versus_hoca_reference() {
+fn run_benchmark_cell(benchmark_id: &str, task: &str) {
     // The fake adapter is the only available implementation/review adapter in CI;
     // configured cloud adapters are a documented skip (no auth/network here).
-    let repo_a = temp_repo("doc-1");
-    let repo_b = temp_repo("doc-2");
+    let repo_a = temp_repo(&format!("{benchmark_id}-1"));
+    let repo_b = temp_repo(&format!("{benchmark_id}-2"));
     init_repo(&repo_a);
     init_repo(&repo_b);
 
-    let task = "Trivial doc-only change: add a usage note to the README.";
     let runs = vec![
         run_and_read_timing(&repo_a, task),
         run_and_read_timing(&repo_b, task),
@@ -86,8 +84,8 @@ fn hepa_fake_adapter_matrix_meets_targets_versus_hoca_reference() {
     }
 
     // Manual timing: the fake adapter does not measure real wall time / RSS.
-    let candidate =
-        aggregate_timing_records("PB-DOC-001", &runs, 0.0, 0.0, true).expect("aggregate");
+    let candidate = aggregate_timing_records(benchmark_id, &runs, 0.0, 0.0, true)
+        .expect("aggregate benchmark cell");
     let comparison = compare_to_reference(&candidate).expect("compare to HOCA reference");
 
     assert!(comparison.targets.one_loop_per_attempt);
@@ -99,7 +97,22 @@ fn hepa_fake_adapter_matrix_meets_targets_versus_hoca_reference() {
         "targets: {:?}",
         comparison.targets
     );
+    let table = render_comparison_table(&comparison);
+    assert!(table.contains(benchmark_id));
+    assert!(!table.contains("/Users/"));
 
     std::fs::remove_dir_all(&repo_a).ok();
     std::fs::remove_dir_all(&repo_b).ok();
+}
+
+#[test]
+fn hepa_fake_adapter_matrix_meets_targets_versus_hoca_reference() {
+    run_benchmark_cell(
+        "PB-DOC-001",
+        "Trivial doc-only change: add a usage note to the README.",
+    );
+    run_benchmark_cell(
+        "PB-FE-001",
+        "Small frontend feature change: add a focused UI usage note and validate the app.",
+    );
 }
