@@ -946,6 +946,8 @@ fn execute_live_worker_attempt(
         .map_err(|error| error.to_string())?;
     let cost_class = spec.cost_class.clone();
     let output_capture = spec.output_capture.clone();
+    let _local_generation_permit =
+        local_pi_generation_concurrency_permit(adapter_id, &environment, HepaAdapterRole::Worker);
     let invocation = HepaOneshotAdapterInvocation {
         spec,
         role: HepaAdapterRole::Worker,
@@ -1660,7 +1662,8 @@ fn live_adapter_review(
         environment: environment.clone(),
         monitor_policy: live_monitor_policy(),
     };
-    let _local_review_permit = local_pi_reviewer_concurrency_permit(adapter_id, environment);
+    let _local_generation_permit =
+        local_pi_generation_concurrency_permit(adapter_id, environment, HepaAdapterRole::Reviewer);
     let result = HepaOneshotAdapterExecutor::new()
         .run(&invocation)
         .map_err(|error| error.to_string())?;
@@ -1755,16 +1758,35 @@ fn pi_review_model_needs_no_think_suffix(
     pi_model_needs_no_think_suffix(&review_model, &base_url)
 }
 
-fn local_pi_reviewer_concurrency_permit(
+fn pi_worker_model_needs_local_permit(
+    environment: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let worker_model = environment
+        .get("HEPA_PI_MODEL")
+        .cloned()
+        .unwrap_or_default();
+    let base_url = environment.get("HEPA_PI_BASE_URL").cloned();
+    pi_model_needs_no_think_suffix(&worker_model, &base_url)
+}
+
+fn local_pi_generation_concurrency_permit(
     adapter_id: &str,
     environment: &std::collections::BTreeMap<String, String>,
+    role: HepaAdapterRole,
 ) -> Option<MutexGuard<'static, ()>> {
-    if adapter_id != "pi" || !pi_review_model_needs_no_think_suffix(environment) {
+    if adapter_id != "pi" {
         return None;
     }
-    static LOCAL_PI_REVIEWER_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    let needs_permit = match role {
+        HepaAdapterRole::Worker => pi_worker_model_needs_local_permit(environment),
+        HepaAdapterRole::Reviewer => pi_review_model_needs_no_think_suffix(environment),
+    };
+    if !needs_permit {
+        return None;
+    }
+    static LOCAL_PI_GENERATION_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     Some(
-        LOCAL_PI_REVIEWER_MUTEX
+        LOCAL_PI_GENERATION_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
@@ -3437,8 +3459,12 @@ mod tests {
     }
 
     #[test]
-    fn local_pi_reviewer_permit_only_applies_to_local_review_models() {
+    fn local_pi_generation_permit_applies_to_local_worker_and_reviewer_models() {
         let local_environment = std::collections::BTreeMap::from([
+            (
+                "HEPA_PI_MODEL".to_string(),
+                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+            ),
             (
                 "HEPA_PI_REVIEW_MODEL".to_string(),
                 "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
@@ -3452,12 +3478,66 @@ mod tests {
             "HEPA_PI_REVIEW_MODEL".to_string(),
             "deepseek/deepseek-chat".to_string(),
         )]);
+        let hybrid_environment = std::collections::BTreeMap::from([
+            (
+                "HEPA_PI_MODEL".to_string(),
+                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+            ),
+            (
+                "HEPA_PI_REVIEW_MODEL".to_string(),
+                "deepseek/deepseek-chat".to_string(),
+            ),
+            (
+                "HEPA_PI_BASE_URL".to_string(),
+                "http://127.0.0.1:52415/v1".to_string(),
+            ),
+        ]);
 
-        let permit = local_pi_reviewer_concurrency_permit("pi", &local_environment);
+        let permit = local_pi_generation_concurrency_permit(
+            "pi",
+            &local_environment,
+            HepaAdapterRole::Worker,
+        );
         assert!(permit.is_some());
         drop(permit);
-        assert!(local_pi_reviewer_concurrency_permit("pi", &cloud_environment).is_none());
-        assert!(local_pi_reviewer_concurrency_permit("custom", &local_environment).is_none());
+        let permit = local_pi_generation_concurrency_permit(
+            "pi",
+            &local_environment,
+            HepaAdapterRole::Reviewer,
+        );
+        assert!(permit.is_some());
+        drop(permit);
+        let permit = local_pi_generation_concurrency_permit(
+            "pi",
+            &hybrid_environment,
+            HepaAdapterRole::Worker,
+        );
+        assert!(permit.is_some());
+        drop(permit);
+        assert!(
+            local_pi_generation_concurrency_permit(
+                "pi",
+                &hybrid_environment,
+                HepaAdapterRole::Reviewer
+            )
+            .is_none()
+        );
+        assert!(
+            local_pi_generation_concurrency_permit(
+                "pi",
+                &cloud_environment,
+                HepaAdapterRole::Worker
+            )
+            .is_none()
+        );
+        assert!(
+            local_pi_generation_concurrency_permit(
+                "custom",
+                &local_environment,
+                HepaAdapterRole::Worker
+            )
+            .is_none()
+        );
     }
 
     #[test]
