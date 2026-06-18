@@ -106,6 +106,12 @@ assistant message and tool activity; changed files are derived from `git status`
 in the lane worktree, not from Pi output. Malformed, truncated, or schema-drifted
 streams are explicit parse failures.
 
+Live Pi runs use bounded monitor budgets. Operators may lower
+`HEPA_PI_LIVE_TIMEOUT_MS` or `HEPA_PI_LIVE_STALL_MS`, but HEPA clamps live Pi
+budgets to the small-task release target so local-provider stalls finish as
+blocked diagnostic attempts with `stdout.log`, `stderr.log`, and `attempt.json`
+instead of waiting indefinitely.
+
 ## Local CLI adapters
 
 HEPA ships multiple local adapter templates for projects that require a fully

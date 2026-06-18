@@ -88,7 +88,7 @@ pub fn builtin_adapter_spec(id: &str) -> HepaAdapterSpec {
             cost_class: HepaAdapterCostClass::PaidCloud,
             resource_weight: 1,
             max_concurrency: 2,
-            prompt_transport: HepaAdapterPromptTransport::PromptArg,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
             output_capture: HepaAdapterOutputCapture::Stdout,
         },
         "shell-command" => spec(AdapterSpecTemplate {

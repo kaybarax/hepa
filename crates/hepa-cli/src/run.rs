@@ -1002,10 +1002,42 @@ fn execute_live_worker_attempt(
         monitor_policy: live_monitor_policy(),
     };
     let worker_started = Instant::now();
-    let result = HepaOneshotAdapterExecutor::new()
-        .run(&invocation)
-        .map_err(|error| error.to_string())?;
+    let result = match HepaOneshotAdapterExecutor::new().run(&invocation) {
+        Ok(result) => result,
+        Err(error) => {
+            write_live_adapter_stream_logs(&attempt_paths, &error.stdout, &error.stderr)?;
+            let changed_files =
+                collect_changed_files(&allocation.worktree_path).unwrap_or_default();
+            let attempt = HepaAttemptReport {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                attempt_id: attempt_id.to_string(),
+                lane_id: config.lane_id.clone(),
+                task_id: config.task_id.clone(),
+                round,
+                role: HepaAgentRole::Worker,
+                adapter_id: adapter_id.to_string(),
+                status: if error.status.as_deref() == Some("blocked") {
+                    hepa_core::contracts::HepaAttemptStatus::Blocked
+                } else {
+                    hepa_core::contracts::HepaAttemptStatus::Failed
+                },
+                commands_run: vec![format!("live adapter invocation: {adapter_id}")],
+                changed_files,
+                summary: live_attempt_summary(
+                    &allocation.worktree_path,
+                    &error.stdout,
+                    &error.stderr,
+                ),
+                blocked_reason: Some(error.sanitized_summary()),
+                started_at: started_at.to_string(),
+                completed_at: Some(completed_at.to_string()),
+            };
+            write_attempt(lane_paths, &attempt)?;
+            return Err(error.to_string());
+        }
+    };
     let duration_seconds = worker_started.elapsed().as_secs_f64();
+    write_live_adapter_stream_logs(&attempt_paths, &result.stdout, &result.stderr)?;
     let changed_files = collect_changed_files(&allocation.worktree_path)?;
     let usage_entries = extract_live_usage_entries(
         adapter_id,
@@ -1044,6 +1076,16 @@ fn execute_live_worker_attempt(
         changed_files,
         usage_entries,
     })
+}
+
+fn write_live_adapter_stream_logs(
+    attempt_paths: &hepa_core::artifacts::HepaAttemptArtifactPaths,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    fs::write(&attempt_paths.stdout_log, stdout).map_err(|error| error.to_string())?;
+    fs::write(&attempt_paths.stderr_log, stderr).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 struct RunLiveRepairInput<'a> {
@@ -1288,17 +1330,32 @@ fn optional_env(key: &str) -> Option<Option<String>> {
 }
 
 fn live_monitor_policy() -> HepaMonitorPolicy {
+    const DEFAULT_PI_LIVE_TIMEOUT_MS: u64 = 300_000;
+    const DEFAULT_PI_LIVE_STALL_MS: u64 = 240_000;
+    const MAX_PI_LIVE_BUDGET_MS: u64 = 600_000;
     HepaMonitorPolicy {
-        timeout_ms: std::env::var("HEPA_PI_LIVE_TIMEOUT_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .or(Some(300_000)),
-        stall_ms: std::env::var("HEPA_PI_LIVE_STALL_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .or(Some(240_000)),
+        timeout_ms: Some(live_budget_ms(
+            "HEPA_PI_LIVE_TIMEOUT_MS",
+            DEFAULT_PI_LIVE_TIMEOUT_MS,
+            MAX_PI_LIVE_BUDGET_MS,
+        )),
+        stall_ms: Some(live_budget_ms(
+            "HEPA_PI_LIVE_STALL_MS",
+            DEFAULT_PI_LIVE_STALL_MS,
+            MAX_PI_LIVE_BUDGET_MS,
+        )),
         ..HepaMonitorPolicy::default()
     }
+}
+
+fn live_budget_ms(key: &str, default_ms: u64, max_ms: u64) -> u64 {
+    clamp_live_budget_ms(std::env::var(key).ok().as_deref(), default_ms, max_ms)
+}
+
+fn clamp_live_budget_ms(raw: Option<&str>, default_ms: u64, max_ms: u64) -> u64 {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1, max_ms))
+        .unwrap_or(default_ms)
 }
 
 fn live_worker_prompt(task_text: &str) -> String {
@@ -3076,6 +3133,24 @@ mod tests {
         }
 
         remove_test_dir(root);
+    }
+
+    #[test]
+    fn live_pi_budget_clamps_operator_env_to_release_target() {
+        assert_eq!(clamp_live_budget_ms(None, 300_000, 600_000), 300_000);
+        assert_eq!(
+            clamp_live_budget_ms(Some("5400000"), 300_000, 600_000),
+            600_000
+        );
+        assert_eq!(
+            clamp_live_budget_ms(Some("120000"), 300_000, 600_000),
+            120_000
+        );
+        assert_eq!(clamp_live_budget_ms(Some("0"), 300_000, 600_000), 1);
+        assert_eq!(
+            clamp_live_budget_ms(Some("not-a-number"), 300_000, 600_000),
+            300_000
+        );
     }
 
     #[test]

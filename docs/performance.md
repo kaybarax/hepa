@@ -80,6 +80,12 @@ Interpretation:
 - Max RSS and peak footprint are measured for the HEPA manager process. External
   model-serving memory and compute for exo/MLX live outside that process and
   should be measured separately when sizing a local deployment.
+- Follow-up hardening now sends Pi prompts through stdin, persists per-attempt
+  stdout/stderr logs for live adapters, retains partial stdout/stderr on monitor
+  stops, and clamps live Pi monitor budgets to the small-task release target so
+  future local-route stalls become terminal diagnostic artifacts instead of
+  silent waits. The local and hybrid routes remain release blockers until a
+  Hermes-present rerun completes inside the target.
 
 These numbers are release evidence for the tested validation tasks and
 environment. Larger changes, slow dependency installs, long test suites, CI

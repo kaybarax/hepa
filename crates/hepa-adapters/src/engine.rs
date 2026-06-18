@@ -10,6 +10,7 @@ use std::{
     io::Read,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -175,6 +176,8 @@ pub struct HepaAdapterExecutionError {
     pub field: String,
     pub message: String,
     pub status: Option<String>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 impl HepaAdapterExecutionError {
@@ -183,6 +186,8 @@ impl HepaAdapterExecutionError {
             field: field.into(),
             message: message.into(),
             status: None,
+            stdout: String::new(),
+            stderr: String::new(),
         }
     }
 
@@ -191,6 +196,34 @@ impl HepaAdapterExecutionError {
             field: field.into(),
             message: message.into(),
             status: Some("blocked".to_string()),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn with_output(mut self, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        self.stdout = String::from_utf8_lossy(&stdout).to_string();
+        self.stderr = String::from_utf8_lossy(&stderr).to_string();
+        self
+    }
+
+    pub fn has_output(&self) -> bool {
+        !self.stdout.is_empty() || !self.stderr.is_empty()
+    }
+}
+
+impl HepaAdapterExecutionError {
+    pub fn sanitized_summary(&self) -> String {
+        if self.has_output() {
+            format!(
+                "{}: {}; captured stdout={} bytes stderr={} bytes",
+                self.field,
+                self.message,
+                self.stdout.len(),
+                self.stderr.len()
+            )
+        } else {
+            self.to_string()
         }
     }
 }
@@ -207,28 +240,22 @@ fn wait_with_monitor(
     mut child: std::process::Child,
     policy: &HepaMonitorPolicy,
 ) -> Result<std::process::Output, HepaAdapterExecutionError> {
-    let mut stdout = child.stdout.take().ok_or_else(|| {
+    let stdout = child.stdout.take().ok_or_else(|| {
         HepaAdapterExecutionError::new("stdout", "failed to capture adapter stdout")
     })?;
-    let mut stderr = child.stderr.take().ok_or_else(|| {
+    let stderr = child.stderr.take().ok_or_else(|| {
         HepaAdapterExecutionError::new("stderr", "failed to capture adapter stderr")
     })?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
+    let stdout_reader = spawn_output_reader(stdout);
+    let stderr_reader = spawn_output_reader(stderr);
     let started_at = Instant::now();
     loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|error| HepaAdapterExecutionError::new("command", error.to_string()))?
         {
-            let stdout = join_output_reader("stdout", stdout_reader)?;
-            let stderr = join_output_reader("stderr", stderr_reader)?;
+            let stdout = receive_output_reader("stdout", &stdout_reader)?;
+            let stderr = receive_output_reader("stderr", &stderr_reader)?;
             return Ok(std::process::Output {
                 status,
                 stdout,
@@ -239,27 +266,76 @@ fn wait_with_monitor(
         if let Err(stop) = policy.check_elapsed(elapsed_ms) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = join_output_reader("stdout", stdout_reader);
-            let _ = join_output_reader("stderr", stderr_reader);
-            return Err(monitor_error(stop));
+            let stdout = receive_output_reader_snapshot(&stdout_reader);
+            let stderr = receive_output_reader_snapshot(&stderr_reader);
+            return Err(monitor_error(stop).with_output(stdout, stderr));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn join_output_reader(
+struct OutputReader {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<Result<(), std::io::Error>>,
+}
+
+fn spawn_output_reader<R>(mut stream: R) -> OutputReader
+where
+    R: Read + Send + 'static,
+{
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let thread_bytes = Arc::clone(&bytes);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        let result = loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break Ok(()),
+                Ok(count) => {
+                    thread_bytes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(&chunk[..count]);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    OutputReader {
+        bytes,
+        done: receiver,
+    }
+}
+
+fn receive_output_reader(
     stream: &'static str,
-    reader: std::thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+    reader: &OutputReader,
 ) -> Result<Vec<u8>, HepaAdapterExecutionError> {
     reader
-        .join()
-        .map_err(|_| HepaAdapterExecutionError::new(stream, "reader thread panicked"))?
+        .done
+        .recv()
+        .map_err(|_| HepaAdapterExecutionError::new(stream, "reader thread disconnected"))?
         .map_err(|error| {
             HepaAdapterExecutionError::new(
                 stream,
                 format!("failed to read adapter {stream}: {error}"),
             )
-        })
+        })?;
+    Ok(reader
+        .bytes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone())
+}
+
+fn receive_output_reader_snapshot(reader: &OutputReader) -> Vec<u8> {
+    let _ = reader.done.recv_timeout(Duration::from_millis(100));
+    reader
+        .bytes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn write_prompt_file(
@@ -965,6 +1041,82 @@ esac
         .expect_err("stall should stop");
         assert_eq!(stall_error.status.as_deref(), Some("blocked"));
         assert!(stall_error.message.contains("stall"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_retains_partial_streams_on_monitor_stop() {
+        let root = unique_test_dir("monitor-output");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("fake-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+printf 'partial stdout before timeout'
+printf 'partial stderr before timeout' >&2
+sleep 10
+"#,
+        );
+
+        let error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} ignored", script.display()),
+            HepaMonitorPolicy {
+                timeout_ms: Some(5_000),
+                ..HepaMonitorPolicy::default()
+            },
+        )
+        .expect_err("timeout should retain diagnostics");
+
+        assert_eq!(error.status.as_deref(), Some("blocked"));
+        assert!(error.message.contains("timeout"));
+        assert!(error.stdout.contains("partial stdout before timeout"));
+        assert!(error.stderr.contains("partial stderr before timeout"));
+        assert!(error.sanitized_summary().contains("captured stdout="));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_timeout_does_not_wait_on_descendant_held_pipes() {
+        let root = unique_test_dir("monitor-descendant");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("fake-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+(sleep 5) &
+printf 'parent output before timeout'
+sleep 3
+"#,
+        );
+        let started = Instant::now();
+
+        let error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} ignored", script.display()),
+            HepaMonitorPolicy {
+                timeout_ms: Some(250),
+                ..HepaMonitorPolicy::default()
+            },
+        )
+        .expect_err("timeout should return before descendant pipe EOF");
+
+        assert_eq!(error.status.as_deref(), Some("blocked"));
+        assert!(error.message.contains("timeout"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path waited on descendant-held pipe"
+        );
 
         remove_test_dir(root);
     }

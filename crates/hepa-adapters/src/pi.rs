@@ -138,7 +138,7 @@ pub fn adapter_spec_from_config(config: &HepaPiConfig) -> HepaAdapterSpec {
     ));
     spec.required_env = model_config.required_env();
     spec.cost_class = model_config.cost_class();
-    spec.prompt_transport = crate::spec::HepaAdapterPromptTransport::PromptArg;
+    spec.prompt_transport = crate::spec::HepaAdapterPromptTransport::Stdin;
     spec
 }
 
@@ -443,6 +443,10 @@ mod tests {
         assert!(spec.command.contains("--model qwen2.5-coder"));
         assert!(spec.command.contains("--no-approve"));
         assert!(!spec.command.contains("--approve "));
+        assert_eq!(
+            spec.prompt_transport,
+            crate::spec::HepaAdapterPromptTransport::Stdin
+        );
         assert!(
             spec.review_command
                 .as_deref()
