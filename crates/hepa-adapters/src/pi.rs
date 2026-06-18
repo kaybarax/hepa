@@ -25,12 +25,23 @@ pub struct HepaPiModelConfig {
 
 impl HepaPiModelConfig {
     pub fn required_env(&self) -> Vec<String> {
-        self.provider_key_env
+        let mut env = self
+            .provider_key_env
             .as_ref()
             .filter(|value| !value.trim().is_empty())
             .into_iter()
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        if self
+            .base_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            env.push("HEPA_PI_BASE_URL".to_string());
+        }
+        env.sort();
+        env.dedup();
+        env
     }
 
     pub fn cost_class(&self) -> HepaAdapterCostClass {
@@ -459,7 +470,7 @@ mod tests {
                 .unwrap()
                 .contains("--no-approve")
         );
-        assert_eq!(spec.required_env, Vec::<String>::new());
+        assert_eq!(spec.required_env, vec!["HEPA_PI_BASE_URL".to_string()]);
         assert_eq!(spec.cost_class, HepaAdapterCostClass::Local);
     }
 
@@ -489,7 +500,13 @@ mod tests {
                 .unwrap()
                 .contains("--model deepseek-chat")
         );
-        assert_eq!(spec.required_env, vec!["DEEPSEEK_API_KEY".to_string()]);
+        assert_eq!(
+            spec.required_env,
+            vec![
+                "DEEPSEEK_API_KEY".to_string(),
+                "HEPA_PI_BASE_URL".to_string()
+            ]
+        );
         assert_eq!(spec.cost_class, HepaAdapterCostClass::PaidCloud);
     }
 
