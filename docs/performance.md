@@ -53,6 +53,14 @@ surface and HEPA's deterministic run records remaining authoritative:
 | Pi + local Qwen worker/reviewer via exo + Apple MLX | 2 | 2 | timeout / no final summary | 613.89 s | 9.7 MiB | 1.7 MiB | no PRs opened; worktrees cleaned |
 | Pi + local Qwen worker via exo + Apple MLX / DeepSeek reviewer | 2 | 2 | timeout / no final summary | 645.54 s | 9.7 MiB | 1.7 MiB | no PRs opened; worktrees cleaned |
 
+Post-hardening Hermes-present local-route rerun, after Pi stdin transport,
+stdout/stderr capture, partial-output retention, and live Pi monitor clamping:
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| Pi + local Qwen worker/reviewer via exo + Apple MLX | 2 | 2 | interrupted after one zero-output local response and one non-terminal lane | 1191.03 s | 171.2 MiB | 1.9 MiB | no PRs opened; worktrees cleaned |
+| Pi + local Qwen worker via exo + Apple MLX / DeepSeek reviewer | 2 | 2 | interrupted after local worker stage failed to produce terminal attempt results | 619.70 s | 173.0 MiB | 1.8 MiB | no PRs opened; worktrees cleaned |
+
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
 operator waits while HEPA schedules, executes, validates, reviews, stages, opens
@@ -74,6 +82,13 @@ Interpretation:
 - The hybrid route proved local-worker/cloud-reviewer operation in the initial
   sample, but the Hermes-present rerun also timed out before final summaries
   because it still depends on the local worker leg.
+- The post-hardening local-route rerun improved diagnostics but did not clear
+  the release blocker. In both pure-local and hybrid configs, the docs-only lane
+  captured `stdout.log`, `stderr.log`, and `attempt.json` for a zero-output
+  local Qwen response from the exo/MLX route. The app-starter lane did not reach
+  a terminal attempt record before operator interruption. The hybrid run did
+  not reach meaningful DeepSeek review because the local worker leg failed
+  first.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.
@@ -82,10 +97,12 @@ Interpretation:
   should be measured separately when sizing a local deployment.
 - Follow-up hardening now sends Pi prompts through stdin, persists per-attempt
   stdout/stderr logs for live adapters, retains partial stdout/stderr on monitor
-  stops, and clamps live Pi monitor budgets to the small-task release target so
-  future local-route stalls become terminal diagnostic artifacts instead of
-  silent waits. The local and hybrid routes remain release blockers until a
-  Hermes-present rerun completes inside the target.
+  stops, and clamps live Pi monitor budgets to the small-task release target.
+  The post-hardening rerun shows this is only partially effective: empty local
+  responses are now diagnosable, but at least one local-provider stall can still
+  outlive the target without a terminal lane artifact. The local and hybrid
+  routes remain release blockers until a Hermes-present rerun completes inside
+  the target or fails terminally with complete per-lane diagnostics.
 
 These numbers are release evidence for the tested validation tasks and
 environment. Larger changes, slow dependency installs, long test suites, CI
