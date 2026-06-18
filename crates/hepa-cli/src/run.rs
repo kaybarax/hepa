@@ -1625,7 +1625,12 @@ fn live_adapter_review(
     diff_context: &str,
 ) -> Result<LiveReviewOutcome, String> {
     let review_id = "review-live-adapter";
-    let prompt = live_review_prompt(config, changed_files, validation, diff_context);
+    let mut prompt = live_review_prompt(config, changed_files, validation, diff_context);
+    if adapter_id == "pi" && pi_review_model_needs_no_think_suffix(environment) {
+        prompt.push_str(
+            "\nAdapter-local reviewer note: answer directly with only the requested JSON object and do not emit hidden reasoning. /no_think\n",
+        );
+    }
     let review_output = lane_paths.lane_dir.join("review/live-adapter-output.jsonl");
     let prompt_path = lane_paths.lane_dir.join("review/live-adapter-prompt.md");
     if let Some(parent) = prompt_path.parent() {
@@ -1731,6 +1736,18 @@ fn live_review_prompt(
         validation.status,
         diff_context
     )
+}
+
+fn pi_review_model_needs_no_think_suffix(
+    environment: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let review_model = environment
+        .get("HEPA_PI_REVIEW_MODEL")
+        .or_else(|| environment.get("HEPA_PI_MODEL"))
+        .cloned()
+        .unwrap_or_default();
+    let base_url = environment.get("HEPA_PI_BASE_URL").cloned();
+    pi_model_needs_no_think_suffix(&review_model, &base_url)
 }
 
 fn adapter_review_payload(
@@ -3376,6 +3393,26 @@ mod tests {
         assert!(prompt.contains("\"status\":\"approved|changes_requested|blocked|failed\""));
         assert!(prompt.contains("Do not create commits"));
         assert!(prompt.contains("pull requests"));
+    }
+
+    #[test]
+    fn live_review_prompt_adds_no_think_for_local_qwen_review_model() {
+        let environment = std::collections::BTreeMap::from([
+            (
+                "HEPA_PI_MODEL".to_string(),
+                "deepseek/deepseek-chat".to_string(),
+            ),
+            (
+                "HEPA_PI_REVIEW_MODEL".to_string(),
+                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+            ),
+            (
+                "HEPA_PI_BASE_URL".to_string(),
+                "http://127.0.0.1:52415/v1".to_string(),
+            ),
+        ]);
+
+        assert!(pi_review_model_needs_no_think_suffix(&environment));
     }
 
     #[test]
