@@ -286,7 +286,7 @@ mod tests {
 
         assert!(pi.command.contains("--provider ollama"));
         assert!(pi.command.contains("--model qwen2.5-coder"));
-        assert_eq!(pi.required_env, Vec::<String>::new());
+        assert_eq!(pi.required_env, vec!["HEPA_PI_BASE_URL".to_string()]);
         assert_eq!(pi.cost_class, HepaAdapterCostClass::Local);
 
         remove_test_dir(root);

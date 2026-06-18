@@ -972,6 +972,7 @@ pub fn fleet_command(args: &[String]) -> Result<String, String> {
 #[derive(Debug, Clone)]
 struct LiveMatrixJob {
     label: String,
+    run_nonce: String,
     repo_path: PathBuf,
     task_text: String,
 }
@@ -1024,10 +1025,11 @@ fn fleet_live_matrix(control_root: &Path, mut flags: Vec<String>) -> Result<Stri
     let max_concurrency = explicit_max_concurrency
         .unwrap_or_else(|| adapter_max_concurrency(&agent).unwrap_or(1).max(1))
         .max(1);
+    let run_nonce = cli_timestamp();
     let jobs = raw_jobs
         .iter()
         .enumerate()
-        .map(|(index, raw)| parse_live_matrix_job(index + 1, raw))
+        .map(|(index, raw)| parse_live_matrix_job(index + 1, &run_nonce, raw))
         .collect::<Result<Vec<_>, _>>()?;
     let started = std::time::Instant::now();
     let mut summaries = Vec::new();
@@ -1092,7 +1094,11 @@ fn adapter_max_concurrency(agent: &str) -> Option<usize> {
         .map(|spec| spec.max_concurrency as usize)
 }
 
-fn parse_live_matrix_job(index: usize, raw: &str) -> Result<LiveMatrixJob, String> {
+fn parse_live_matrix_job(
+    index: usize,
+    run_nonce: &str,
+    raw: &str,
+) -> Result<LiveMatrixJob, String> {
     let (repo, task) = raw
         .split_once("::")
         .ok_or_else(|| "--job must use <repo>::<task>".to_string())?;
@@ -1101,6 +1107,7 @@ fn parse_live_matrix_job(index: usize, raw: &str) -> Result<LiveMatrixJob, Strin
     }
     Ok(LiveMatrixJob {
         label: format!("job-{index}"),
+        run_nonce: run_nonce.to_string(),
         repo_path: PathBuf::from(repo),
         task_text: task.to_string(),
     })
@@ -1113,9 +1120,9 @@ fn run_live_matrix_job(job: LiveMatrixJob, agent: &str) -> LiveMatrixJobSummary 
         worktree_root: job.repo_path.join(".hepa/worktrees"),
         archive_root: job.repo_path.join(".hepa/archive"),
         repo_path: job.repo_path.clone(),
-        run_id: "run-fleet-live-matrix".to_string(),
+        run_id: format!("run-fleet-live-matrix-{}", job.run_nonce),
         task_id: format!("task-{}", job.label),
-        lane_id: format!("lane-{}", job.label),
+        lane_id: format!("lane-{}-{}", job.label, job.run_nonce),
         task_text: job.task_text,
         timing: true,
     };

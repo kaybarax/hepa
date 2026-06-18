@@ -60,7 +60,7 @@ use serde::Serialize;
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Mutex, MutexGuard, OnceLock, TryLockError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -1505,8 +1505,10 @@ fn live_worker_prompt_for_adapter(
     if adapter_id == "pi" {
         prompt.push_str(pi_tool_path_rules());
     }
-    if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
+    if adapter_id == "pi" && pi_model_is_local(&config.pi.model, &config.pi.base_url) {
         prompt.push_str(pi_local_provider_bounded_task_rules());
+    }
+    if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
         prompt.push_str(
             "\nAdapter-local model note: answer directly and do not emit hidden reasoning. /no_think\n",
         );
@@ -1525,8 +1527,13 @@ fn live_repair_worker_prompt_for_adapter(
     if adapter_id == "pi" {
         prompt.push_str(pi_tool_path_rules());
     }
-    if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
+    if adapter_id == "pi" && pi_model_is_local(&config.pi.model, &config.pi.base_url) {
         prompt.push_str(pi_local_provider_bounded_task_rules());
+        prompt.push_str(
+            "\nLocal-provider repair override: do not rerun the failing validation commands yourself; make the minimal repair and let HEPA's manager rerun validation.\n",
+        );
+    }
+    if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
         prompt.push_str(
             "\nAdapter-local model note: answer directly and do not emit hidden reasoning. /no_think\n",
         );
@@ -1539,19 +1546,23 @@ fn pi_tool_path_rules() -> &'static str {
 }
 
 fn pi_local_provider_bounded_task_rules() -> &'static str {
-    "\nLocal-provider bounded task rules:\n- Keep the first attempt small and direct: inspect only the files needed for the task, edit the smallest existing file set that satisfies it, then stop.\n- Do not create new styling, helper, config, or test-support files unless the task explicitly requires them or no existing file can satisfy the acceptance criteria.\n- If the task names validation commands, run those commands once after edits; do not keep exploring after validation.\n- If you cannot find the correct file after a few targeted reads/finds, report the blocker instead of looping.\n"
+    "\nLocal-provider bounded task rules:\n- Keep the first attempt small and direct: inspect only the files needed for the task, edit the smallest existing file set that satisfies it, then stop.\n- Prefer grep/find and targeted reads over reading large test, lockfile, bundle, or generated files into context.\n- Do not create new styling, helper, config, package manager, lockfile, or test-support files unless the task explicitly requires them or no existing file can satisfy the acceptance criteria.\n- Do not run dependency installs or package-manager commands that can rewrite lockfiles.\n- Do not run validation commands yourself; HEPA's manager owns validation after your edit and will run the task's validation commands.\n- If you cannot find the correct file after a few targeted reads/finds, report the blocker instead of looping.\n"
 }
 
 fn pi_model_needs_no_think_suffix(model: &str, base_url: &Option<String>) -> bool {
     let model = model.to_ascii_lowercase();
     let is_qwen = model.contains("qwen");
-    let is_local = model.starts_with("local/")
+    is_qwen && pi_model_is_local(&model, base_url)
+}
+
+fn pi_model_is_local(model: &str, base_url: &Option<String>) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("local/")
         || model.starts_with("ollama/")
-        || model.starts_with("lmstudio/")
+        || model.starts_with("llama-cpp/")
         || model.starts_with("vllm/")
         || model.starts_with("mlx-community/")
-        || base_url.as_deref().is_some_and(is_loopback_url);
-    is_qwen && is_local
+        || base_url.as_deref().is_some_and(is_loopback_url)
 }
 
 fn is_loopback_url(value: &str) -> bool {
@@ -1611,6 +1622,9 @@ fn live_validation_commands(task_text: &str) -> Vec<String> {
     for command in [
         "pnpm install --frozen-lockfile --offline",
         "pnpm format:check",
+        "yarn install --frozen-lockfile",
+        "yarn test:e2e",
+        "yarn build",
         "npx vitest run login-form.test.tsx",
         "git diff --check",
     ] {
@@ -1619,6 +1633,15 @@ fn live_validation_commands(task_text: &str) -> Vec<String> {
         }
     }
     if !commands.is_empty() {
+        if commands
+            .iter()
+            .any(|command| command == "yarn test:e2e" || command == "yarn build")
+            && !commands
+                .iter()
+                .any(|command| command == "yarn install --frozen-lockfile")
+        {
+            commands.insert(0, "yarn install --frozen-lockfile".to_string());
+        }
         commands.dedup();
         return commands;
     }
@@ -1809,6 +1832,9 @@ fn run_safe_validation_command(
     command: &str,
 ) -> Result<(i32, String, String), String> {
     let argv = match command {
+        "yarn install --frozen-lockfile" => vec!["yarn", "install", "--frozen-lockfile"],
+        "yarn test:e2e" => vec!["yarn", "test:e2e"],
+        "yarn build" => vec!["yarn", "build"],
         "npx vitest run login-form.test.tsx" => vec!["npx", "vitest", "run", "login-form.test.tsx"],
         "pnpm install --frozen-lockfile --offline" => {
             vec!["pnpm", "install", "--frozen-lockfile", "--offline"]
@@ -1817,16 +1843,61 @@ fn run_safe_validation_command(
         "git diff --check" => vec!["git", "diff", "--check"],
         _ => return Err(format!("unsupported live validation command: {command}")),
     };
-    let output = Command::new(argv[0])
+    let timeout_ms = live_validation_timeout_ms();
+    let started = Instant::now();
+    let mut child = Command::new(argv[0])
         .args(&argv[1..])
         .current_dir(worktree)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| error.to_string())?;
-    Ok((
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    ))
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .map_err(|error| error.to_string())?;
+            return Ok((
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).to_string(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if elapsed_ms >= timeout_ms {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .map_err(|error| error.to_string())?;
+            let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!(
+                "HEPA validation timeout: `{command}` exceeded {timeout_ms}ms and was terminated."
+            ));
+            return Ok((
+                -1,
+                String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr,
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn live_validation_timeout_ms() -> u64 {
+    const DEFAULT_LIVE_VALIDATION_TIMEOUT_MS: u64 = 300_000;
+    const MAX_LIVE_VALIDATION_TIMEOUT_MS: u64 = 900_000;
+    live_budget_ms(
+        "HEPA_LIVE_VALIDATION_TIMEOUT_MS",
+        DEFAULT_LIVE_VALIDATION_TIMEOUT_MS,
+        MAX_LIVE_VALIDATION_TIMEOUT_MS,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2027,7 +2098,7 @@ fn pi_worker_model_needs_local_permit(
         .cloned()
         .unwrap_or_default();
     let base_url = environment.get("HEPA_PI_BASE_URL").cloned();
-    pi_model_needs_no_think_suffix(&worker_model, &base_url)
+    pi_model_is_local(&worker_model, &base_url)
 }
 
 fn local_pi_generation_concurrency_permit(
@@ -3596,11 +3667,34 @@ mod tests {
         assert!(prompt.contains("read or edit `src/app/file.tsx`"));
         assert!(prompt.contains("Local-provider bounded task rules"));
         assert!(prompt.contains("edit the smallest existing file set"));
+        assert!(prompt.contains("Do not run validation commands yourself"));
         assert!(prompt.contains("/no_think"));
     }
 
     #[test]
-    fn live_worker_prompt_does_not_add_no_think_for_cloud_or_non_pi() {
+    fn live_worker_prompt_adds_bounded_rules_without_no_think_for_local_llama_cpp_pi() {
+        let config = hepa_core::config::HepaConfig::load(
+            None,
+            &std::collections::BTreeMap::new(),
+            HepaConfigOverrides {
+                pi_model: Some("llama-cpp/devstral-small-24b".to_string()),
+                pi_base_url: Some(Some("http://127.0.0.1:8080/v1".to_string())),
+                ..HepaConfigOverrides::default()
+            },
+        )
+        .expect("config should load");
+
+        let prompt = live_worker_prompt_for_adapter("Update README.md", "pi", &config);
+
+        assert!(prompt.contains("Pi tool path rules"));
+        assert!(prompt.contains("Local-provider bounded task rules"));
+        assert!(prompt.contains("targeted reads"));
+        assert!(prompt.contains("Do not run validation commands yourself"));
+        assert!(!prompt.contains("/no_think"));
+    }
+
+    #[test]
+    fn live_worker_prompt_does_not_add_local_rules_for_cloud_or_non_pi() {
         let cloud_config = hepa_core::config::HepaConfig::load(
             None,
             &std::collections::BTreeMap::new(),
@@ -3645,6 +3739,28 @@ mod tests {
             !live_worker_prompt_for_adapter("Update README.md", "custom", &local_config)
                 .contains("Local-provider bounded task rules")
         );
+    }
+
+    #[test]
+    fn pi_local_detection_covers_llama_cpp_without_no_think() {
+        let base_url = Some("http://127.0.0.1:8080/v1".to_string());
+
+        assert!(pi_model_is_local("llama-cpp/devstral-small-24b", &None));
+        assert!(pi_model_is_local("deepseek/deepseek-chat", &base_url));
+        assert!(pi_worker_model_needs_local_permit(
+            &std::collections::BTreeMap::from([(
+                "HEPA_PI_MODEL".to_string(),
+                "llama-cpp/devstral-small-24b".to_string(),
+            )])
+        ));
+        assert!(!pi_model_needs_no_think_suffix(
+            "llama-cpp/devstral-small-24b",
+            &base_url
+        ));
+        assert!(pi_model_needs_no_think_suffix(
+            "local/mlx-community/Qwen3-30B-A3B-4bit",
+            &base_url
+        ));
     }
 
     #[test]
@@ -3698,6 +3814,32 @@ mod tests {
             vec![
                 "pnpm install --frozen-lockfile --offline",
                 "pnpm format:check"
+            ]
+        );
+    }
+
+    #[test]
+    fn live_task_spec_derives_yarn_app_validation_commands() {
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Add a status badge. Validation commands: yarn test:e2e; yarn build."
+                .to_string(),
+            timing: true,
+        };
+        let task_spec = live_task_spec(&config);
+
+        assert_eq!(
+            task_spec.validation_commands,
+            vec![
+                "yarn install --frozen-lockfile",
+                "yarn test:e2e",
+                "yarn build"
             ]
         );
     }

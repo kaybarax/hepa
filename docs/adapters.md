@@ -87,6 +87,15 @@ export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:52415/v1
 ```
 
+llama.cpp local:
+
+```bash
+export HEPA_DEFAULT_ADAPTER=pi
+export HEPA_PI_MODEL=llama-cpp/<model-id>
+export HEPA_PI_PROVIDER_KEY_ENV=
+export HEPA_PI_BASE_URL=http://127.0.0.1:8080/v1
+```
+
 Ollama-compatible local:
 
 ```bash
@@ -97,9 +106,15 @@ export HEPA_PI_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
 Cost class is derived from the model/base URL/key surface: exo/MLX through the
-generic `local/...` provider, Ollama/loopback/no-key routes are local, while
-remote provider routes with keys are paid-cloud. The existing `local-only`
-routing policy and paid-lane caps enforce the result.
+generic `local/...` provider, llama.cpp/Ollama/loopback/no-key routes are
+local, while remote provider routes with keys are paid-cloud. The existing
+`local-only` routing policy and paid-lane caps enforce the result.
+
+Hybrid Pi runs can use a local worker model and a cloud reviewer model by
+setting `HEPA_PI_MODEL` and `HEPA_PI_REVIEW_MODEL` separately. HEPA filters Pi
+provider credentials by role: a local worker process does not receive a
+reviewer-only cloud key, while the reviewer receives the key required by its
+configured provider.
 
 Pi output is newline-delimited JSON events. HEPA parses `agent_end` for the final
 assistant message and tool activity; changed files are derived from `git status`

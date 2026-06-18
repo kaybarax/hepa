@@ -69,6 +69,25 @@ Fixed-local-serving rerun with the supplied exo + Apple MLX Qwen endpoint
 | Pi + local Qwen worker/reviewer via exo + Apple MLX | 2 | 2 | 1 succeeded / 1 blocked | 210.23 s | 198.7 MiB | 10.6 MiB | docs PR opened, then closed/cleaned |
 | Pi + local Qwen worker via exo + Apple MLX / DeepSeek reviewer | 2 | 2 | 1 succeeded / 1 blocked | 212.67 s | 191.5 MiB | 9.9 MiB | docs PR opened, then closed/cleaned |
 
+Replacement-local-model rerun with Devstral Small 2 24B Q4_K_M served by
+llama.cpp (`HEPA_PI_MODEL=llama-cpp/<DEVSTRAL_24B_GGUF>`,
+`HEPA_PI_BASE_URL=http://127.0.0.1:8080/v1`, local model id redacted):
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | External model RSS | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| Pi + Devstral via llama.cpp, ctx4096 | 2 | 2 | 1 succeeded / 1 blocked | 89.82 s | 198.0 MiB | 8.6 MiB | ~20.6 GiB peak observed | docs PR opened, then closed/cleaned |
+| Pi + Devstral via llama.cpp, ctx8192 | 2 | 2 | 1 succeeded / 1 blocked | 137.70 s | 202.5 MiB | 10.3 MiB | ~24.8 GiB peak observed | docs PR opened, then closed/cleaned |
+| Pi + Devstral via llama.cpp, ctx16384 | 2 | 2 | 1 succeeded / 1 blocked | 300.19 s | 650.0 MiB | 29.9 MiB | ~20.1 GiB peak observed | docs PR opened, then closed/cleaned |
+
+Final Devstral/llama.cpp reruns after local-provider hardening, manager-owned
+Yarn validation, Pi role-scoped credential filtering, and unique live-matrix
+lane IDs:
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | External model RSS | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| Pi + Devstral worker/reviewer via llama.cpp, ctx16384 | 2 | 2 | 2 succeeded / 0 failed | 207.11 s | 462.1 MiB | 19.6 MiB | ~18.6 GiB stable observed | PRs opened, then closed/cleaned |
+| Pi + Devstral worker via llama.cpp, ctx16384 / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 175.48 s | 461.8 MiB | 19.5 MiB | ~17.4-20.0 GiB stable observed | PRs opened, then closed/cleaned |
+
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
 operator waits while HEPA schedules, executes, validates, reviews, stages, opens
@@ -109,25 +128,33 @@ Interpretation:
   preserved stdout/stderr/attempt/final-report evidence, emitted a fleet
   summary, skipped validation for the blocked lane, closed validation PRs from
   the successful lane, and cleaned validation worktrees.
+- The first Devstral/llama.cpp replacement attempts proved the model server was
+  memory-stable, but exposed HEPA hardening gaps: local workers could spend
+  context on validation, app validation lacked a manager-owned dependency
+  install preflight, hybrid Pi workers could receive reviewer-only cloud
+  credentials, and live-matrix reruns reused remote branch names. The final
+  reruns cleared those gaps. Pure-local Devstral completed the app-starter and
+  docs lanes in 207.11 s, with manager-owned `yarn install --frozen-lockfile`,
+  `yarn test:e2e`, `yarn build`, and `git diff --check` all passing. Hybrid
+  Devstral-worker/DeepSeek-reviewer completed the same lanes in 175.48 s with
+  role-scoped credential filtering and unique lane branches. Validation PRs were
+  opened only by the manager, then closed and cleaned as validation evidence.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.
 - Max RSS and peak footprint are measured for the HEPA manager process. External
-  model-serving memory and compute for exo/MLX live outside that process and
-  should be measured separately when sizing a local deployment.
+  model-serving memory and compute for exo/MLX or llama.cpp live outside that
+  process and should be measured separately when sizing a local deployment.
 - Follow-up hardening now sends Pi prompts through stdin, persists per-attempt
   stdout/stderr logs for live adapters, retains partial stdout/stderr on monitor
   stops, clamps live Pi monitor budgets to the small-task release target, bounds
-  local Pi generation-permit waits, and terminalizes worker/reviewer adapter
-  errors with blocked final reports and cleanup. A short local-provider
-  hardening smoke run against `<VALIDATION_REPO_C>` intentionally used the weak
-  exo/MLX Qwen route and exited in 30.12 s with status `blocked`, a fleet
-  summary, `attempt.json`, `stdout.log`, `stderr.log`, `final-report.json`, and
-  validation marked skipped because the worker failed before validation. The
-  follow-up fixed-local-serving rerun confirms deterministic terminal blocking
-  and cleanup at fleet scale, but the local and hybrid routes remain release
-  blockers until the local worker leg completes the app-starter validation lane
-  inside the target.
+  local Pi generation-permit waits, terminalizes worker/reviewer adapter errors
+  with blocked final reports and cleanup, keeps local-provider workers out of
+  validation command loops, runs manager-owned Yarn validation with bounded
+  timeouts, scopes Pi provider credentials by role, and gives live-matrix reruns
+  unique lane/branch IDs. Weak local providers still fail deterministically with
+  evidence, while the tested Devstral/llama.cpp local and hybrid routes now pass
+  the app-starter and docs validation lanes.
 
 These numbers are release evidence for the tested validation tasks and
 environment. Larger changes, slow dependency installs, long test suites, CI

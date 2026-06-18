@@ -90,7 +90,7 @@ impl HepaOneshotAdapterExecutor {
             write_prompt_file(invocation)?;
         }
 
-        let filtered_env = filtered_environment(invocation);
+        let filtered_env = filtered_environment(invocation, &command);
         let mut child = Command::new(program);
         child.args(&args).current_dir(&workdir).env_clear().envs(
             filtered_env
@@ -411,7 +411,10 @@ fn rendered_workdir(
         .map_err(|error| HepaAdapterExecutionError::new("workdir", error.to_string()))
 }
 
-fn filtered_environment(invocation: &HepaOneshotAdapterInvocation) -> BTreeMap<String, String> {
+fn filtered_environment(
+    invocation: &HepaOneshotAdapterInvocation,
+    command: &str,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_string(), path);
@@ -421,12 +424,12 @@ fn filtered_environment(invocation: &HepaOneshotAdapterInvocation) -> BTreeMap<S
         "HEPA_ADAPTER_ROLE".to_string(),
         role_name(&invocation.role).to_string(),
     );
-    for key in &invocation.spec.required_env {
+    for key in role_required_env(invocation, command) {
         if is_manager_only_env_key(key) {
             continue;
         }
         if let Some(value) = invocation.environment.get(key) {
-            env.insert(key.clone(), value.clone());
+            env.insert(key.to_string(), value.clone());
         }
     }
     for (key, value) in &invocation.environment {
@@ -435,6 +438,57 @@ fn filtered_environment(invocation: &HepaOneshotAdapterInvocation) -> BTreeMap<S
         }
     }
     env
+}
+
+fn role_required_env<'a>(
+    invocation: &'a HepaOneshotAdapterInvocation,
+    command: &str,
+) -> Vec<&'a str> {
+    if invocation.spec.id != crate::pi::PI_ADAPTER_ID {
+        return invocation
+            .spec
+            .required_env
+            .iter()
+            .map(String::as_str)
+            .collect();
+    }
+    let Some(provider) = pi_provider_from_command(command) else {
+        return invocation
+            .spec
+            .required_env
+            .iter()
+            .map(String::as_str)
+            .collect();
+    };
+    invocation
+        .spec
+        .required_env
+        .iter()
+        .filter_map(|key| {
+            if key == "HEPA_PI_BASE_URL" {
+                return pi_provider_uses_base_url(&provider).then_some(key.as_str());
+            }
+            crate::pi::env_key_for_model(&format!("{provider}/model"))
+                .is_some_and(|provider_key| provider_key == key)
+                .then_some(key.as_str())
+        })
+        .collect()
+}
+
+fn pi_provider_from_command(command: &str) -> Option<String> {
+    let argv = split_command_line(command).ok()?;
+    argv.windows(2).find_map(|parts| {
+        (parts.first().map(String::as_str) == Some("--provider"))
+            .then(|| parts.get(1).cloned())
+            .flatten()
+    })
+}
+
+fn pi_provider_uses_base_url(provider: &str) -> bool {
+    matches!(
+        provider,
+        "local" | "ollama" | "llama-cpp" | "vllm" | "mlx-community"
+    )
 }
 
 fn is_manager_only_env_key(key: &str) -> bool {
@@ -753,6 +807,90 @@ env | sort > "$2"
 
             remove_test_dir(root);
         }
+    }
+
+    #[test]
+    fn pi_hybrid_worker_does_not_receive_reviewer_provider_key() {
+        let root = unique_test_dir("pi-hybrid-env");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("fake-pi");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--out" ]; then
+    shift
+    out="$1"
+  fi
+  shift
+done
+env | sort > "$out"
+"#,
+        );
+        let worker_output = artifact_dir.join("worker-env.txt");
+        let spec = adapter_spec(
+            crate::pi::PI_ADAPTER_ID,
+            vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            format!(
+                "{} --provider llama-cpp --model devstral --out {{output_file}}",
+                script.display()
+            ),
+            Some(format!(
+                "{} --provider deepseek --model deepseek-chat --out {{review_output_file}}",
+                script.display()
+            )),
+            vec!["DEEPSEEK_API_KEY".to_string()],
+        );
+        let environment = BTreeMap::from([(
+            "DEEPSEEK_API_KEY".to_string(),
+            "reviewer-only-secret".to_string(),
+        )]);
+        let context = template_context(&worktree, &artifact_dir, &worker_output);
+        let review_output = PathBuf::from(&context.review_output_file);
+
+        let worker = HepaOneshotAdapterExecutor::new()
+            .run(&HepaOneshotAdapterInvocation {
+                spec: spec.clone(),
+                role: HepaAdapterRole::Worker,
+                context: context.clone(),
+                prompt: "worker prompt".to_string(),
+                environment: environment.clone(),
+                monitor_policy: HepaMonitorPolicy::default(),
+            })
+            .expect("worker should run");
+        let reviewer = HepaOneshotAdapterExecutor::new()
+            .run(&HepaOneshotAdapterInvocation {
+                spec,
+                role: HepaAdapterRole::Reviewer,
+                context,
+                prompt: "review prompt".to_string(),
+                environment,
+                monitor_policy: HepaMonitorPolicy::default(),
+            })
+            .expect("reviewer should run");
+        let worker_env = fs::read_to_string(worker_output).expect("worker env");
+        let reviewer_env = fs::read_to_string(review_output).expect("reviewer env");
+
+        assert_eq!(worker.exit_code, Some(0));
+        assert_eq!(reviewer.exit_code, Some(0));
+        assert!(!worker_env.contains("DEEPSEEK_API_KEY"));
+        assert!(
+            !worker
+                .allowed_env_keys
+                .contains(&"DEEPSEEK_API_KEY".to_string())
+        );
+        assert!(reviewer_env.contains("DEEPSEEK_API_KEY=reviewer-only-secret"));
+        assert!(
+            reviewer
+                .allowed_env_keys
+                .contains(&"DEEPSEEK_API_KEY".to_string())
+        );
+
+        remove_test_dir(root);
     }
 
     #[test]

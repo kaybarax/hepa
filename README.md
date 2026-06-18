@@ -4,7 +4,7 @@
 engineering automation system: Hermes coordinates the fleet, and the **Pi Coding
 Agent** ([pi.dev](https://pi.dev), MIT) is the built-in default harness that does
 the actual coding — so cloud models (e.g. DeepSeek) and local models (e.g. via
-exo + Apple MLX, Ollama, LM Studio, or vLLM) work out of the box without wiring
+exo + Apple MLX, llama.cpp, Ollama, or vLLM) work out of the box without wiring
 your own CLI.
 
 HEPA stays **agent-agnostic**: Pi is the default and namesake, **not** a hard
@@ -95,7 +95,7 @@ export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:52415/v1
 ```
 
-Ollama, LM Studio, and vLLM-style loopback routes are also supported. Local Pi
+llama.cpp, Ollama, and vLLM-style loopback routes are also supported. Local Pi
 routes derive `cost_class=local`, so they satisfy `local-only` routing policy.
 
 Fleet commands accept `--control-root <path>` to target an isolated control
@@ -112,7 +112,7 @@ changing authoritative state. See [docs/hermes-kanban.md](docs/hermes-kanban.md)
 
 The **Pi adapter** is the batteries-included default harness: `hepa adapter
 install pi` installs it and you route it to any model — DeepSeek and other
-clouds directly, or local models via exo + Apple MLX, Ollama, LM Studio, or
+clouds directly, or local models via exo + Apple MLX, llama.cpp, Ollama, or
 vLLM. Because all execution and review route through the adapter contract, you
 can use Pi, Claude Code, Codex, custom, or local adapters interchangeably — no
 feature hard-requires a specific vendor CLI. Built-in adapters, the Pi setup,
