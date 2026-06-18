@@ -60,6 +60,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, MutexGuard, OnceLock},
     time::Instant,
 };
 
@@ -303,6 +304,9 @@ pub fn run_live_task(
         .clone();
     let mut environment = std::collections::BTreeMap::new();
     for key in [
+        "HEPA_PI_MODEL",
+        "HEPA_PI_REVIEW_MODEL",
+        "HEPA_PI_BASE_URL",
         "PI_CODING_AGENT_DIR",
         "PI_CODING_AGENT_SESSION_DIR",
         "PI_PACKAGE_DIR",
@@ -1656,6 +1660,7 @@ fn live_adapter_review(
         environment: environment.clone(),
         monitor_policy: live_monitor_policy(),
     };
+    let _local_review_permit = local_pi_reviewer_concurrency_permit(adapter_id, environment);
     let result = HepaOneshotAdapterExecutor::new()
         .run(&invocation)
         .map_err(|error| error.to_string())?;
@@ -1748,6 +1753,22 @@ fn pi_review_model_needs_no_think_suffix(
         .unwrap_or_default();
     let base_url = environment.get("HEPA_PI_BASE_URL").cloned();
     pi_model_needs_no_think_suffix(&review_model, &base_url)
+}
+
+fn local_pi_reviewer_concurrency_permit(
+    adapter_id: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Option<MutexGuard<'static, ()>> {
+    if adapter_id != "pi" || !pi_review_model_needs_no_think_suffix(environment) {
+        return None;
+    }
+    static LOCAL_PI_REVIEWER_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    Some(
+        LOCAL_PI_REVIEWER_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
 }
 
 fn adapter_review_payload(
@@ -3413,6 +3434,30 @@ mod tests {
         ]);
 
         assert!(pi_review_model_needs_no_think_suffix(&environment));
+    }
+
+    #[test]
+    fn local_pi_reviewer_permit_only_applies_to_local_review_models() {
+        let local_environment = std::collections::BTreeMap::from([
+            (
+                "HEPA_PI_REVIEW_MODEL".to_string(),
+                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+            ),
+            (
+                "HEPA_PI_BASE_URL".to_string(),
+                "http://127.0.0.1:52415/v1".to_string(),
+            ),
+        ]);
+        let cloud_environment = std::collections::BTreeMap::from([(
+            "HEPA_PI_REVIEW_MODEL".to_string(),
+            "deepseek/deepseek-chat".to_string(),
+        )]);
+
+        let permit = local_pi_reviewer_concurrency_permit("pi", &local_environment);
+        assert!(permit.is_some());
+        drop(permit);
+        assert!(local_pi_reviewer_concurrency_permit("pi", &cloud_environment).is_none());
+        assert!(local_pi_reviewer_concurrency_permit("custom", &local_environment).is_none());
     }
 
     #[test]
