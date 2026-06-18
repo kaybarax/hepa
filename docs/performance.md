@@ -61,6 +61,14 @@ stdout/stderr capture, partial-output retention, and live Pi monitor clamping:
 | Pi + local Qwen worker/reviewer via exo + Apple MLX | 2 | 2 | interrupted after one zero-output local response and one non-terminal lane | 1191.03 s | 171.2 MiB | 1.9 MiB | no PRs opened; worktrees cleaned |
 | Pi + local Qwen worker via exo + Apple MLX / DeepSeek reviewer | 2 | 2 | interrupted after local worker stage failed to produce terminal attempt results | 619.70 s | 173.0 MiB | 1.8 MiB | no PRs opened; worktrees cleaned |
 
+Fixed-local-serving rerun with the supplied exo + Apple MLX Qwen endpoint
+(`HEPA_PI_BASE_URL=<LOCAL_LOOPBACK_OPENAI_V1>`, local model path redacted):
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| Pi + local Qwen worker/reviewer via exo + Apple MLX | 2 | 2 | 1 succeeded / 1 blocked | 210.23 s | 198.7 MiB | 10.6 MiB | docs PR opened, then closed/cleaned |
+| Pi + local Qwen worker via exo + Apple MLX / DeepSeek reviewer | 2 | 2 | 1 succeeded / 1 blocked | 212.67 s | 191.5 MiB | 9.9 MiB | docs PR opened, then closed/cleaned |
+
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
 operator waits while HEPA schedules, executes, validates, reviews, stages, opens
@@ -89,6 +97,18 @@ Interpretation:
   a terminal attempt record before operator interruption. The hybrid run did
   not reach meaningful DeepSeek review because the local worker leg failed
   first.
+- The fixed-local-serving rerun proved HEPA's new hardening behavior under the
+  same failure class. The docs-only lane completed in both pure-local and
+  hybrid configs, opened validation PRs, and those PRs were closed and cleaned.
+  The app-starter lane was terminally marked `blocked` in both configs with
+  `local_provider_empty_or_malformed_response: Pi output parse failure:
+  agent_end missing final assistant message`. The captured stdout shows local
+  Qwen repeatedly found files under `src/` and then tried to read them without
+  the `src/` prefix, hit `ENOENT`, then the stream ended without
+  `finish_reason` and the local server stopped accepting connections. HEPA
+  preserved stdout/stderr/attempt/final-report evidence, emitted a fleet
+  summary, skipped validation for the blocked lane, closed validation PRs from
+  the successful lane, and cleaned validation worktrees.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.
@@ -104,8 +124,10 @@ Interpretation:
   exo/MLX Qwen route and exited in 30.12 s with status `blocked`, a fleet
   summary, `attempt.json`, `stdout.log`, `stderr.log`, `final-report.json`, and
   validation marked skipped because the worker failed before validation. The
-  local and hybrid routes remain release blockers until a Hermes-present rerun
-  completes inside the target after local serving is made sufficient.
+  follow-up fixed-local-serving rerun confirms deterministic terminal blocking
+  and cleanup at fleet scale, but the local and hybrid routes remain release
+  blockers until the local worker leg completes the app-starter validation lane
+  inside the target.
 
 These numbers are release evidence for the tested validation tasks and
 environment. Larger changes, slow dependency installs, long test suites, CI
