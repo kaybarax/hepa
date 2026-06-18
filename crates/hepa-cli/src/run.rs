@@ -61,8 +61,9 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, MutexGuard, OnceLock},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Mutex, MutexGuard, OnceLock, TryLockError},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,7 +338,7 @@ pub fn run_live_task(
     let prompt =
         live_worker_prompt_for_adapter(&sanitized_task_text(config), adapter_id, &live_config);
     let mut repair_timing = None;
-    let mut attempt_outcome = execute_live_worker_attempt(ExecuteLiveAttemptInput {
+    let mut attempt_outcome = match execute_live_worker_attempt(ExecuteLiveAttemptInput {
         config,
         lane_paths: &lane_paths,
         allocation: &allocation,
@@ -349,7 +350,44 @@ pub fn run_live_task(
         prompt: prompt.clone(),
         started_at: "2026-06-16T00:00:02Z",
         completed_at: "2026-06-16T00:00:03Z",
-    })?;
+    }) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            lane.attempt_count = 1;
+            transition_and_record(
+                &lane_paths,
+                &mut lane,
+                3,
+                HepaLaneState::Blocked,
+                "live worker attempt blocked",
+                "2026-06-16T00:00:03Z",
+            )?;
+            return finish_blocked_live_run(FinishBlockedInput {
+                config,
+                task,
+                run_paths: &run_paths,
+                lane_paths: &lane_paths,
+                allocator: &allocator,
+                lane: &mut lane,
+                validation: blocked_worker_validation_summary(&error),
+                review_signals: Vec::new(),
+                arbitration: None,
+                timing: live_timing_record(LiveTimingInput {
+                    config,
+                    adapter_id,
+                    worker_duration_seconds: 0.0,
+                    validation_duration_seconds: 0.0,
+                    review_duration_seconds: 0.0,
+                    reviewer_passes: 0,
+                    terminal_phase: LivePipelinePhase::WorkerBlocked,
+                    repair_timing: None,
+                }),
+                reason: format!(
+                    "Live worker attempt failed before validation/review/staging: {error}"
+                ),
+            });
+        }
+    };
     lane.attempt_count = 1;
     let mut usage_entries = attempt_outcome.usage_entries.clone();
     write_lane_cost_report_if_present(config, &lane_paths, &usage_entries)?;
@@ -576,7 +614,7 @@ pub fn run_live_task(
     )?;
     let review_started = Instant::now();
     let diff_context = collect_live_diff(&allocation.worktree_path)?;
-    let review_outcome = live_review_fanout(LiveReviewInput {
+    let review_outcome = match live_review_fanout(LiveReviewInput {
         config,
         adapter_id,
         spec: &spec,
@@ -586,7 +624,41 @@ pub fn run_live_task(
         changed_files: &attempt_outcome.changed_files,
         validation: &validation,
         diff_context: &diff_context,
-    })?;
+    }) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            transition_and_record(
+                &lane_paths,
+                &mut lane,
+                7,
+                HepaLaneState::Blocked,
+                "live review fanout failed",
+                "2026-06-16T00:00:07Z",
+            )?;
+            return finish_blocked_live_run(FinishBlockedInput {
+                config,
+                task,
+                run_paths: &run_paths,
+                lane_paths: &lane_paths,
+                allocator: &allocator,
+                lane: &mut lane,
+                validation,
+                review_signals: Vec::new(),
+                arbitration: None,
+                timing: live_timing_record(LiveTimingInput {
+                    config,
+                    adapter_id,
+                    worker_duration_seconds: attempt_outcome.duration_seconds,
+                    validation_duration_seconds,
+                    review_duration_seconds: review_started.elapsed().as_secs_f64(),
+                    reviewer_passes: 0,
+                    terminal_phase: LivePipelinePhase::ReviewFailed,
+                    repair_timing,
+                }),
+                reason: format!("Live review fanout failed before staging/PR creation: {error}"),
+            });
+        }
+    };
     let review_duration_seconds = review_started.elapsed().as_secs_f64();
     for signal in &review_outcome.signals {
         write_json(
@@ -976,8 +1048,38 @@ fn execute_live_worker_attempt(
         .map_err(|error| error.to_string())?;
     let cost_class = spec.cost_class.clone();
     let output_capture = spec.output_capture.clone();
-    let _local_generation_permit =
-        local_pi_generation_concurrency_permit(adapter_id, &environment, HepaAdapterRole::Worker);
+    let _local_generation_permit = match local_pi_generation_concurrency_permit(
+        adapter_id,
+        &environment,
+        HepaAdapterRole::Worker,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            let attempt = HepaAttemptReport {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                attempt_id: attempt_id.to_string(),
+                lane_id: config.lane_id.clone(),
+                task_id: config.task_id.clone(),
+                round,
+                role: HepaAgentRole::Worker,
+                adapter_id: adapter_id.to_string(),
+                status: hepa_core::contracts::HepaAttemptStatus::Blocked,
+                commands_run: vec![format!("live adapter invocation: {adapter_id}")],
+                changed_files: collect_changed_files(&allocation.worktree_path)
+                    .unwrap_or_default(),
+                summary: vec![
+                    "Local-provider generation did not acquire its concurrency permit before the bounded wait elapsed."
+                        .to_string(),
+                ],
+                blocked_reason: Some(error.clone()),
+                started_at: started_at.to_string(),
+                completed_at: Some(completed_at.to_string()),
+            };
+            write_live_adapter_stream_logs(&attempt_paths, "", "")?;
+            write_attempt(lane_paths, &attempt)?;
+            return Err(error);
+        }
+    };
     let invocation = HepaOneshotAdapterInvocation {
         spec,
         role: HepaAdapterRole::Worker,
@@ -1039,6 +1141,36 @@ fn execute_live_worker_attempt(
     let duration_seconds = worker_started.elapsed().as_secs_f64();
     write_live_adapter_stream_logs(&attempt_paths, &result.stdout, &result.stderr)?;
     let changed_files = collect_changed_files(&allocation.worktree_path)?;
+    if adapter_id == "pi" {
+        if let Err(error) = parse_pi_json_events(&result.stdout) {
+            let attempt = HepaAttemptReport {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                attempt_id: attempt_id.to_string(),
+                lane_id: config.lane_id.clone(),
+                task_id: config.task_id.clone(),
+                round,
+                role: HepaAgentRole::Worker,
+                adapter_id: adapter_id.to_string(),
+                status: hepa_core::contracts::HepaAttemptStatus::Blocked,
+                commands_run: vec![result.command],
+                changed_files,
+                summary: live_attempt_summary(
+                    &allocation.worktree_path,
+                    &result.stdout,
+                    &result.stderr,
+                ),
+                blocked_reason: Some(format!(
+                    "local_provider_empty_or_malformed_response: {error}"
+                )),
+                started_at: started_at.to_string(),
+                completed_at: Some(completed_at.to_string()),
+            };
+            write_attempt(lane_paths, &attempt)?;
+            return Err(format!(
+                "local_provider_empty_or_malformed_response: {error}"
+            ));
+        }
+    }
     let usage_entries = extract_live_usage_entries(
         adapter_id,
         attempt_id,
@@ -1776,7 +1908,7 @@ fn live_adapter_review(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, 
         input.adapter_id,
         input.environment,
         HepaAdapterRole::Reviewer,
-    );
+    )?;
     let result = HepaOneshotAdapterExecutor::new()
         .run(&invocation)
         .map_err(|error| error.to_string())?;
@@ -1886,24 +2018,55 @@ fn local_pi_generation_concurrency_permit(
     adapter_id: &str,
     environment: &std::collections::BTreeMap<String, String>,
     role: HepaAdapterRole,
-) -> Option<MutexGuard<'static, ()>> {
+) -> Result<Option<MutexGuard<'static, ()>>, String> {
     if adapter_id != "pi" {
-        return None;
+        return Ok(None);
     }
     let needs_permit = match role {
         HepaAdapterRole::Worker => pi_worker_model_needs_local_permit(environment),
         HepaAdapterRole::Reviewer => pi_review_model_needs_no_think_suffix(environment),
     };
     if !needs_permit {
-        return None;
+        return Ok(None);
     }
     static LOCAL_PI_GENERATION_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    Some(
-        LOCAL_PI_GENERATION_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    acquire_local_pi_generation_permit(
+        LOCAL_PI_GENERATION_MUTEX.get_or_init(|| Mutex::new(())),
+        live_local_generation_mutex_wait_ms(),
     )
+    .map(Some)
+}
+
+fn live_local_generation_mutex_wait_ms() -> u64 {
+    const DEFAULT_PI_LOCAL_MUTEX_WAIT_MS: u64 = 60_000;
+    const MAX_PI_LOCAL_MUTEX_WAIT_MS: u64 = 600_000;
+    live_budget_ms(
+        "HEPA_PI_LOCAL_MUTEX_WAIT_MS",
+        DEFAULT_PI_LOCAL_MUTEX_WAIT_MS,
+        MAX_PI_LOCAL_MUTEX_WAIT_MS,
+    )
+}
+
+fn acquire_local_pi_generation_permit(
+    mutex: &'static Mutex<()>,
+    wait_ms: u64,
+) -> Result<MutexGuard<'static, ()>, String> {
+    let started = Instant::now();
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                if elapsed_ms >= wait_ms {
+                    return Err(format!(
+                        "local_provider_concurrency_wait_timeout: waited {elapsed_ms}ms for local Pi generation permit"
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 fn adapter_review_payload(
@@ -2258,6 +2421,7 @@ fn format_arbitration_error(error: hepa_review::arbitration::HepaArbitrationErro
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LivePipelinePhase {
+    WorkerBlocked,
     SafetyBlocked,
     ValidationFailed,
     ReviewFailed,
@@ -2291,7 +2455,11 @@ fn live_timing_record(input: LiveTimingInput<'_>) -> HepaTimingRecord {
     let mut phases = vec![
         HepaTimingPhase {
             name: "live_worker".to_string(),
-            status: HepaPhaseStatus::Completed,
+            status: if terminal_phase == LivePipelinePhase::WorkerBlocked {
+                HepaPhaseStatus::Blocked
+            } else {
+                HepaPhaseStatus::Completed
+            },
             duration_seconds: worker_duration_seconds,
             round: Some(1),
             role: Some(HepaAgentRole::Worker),
@@ -2301,7 +2469,9 @@ fn live_timing_record(input: LiveTimingInput<'_>) -> HepaTimingRecord {
         },
         HepaTimingPhase {
             name: "live_validation".to_string(),
-            status: if terminal_phase == LivePipelinePhase::ValidationFailed
+            status: if terminal_phase == LivePipelinePhase::WorkerBlocked {
+                HepaPhaseStatus::Skipped
+            } else if terminal_phase == LivePipelinePhase::ValidationFailed
                 || repair_timing.is_some()
             {
                 HepaPhaseStatus::Failed
@@ -2358,7 +2528,9 @@ fn live_timing_record(input: LiveTimingInput<'_>) -> HepaTimingRecord {
     }
     if !matches!(
         terminal_phase,
-        LivePipelinePhase::ValidationFailed | LivePipelinePhase::SafetyBlocked
+        LivePipelinePhase::WorkerBlocked
+            | LivePipelinePhase::ValidationFailed
+            | LivePipelinePhase::SafetyBlocked
     ) {
         phases.push(HepaTimingPhase {
             name: "live_review_fanout".to_string(),
@@ -2899,6 +3071,19 @@ fn validation_summary() -> HepaValidationSummary {
     }
 }
 
+fn blocked_worker_validation_summary(reason: &str) -> HepaValidationSummary {
+    HepaValidationSummary {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        status: HepaValidationStatus::Skipped,
+        commands: Vec::new(),
+        no_tests_detected: true,
+        failure_type: Some("live_worker_blocked_before_validation".to_string()),
+        summary: vec![format!(
+            "Validation was not run because the live worker did not produce a usable terminal attempt: {reason}"
+        )],
+    }
+}
+
 fn readiness_result(config: &HepaFakeRunConfig) -> HepaReadinessResult {
     HepaReadinessResult {
         schema_version: CONTRACT_SCHEMA_VERSION,
@@ -3060,6 +3245,10 @@ fn collect_live_diff(worktree: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hepa_adapters::spec::{
+        ADAPTER_SPEC_SCHEMA_VERSION, HepaAdapterCostClass, HepaAdapterMode,
+        HepaAdapterPromptTransport, HepaAdapterSandbox, HepaAdapterSpec,
+    };
     use hepa_kanban::{
         card_mapping::{
             HepaHermesCardMappingInput, HepaHermesCommentKind, HepaHermesFieldValue,
@@ -3068,6 +3257,7 @@ mod tests {
         sync::HepaMemoryHermesCardStore,
     };
     use std::{
+        os::unix::fs::PermissionsExt,
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3151,6 +3341,110 @@ mod tests {
             clamp_live_budget_ms(Some("not-a-number"), 300_000, 600_000),
             300_000
         );
+    }
+
+    #[test]
+    fn local_pi_generation_permit_wait_is_bounded() {
+        let mutex: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+        let held = mutex.lock().expect("hold local generation permit");
+
+        let started = Instant::now();
+        let error =
+            acquire_local_pi_generation_permit(mutex, 25).expect_err("permit wait should time out");
+
+        assert!(error.contains("local_provider_concurrency_wait_timeout"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+        assert!(acquire_local_pi_generation_permit(mutex, 25).is_ok());
+    }
+
+    #[test]
+    fn live_pi_empty_output_writes_blocked_attempt_artifacts() {
+        let root = unique_test_dir("live-pi-empty-output");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let config = HepaFakeRunConfig {
+            repo_path: repo.clone(),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-empty".to_string(),
+            task_id: "task-empty".to_string(),
+            lane_id: "lane-empty".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let layout =
+            HepaArtifactLayout::new(&config.control_root, &config.archive_root).expect("layout");
+        let lane_paths = layout
+            .run(&config.run_id, &config.task_id)
+            .expect("run paths")
+            .lane(&config.lane_id)
+            .expect("lane paths");
+        fs::create_dir_all(&lane_paths.lane_dir).expect("lane dir");
+        let allocator = HepaWorktreeAllocator::new(&config.repo_path, &config.worktree_root);
+        let allocation = allocator
+            .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
+            .expect("allocation");
+        let fake_pi = root.join("pi-empty");
+        write_fake_pi_empty_output(&fake_pi);
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi Coding Agent".to_string(),
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: format!("{} --mode json", fake_pi.display()),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: vec![fake_pi.to_string_lossy().to_string()],
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec!["local-only".to_string()],
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 1,
+            max_concurrency: 1,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        };
+
+        let result = execute_live_worker_attempt(ExecuteLiveAttemptInput {
+            config: &config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            spec,
+            adapter_id: "pi",
+            environment: std::collections::BTreeMap::new(),
+            attempt_id: "attempt-1",
+            round: 1,
+            prompt: "fixture prompt".to_string(),
+            started_at: "2026-06-16T00:00:02Z",
+            completed_at: "2026-06-16T00:00:03Z",
+        });
+        let error = match result {
+            Ok(_) => panic!("empty Pi output must block"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("local_provider_empty_or_malformed_response"));
+        let attempt_dir = lane_paths
+            .attempt("attempt-1")
+            .expect("attempt paths")
+            .attempt_dir;
+        let attempt_json =
+            fs::read_to_string(attempt_dir.join("attempt.json")).expect("attempt report");
+        assert!(attempt_json.contains("\"status\": \"blocked\""));
+        assert!(attempt_json.contains("local_provider_empty_or_malformed_response"));
+        let stdout = fs::read_to_string(attempt_dir.join("stdout.log")).expect("stdout log");
+        assert!(stdout.contains("\"type\":\"agent_end\""));
+        assert!(attempt_dir.join("stderr.log").exists());
+
+        allocator
+            .cleanup_lane(&config.lane_id, "2026-06-16T00:00:09Z")
+            .expect("cleanup");
+        remove_test_dir(root);
     }
 
     #[test]
@@ -3783,21 +4077,24 @@ mod tests {
             "pi",
             &local_environment,
             HepaAdapterRole::Worker,
-        );
+        )
+        .expect("permit decision");
         assert!(permit.is_some());
         drop(permit);
         let permit = local_pi_generation_concurrency_permit(
             "pi",
             &local_environment,
             HepaAdapterRole::Reviewer,
-        );
+        )
+        .expect("permit decision");
         assert!(permit.is_some());
         drop(permit);
         let permit = local_pi_generation_concurrency_permit(
             "pi",
             &hybrid_environment,
             HepaAdapterRole::Worker,
-        );
+        )
+        .expect("permit decision");
         assert!(permit.is_some());
         drop(permit);
         assert!(
@@ -3806,6 +4103,7 @@ mod tests {
                 &hybrid_environment,
                 HepaAdapterRole::Reviewer
             )
+            .expect("permit decision")
             .is_none()
         );
         assert!(
@@ -3814,6 +4112,7 @@ mod tests {
                 &cloud_environment,
                 HepaAdapterRole::Worker
             )
+            .expect("permit decision")
             .is_none()
         );
         assert!(
@@ -3822,6 +4121,7 @@ mod tests {
                 &local_environment,
                 HepaAdapterRole::Worker
             )
+            .expect("permit decision")
             .is_none()
         );
     }
@@ -4132,6 +4432,17 @@ mod tests {
         fs::write(repo.join("README.md"), "fixture\n").expect("fixture write");
         git(repo, ["add", "README.md"]);
         git(repo, ["commit", "-m", "initial"]);
+    }
+
+    fn write_fake_pi_empty_output(path: &Path) {
+        fs::write(
+            path,
+            "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"agent_start\"}' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[]}]}'\n",
+        )
+        .expect("fake pi write");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
     }
 
     fn git<const N: usize>(repo: &Path, args: [&str; N]) {

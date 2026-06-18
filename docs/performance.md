@@ -97,12 +97,15 @@ Interpretation:
   should be measured separately when sizing a local deployment.
 - Follow-up hardening now sends Pi prompts through stdin, persists per-attempt
   stdout/stderr logs for live adapters, retains partial stdout/stderr on monitor
-  stops, and clamps live Pi monitor budgets to the small-task release target.
-  The post-hardening rerun shows this is only partially effective: empty local
-  responses are now diagnosable, but at least one local-provider stall can still
-  outlive the target without a terminal lane artifact. The local and hybrid
-  routes remain release blockers until a Hermes-present rerun completes inside
-  the target or fails terminally with complete per-lane diagnostics.
+  stops, clamps live Pi monitor budgets to the small-task release target, bounds
+  local Pi generation-permit waits, and terminalizes worker/reviewer adapter
+  errors with blocked final reports and cleanup. A short local-provider
+  hardening smoke run against `<VALIDATION_REPO_C>` intentionally used the weak
+  exo/MLX Qwen route and exited in 30.12 s with status `blocked`, a fleet
+  summary, `attempt.json`, `stdout.log`, `stderr.log`, `final-report.json`, and
+  validation marked skipped because the worker failed before validation. The
+  local and hybrid routes remain release blockers until a Hermes-present rerun
+  completes inside the target after local serving is made sufficient.
 
 These numbers are release evidence for the tested validation tasks and
 environment. Larger changes, slow dependency installs, long test suites, CI

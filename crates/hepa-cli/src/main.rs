@@ -1194,8 +1194,13 @@ mod tests {
         ]))
         .expect_err("custom should attempt live adapter execution");
 
-        assert!(error.contains("failed to spawn adapter"));
-        assert!(!repo.join(".hepa/control/runs/run-cli-fake/tasks/task-cli-fake/lanes/lane-cli-fake/final-report.json").exists());
+        assert!(error.contains("status=blocked"));
+        assert!(
+            repo.join(
+                ".hepa/control/runs/run-cli-fake/tasks/task-cli-fake/lanes/lane-cli-fake/final-report.json"
+            )
+            .exists()
+        );
 
         remove_test_dir(root);
     }
