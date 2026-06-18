@@ -1,6 +1,9 @@
 //! CLI handlers for the fleet command groups (project/task/scheduler/fleet),
 //! all backed by the deterministic, temp-root-safe `HepaFleetRegistry`.
 
+use crate::run::{HepaFakeRunConfig, run_live_task};
+use hepa_adapters::registry::HepaAdapterRegistry;
+use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::HepaLaneState;
 use hepa_core::contracts::{
     CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaLane, HepaProject, HepaReadinessResult,
@@ -22,6 +25,7 @@ use hepa_kanban::{
     sync::{HepaKanbanSyncEngine, HepaMemoryHermesCardStore},
 };
 use serde::Serialize;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fs,
@@ -830,10 +834,11 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Dispatch `hepa fleet <status|doctor|report|cleanup|reconcile|dashboard>`.
+/// Dispatch `hepa fleet <status|doctor|report|cleanup|reconcile|dashboard|live-matrix>`.
 pub fn fleet_command(args: &[String]) -> Result<String, String> {
     let (subcommand, rest) = args.split_first().ok_or_else(|| {
-        "usage: hepa fleet <status|doctor|report|cleanup|reconcile|dashboard>".to_string()
+        "usage: hepa fleet <status|doctor|report|cleanup|reconcile|dashboard|live-matrix>"
+            .to_string()
     })?;
     let (control_root, mut flags) = take_control_root(rest)?;
     let registry = HepaFleetRegistry::new(&control_root);
@@ -937,6 +942,7 @@ pub fn fleet_command(args: &[String]) -> Result<String, String> {
             ))
         }
         "stress-run" => fleet_stress_run(&control_root),
+        "live-matrix" => fleet_live_matrix(&control_root, flags),
         "dashboard" => {
             let output = take_option(&mut flags, "--output")?
                 .map(PathBuf::from)
@@ -960,6 +966,180 @@ pub fn fleet_command(args: &[String]) -> Result<String, String> {
             ))
         }
         other => Err(format!("unknown fleet command: {other}")),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveMatrixJob {
+    label: String,
+    repo_path: PathBuf,
+    task_text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveMatrixSummary {
+    schema_version: u32,
+    agent: String,
+    max_concurrency: usize,
+    job_count: usize,
+    succeeded: usize,
+    failed: usize,
+    jobs: Vec<LiveMatrixJobSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveMatrixJobSummary {
+    label: String,
+    repo_ref: String,
+    status: String,
+    run_id: Option<String>,
+    lane_id: Option<String>,
+    pr_url: Option<String>,
+    wall_seconds: f64,
+    error: Option<String>,
+}
+
+fn fleet_live_matrix(control_root: &Path, mut flags: Vec<String>) -> Result<String, String> {
+    let agent = take_option(&mut flags, "--agent")?.unwrap_or_else(|| "pi".to_string());
+    let explicit_max_concurrency = take_option(&mut flags, "--max-concurrency")?
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| "--max-concurrency must be a number".to_string())?;
+    let evidence_dir = take_option(&mut flags, "--evidence-dir")?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| control_root.join("fleet/live-matrix"));
+    let mut raw_jobs = Vec::new();
+    while let Some(job) = take_option(&mut flags, "--job")? {
+        raw_jobs.push(job);
+    }
+    if !flags.is_empty() {
+        return Err(format!(
+            "unknown fleet live-matrix flags: {}",
+            flags.join(" ")
+        ));
+    }
+    if raw_jobs.is_empty() {
+        return Err("fleet live-matrix requires at least one --job <repo>::<task>".to_string());
+    }
+    let max_concurrency = explicit_max_concurrency
+        .unwrap_or_else(|| adapter_max_concurrency(&agent).unwrap_or(1).max(1))
+        .max(1);
+    let jobs = raw_jobs
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| parse_live_matrix_job(index + 1, raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    let started = std::time::Instant::now();
+    let mut summaries = Vec::new();
+    for chunk in jobs.chunks(max_concurrency) {
+        let handles = chunk
+            .iter()
+            .cloned()
+            .map(|job| {
+                let agent = agent.clone();
+                thread::spawn(move || run_live_matrix_job(job, &agent))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            summaries.push(
+                handle
+                    .join()
+                    .map_err(|_| "fleet live-matrix worker panicked".to_string())?,
+            );
+        }
+    }
+    let succeeded = summaries
+        .iter()
+        .filter(|summary| summary.status == "completed")
+        .count();
+    let failed = summaries.len().saturating_sub(succeeded);
+    fs::create_dir_all(&evidence_dir).map_err(|error| error.to_string())?;
+    let summary = LiveMatrixSummary {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        agent: agent.clone(),
+        max_concurrency,
+        job_count: summaries.len(),
+        succeeded,
+        failed,
+        jobs: summaries,
+    };
+    let summary_path = evidence_dir.join(format!("live-matrix-{}-{}.json", agent, cli_timestamp()));
+    let json = serde_json::to_string_pretty(&summary).map_err(|error| error.to_string())?;
+    fs::write(&summary_path, json).map_err(|error| error.to_string())?;
+    let message = format!(
+        "HEPA fleet live-matrix: agent={} jobs={} succeeded={} failed={} max_concurrency={} elapsed={:.3}s summary={}",
+        agent,
+        summary.job_count,
+        summary.succeeded,
+        summary.failed,
+        summary.max_concurrency,
+        started.elapsed().as_secs_f64(),
+        summary_path.display()
+    );
+    if summary.failed == 0 {
+        Ok(message)
+    } else {
+        Err(message)
+    }
+}
+
+fn adapter_max_concurrency(agent: &str) -> Option<usize> {
+    let config =
+        HepaConfig::load_from_env_and_dotenv_file(".env", HepaConfigOverrides::default()).ok()?;
+    let registry = HepaAdapterRegistry::load_from_config(&config).ok()?;
+    registry
+        .get(agent)
+        .map(|spec| spec.max_concurrency as usize)
+}
+
+fn parse_live_matrix_job(index: usize, raw: &str) -> Result<LiveMatrixJob, String> {
+    let (repo, task) = raw
+        .split_once("::")
+        .ok_or_else(|| "--job must use <repo>::<task>".to_string())?;
+    if repo.trim().is_empty() || task.trim().is_empty() {
+        return Err("--job repo and task must not be empty".to_string());
+    }
+    Ok(LiveMatrixJob {
+        label: format!("job-{index}"),
+        repo_path: PathBuf::from(repo),
+        task_text: task.to_string(),
+    })
+}
+
+fn run_live_matrix_job(job: LiveMatrixJob, agent: &str) -> LiveMatrixJobSummary {
+    let started = std::time::Instant::now();
+    let run_config = HepaFakeRunConfig {
+        control_root: job.repo_path.join(".hepa/control"),
+        worktree_root: job.repo_path.join(".hepa/worktrees"),
+        archive_root: job.repo_path.join(".hepa/archive"),
+        repo_path: job.repo_path.clone(),
+        run_id: "run-fleet-live-matrix".to_string(),
+        task_id: format!("task-{}", job.label),
+        lane_id: format!("lane-{}", job.label),
+        task_text: job.task_text,
+        timing: true,
+    };
+    match run_live_task(&run_config, agent) {
+        Ok(result) => LiveMatrixJobSummary {
+            label: job.label,
+            repo_ref: "<validation-repo>".to_string(),
+            status: result.status,
+            run_id: Some(result.run_id),
+            lane_id: Some(result.lane_id),
+            pr_url: result.terminal_report.pr_url,
+            wall_seconds: started.elapsed().as_secs_f64(),
+            error: None,
+        },
+        Err(error) => LiveMatrixJobSummary {
+            label: job.label,
+            repo_ref: "<validation-repo>".to_string(),
+            status: "failed".to_string(),
+            run_id: Some(run_config.run_id),
+            lane_id: Some(run_config.lane_id),
+            pr_url: None,
+            wall_seconds: started.elapsed().as_secs_f64(),
+            error: Some(error),
+        },
     }
 }
 
@@ -1291,6 +1471,52 @@ mod tests {
 
         let cleanup = fleet_command(&s(&["cleanup", "--control-root", &control])).expect("cleanup");
         assert!(cleanup.contains("removed=0"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fleet_live_matrix_requires_jobs_and_writes_failure_summary() {
+        let root = unique_test_dir("live-matrix");
+        let control = root.join("control");
+        let evidence = root.join("evidence");
+        let control_arg = control.to_str().expect("control path is UTF-8");
+        let evidence_arg = evidence.to_str().expect("evidence path is UTF-8");
+
+        let missing_job = fleet_command(&s(&["live-matrix", "--control-root", control_arg]))
+            .expect_err("live matrix requires jobs");
+        assert!(missing_job.contains("requires at least one --job"));
+
+        let missing_repo = root.join("missing-repo");
+        let job = format!(
+            "{}::Update README.md and run git diff --check.",
+            missing_repo.display()
+        );
+        let error = fleet_command(&s(&[
+            "live-matrix",
+            "--control-root",
+            control_arg,
+            "--evidence-dir",
+            evidence_arg,
+            "--agent",
+            "pi",
+            "--max-concurrency",
+            "1",
+            "--job",
+            &job,
+        ]))
+        .expect_err("missing repo should fail the run but write summary");
+
+        assert!(error.contains("failed=1"));
+        let summary_path = std::fs::read_dir(&evidence)
+            .expect("evidence dir exists")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("summary json written");
+        let summary = std::fs::read_to_string(summary_path).expect("summary readable");
+        assert!(summary.contains("\"failed\": 1"));
+        assert!(summary.contains("\"status\": \"failed\""));
 
         std::fs::remove_dir_all(&root).ok();
     }
