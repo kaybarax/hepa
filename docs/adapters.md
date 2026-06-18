@@ -75,7 +75,19 @@ export HEPA_PI_PROVIDER_KEY_ENV=DEEPSEEK_API_KEY
 export DEEPSEEK_API_KEY=...
 ```
 
-Ollama local:
+exo + Apple MLX local:
+
+exo can serve MLX Community models through a local OpenAI-compatible endpoint.
+Use HEPA's generic local provider route and the exo loopback base URL:
+
+```bash
+export HEPA_DEFAULT_ADAPTER=pi
+export HEPA_PI_MODEL=local/mlx-community/Qwen3-30B-A3B-4bit
+export HEPA_PI_PROVIDER_KEY_ENV=
+export HEPA_PI_BASE_URL=http://127.0.0.1:52415/v1
+```
+
+Ollama-compatible local:
 
 ```bash
 export HEPA_DEFAULT_ADAPTER=pi
@@ -84,9 +96,10 @@ export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
-Cost class is derived from the model/base URL/key surface: Ollama/loopback/no-key
-routes are local, while remote provider routes with keys are paid-cloud. The
-existing `local-only` routing policy and paid-lane caps enforce the result.
+Cost class is derived from the model/base URL/key surface: exo/MLX through the
+generic `local/...` provider, Ollama/loopback/no-key routes are local, while
+remote provider routes with keys are paid-cloud. The existing `local-only`
+routing policy and paid-lane caps enforce the result.
 
 Pi output is newline-delimited JSON events. HEPA parses `agent_end` for the final
 assistant message and tool activity; changed files are derived from `git status`

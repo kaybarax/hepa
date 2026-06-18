@@ -25,10 +25,10 @@ Pi is the default one-loop harness. HEPA invokes
 `pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files -p --mode json --model ...`
 once per worker or reviewer attempt, feeds the prompt on stdin, and captures the
 JSON event stream from stdout into the lane artifact. DeepSeek and other cloud
-routes count as paid-cloud lanes; Ollama/loopback/no-key routes count as local
-lanes and can satisfy `local-only` projects. Container count remains zero for
-trusted host-worktree runs and becomes one only when container mode is required,
-such as untrusted projects.
+routes count as paid-cloud lanes; exo + Apple MLX, Ollama, other loopback
+endpoints, and no-key routes count as local lanes and can satisfy `local-only`
+projects. Container count remains zero for trusted host-worktree runs and
+becomes one only when container mode is required, such as untrusted projects.
 
 ## Live matrix evidence
 
@@ -39,8 +39,8 @@ through manager-owned PR creation, review, evidence capture, and cleanup.
 | Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | PR lifecycle |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
 | Pi + DeepSeek worker/reviewer | 3 | 3 | 3 succeeded / 0 failed | 24.43 s | 191.8 MiB | 15.5 MiB | PRs opened, then closed/cleaned |
-| Pi + local Qwen worker/reviewer | 2 | 2 | 2 succeeded / 0 failed | 928.41 s | 177.1 MiB | 3.2 MiB | PRs opened, then closed/cleaned |
-| Pi + local Qwen worker / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 1209.18 s | 191.4 MiB | 7.1 MiB | PRs opened, then closed/cleaned |
+| Pi + local Qwen worker/reviewer via exo + Apple MLX | 2 | 2 | 2 succeeded / 0 failed | 928.41 s | 177.1 MiB | 3.2 MiB | PRs opened, then closed/cleaned |
+| Pi + local Qwen worker via exo + Apple MLX / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 1209.18 s | 191.4 MiB | 7.1 MiB | PRs opened, then closed/cleaned |
 
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
@@ -51,14 +51,15 @@ Interpretation:
 
 - DeepSeek-only completed three parallel validation jobs across the three repo
   shapes in under one minute for the tested workload.
-- Local Qwen required serialized local Pi model generation after earlier
-  timeout/stall evidence, then passed with two active lanes.
+- Local Qwen was served by exo on Apple MLX through HEPA's `local/...`
+  loopback-provider route. It required serialized local Pi model generation
+  after earlier timeout/stall evidence, then passed with two active lanes.
 - The hybrid route proved local-worker/cloud-reviewer operation, but it was
   slower than local-only in this sample because it combined local worker latency
   with cloud review.
-- Local Qwen used the same local-provider class as Ollama / LM Studio / vLLM;
-  literal Ollama runtime coverage is represented by config, routing, and docs
-  tests rather than this live daemon.
+- exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
+  backend, so it exercises the same HEPA local-provider class as other loopback
+  local servers while accurately representing the runtime used in this test.
 
 These numbers are release evidence for the tested validation tasks and
 environment. Larger changes, slow dependency installs, long test suites, CI
