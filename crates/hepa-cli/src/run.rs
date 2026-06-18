@@ -1502,6 +1502,9 @@ fn live_worker_prompt_for_adapter(
     config: &hepa_core::config::HepaConfig,
 ) -> String {
     let mut prompt = live_worker_prompt(task_text);
+    if adapter_id == "pi" {
+        prompt.push_str(pi_tool_path_rules());
+    }
     if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
         prompt.push_str(
             "\nAdapter-local model note: answer directly and do not emit hidden reasoning. /no_think\n",
@@ -1518,12 +1521,19 @@ fn live_repair_worker_prompt_for_adapter(
     let mut prompt = format!(
         "{repair_prompt}\n\nExecution rules:\n- You are already running inside the same lane worktree.\n- Fix only the evidenced failures named above.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Finish by reporting changed files, rerun validation results, and any remaining blockers.\n"
     );
+    if adapter_id == "pi" {
+        prompt.push_str(pi_tool_path_rules());
+    }
     if adapter_id == "pi" && pi_model_needs_no_think_suffix(&config.pi.model, &config.pi.base_url) {
         prompt.push_str(
             "\nAdapter-local model note: answer directly and do not emit hidden reasoning. /no_think\n",
         );
     }
     prompt
+}
+
+fn pi_tool_path_rules() -> &'static str {
+    "\nPi tool path rules:\n- Treat the lane worktree root as the current directory for all read/edit/write calls.\n- If a find call uses a search root such as `./src` and returns `app/file.tsx`, read or edit `src/app/file.tsx`.\n- Prefer find from `.` when practical so returned paths are already worktree-root relative.\n- Before editing a file discovered by find, verify the exact worktree-relative path exists.\n"
 }
 
 fn pi_model_needs_no_think_suffix(model: &str, base_url: &Option<String>) -> bool {
@@ -3576,6 +3586,8 @@ mod tests {
         let prompt = live_worker_prompt_for_adapter("Update README.md", "pi", &config);
 
         assert!(prompt.contains("Update README.md"));
+        assert!(prompt.contains("Pi tool path rules"));
+        assert!(prompt.contains("read or edit `src/app/file.tsx`"));
         assert!(prompt.contains("/no_think"));
     }
 
@@ -3606,8 +3618,16 @@ mod tests {
                 .contains("/no_think")
         );
         assert!(
+            live_worker_prompt_for_adapter("Update README.md", "pi", &cloud_config)
+                .contains("Pi tool path rules")
+        );
+        assert!(
             !live_worker_prompt_for_adapter("Update README.md", "custom", &local_config)
                 .contains("/no_think")
+        );
+        assert!(
+            !live_worker_prompt_for_adapter("Update README.md", "custom", &local_config)
+                .contains("Pi tool path rules")
         );
     }
 
@@ -3860,6 +3880,8 @@ mod tests {
         assert!(prompt.contains("git diff --check"));
         assert!(prompt.contains("Fix only the evidenced failures"));
         assert!(prompt.contains("HEPA owns the Git lifecycle"));
+        assert!(prompt.contains("Pi tool path rules"));
+        assert!(prompt.contains("find call uses a search root"));
         assert!(!prompt.contains("/no_think"));
     }
 
