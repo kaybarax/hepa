@@ -16,8 +16,10 @@ no default containers, and at most two short manager passes on the happy path.
 | Board observability | optional bridge | default Hermes card/dashboard |
 
 Every run records timing telemetry: per-phase durations and counters for agent
-loops, manager passes, worker-profile LLM calls, reviewer passes, install
-events, and container count, plus the active sandbox posture.
+loops, manager passes, worker-profile calls inside the adapter attempt loop,
+reviewer passes, install events, and container count, plus the active sandbox
+posture. Hermes Worker run briefs are pre-run artifacts and should not appear as
+hidden per-attempt wrappers in this counter.
 
 ## Pi runs
 
@@ -180,9 +182,9 @@ hepa timing trends .hepa/archive
 The benchmark harness reads timing artifacts, aggregates medians, and compares
 against the HOCA reference baselines (Phase 10). Structural performance budget
 tests assert the one-loop invariants (zero per-attempt wrapper spawns, zero
-worker-profile calls on the happy path, bounded manager passes, install skip on
-unchanged lockfile, no container starts in default mode) so a regression that
-reintroduces overhead fails CI.
+worker-profile wrappers inside coding attempts, bounded manager passes, install
+skip on unchanged lockfile, no container starts in default mode) so a regression
+that reintroduces hidden overhead fails CI.
 
 Timing trend reports scan archived run artifacts under `archive:runs/...`, read
 each lane `timing.json`, validate the timing schema, and report portable archive

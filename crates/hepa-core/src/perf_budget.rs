@@ -9,7 +9,9 @@ pub struct HepaStructuralMetrics {
     /// Per-attempt Hermes wrapper process spawns. Must be zero — HEPA does not
     /// wrap each attempt in an orchestrator session.
     pub hermes_wrapper_spawns: u32,
-    /// Worker-profile LLM calls. Must be zero on the happy path.
+    /// Worker-profile LLM calls inside the adapter attempt loop. Must be zero:
+    /// Hermes worker run briefs are pre-run artifacts, not hidden wrappers
+    /// around each coding attempt.
     pub worker_profile_llm_calls: u32,
     pub manager_passes: u32,
     pub prompt_bytes: usize,
@@ -64,7 +66,7 @@ impl Default for HepaPerfBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HepaBudgetViolation {
     HermesWrapperSpawned,
-    WorkerProfileCalledOnHappyPath,
+    WorkerProfileWrappedAttempt,
     ManagerPassesExceeded,
     PromptSizeExceeded,
     InstallOnUnchangedLockfile,
@@ -83,7 +85,7 @@ pub fn check_perf_budget(
         violations.push(HepaBudgetViolation::HermesWrapperSpawned);
     }
     if metrics.worker_profile_llm_calls > 0 {
-        violations.push(HepaBudgetViolation::WorkerProfileCalledOnHappyPath);
+        violations.push(HepaBudgetViolation::WorkerProfileWrappedAttempt);
     }
     if metrics.manager_passes > budget.max_manager_passes {
         violations.push(HepaBudgetViolation::ManagerPassesExceeded);
@@ -148,13 +150,13 @@ mod tests {
                 .contains(&HepaBudgetViolation::HermesWrapperSpawned)
         );
 
-        // Worker-profile LLM call on the happy path.
+        // Worker-profile call inside the adapter attempt loop.
         counters.worker_profile_llm_calls = 1;
         metrics =
             HepaStructuralMetrics::from_timing(&timing(counters.clone()), 0, 4096, false, 0.0);
         assert!(
             check_perf_budget(&metrics, &budget)
-                .contains(&HepaBudgetViolation::WorkerProfileCalledOnHappyPath)
+                .contains(&HepaBudgetViolation::WorkerProfileWrappedAttempt)
         );
 
         // Manager passes exceeded.
