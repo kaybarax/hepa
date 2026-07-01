@@ -1320,10 +1320,23 @@ fn append_tool_summary_stream_event(
         "tool_event_count": parsed.tool_activity.len(),
         "tool_event_types": tool_activity,
         "final_message_bytes": parsed.final_message.len(),
+        "final_message_preview": bounded_model_visible_summary(&parsed.final_message),
     });
     serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
     file.write_all(b"\n").map_err(|error| error.to_string())?;
     file.flush().map_err(|error| error.to_string())
+}
+
+fn bounded_model_visible_summary(message: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 240;
+    let redacted = redact_secrets(message);
+    let mut chars = redacted.chars();
+    let preview = chars.by_ref().take(MAX_PREVIEW_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
 }
 
 struct RunLiveRepairInput<'a> {
@@ -5379,7 +5392,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_summary_stream_events_omit_model_message_content() {
+    fn tool_summary_stream_events_redact_and_bound_model_visible_summary() {
         let root = unique_test_dir("tool-summary-stream");
         let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
             .expect("artifact layout");
@@ -5387,8 +5400,11 @@ mod tests {
             .run("run-live", "task-live")
             .expect("run artifact paths");
         let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
+        let long_tail = " keep-going".repeat(60);
         let parsed = HepaPiParsedOutput {
-            final_message: "Edited README.md and ran validation.".to_string(),
+            final_message: format!(
+                "Edited README.md, used Bearer hepa-test-token-12345, and ran validation.{long_tail} tail-marker"
+            ),
             tool_activity: vec![
                 "tool_call".to_string(),
                 "tool_result".to_string(),
@@ -5408,8 +5424,11 @@ mod tests {
         assert!(stream.contains("\"tool_event_count\":3"));
         assert!(stream.contains("\"tool_call\""));
         assert!(stream.contains("\"tool_result\""));
-        assert!(stream.contains("\"final_message_bytes\":36"));
-        assert!(!stream.contains("Edited README"));
+        assert!(stream.contains("\"final_message_bytes\":"));
+        assert!(stream.contains("\"final_message_preview\""));
+        assert!(stream.contains("Edited README"));
+        assert!(!stream.contains("hepa-test-token-12345"));
+        assert!(!stream.contains("tail-marker"));
 
         remove_test_dir(root);
     }

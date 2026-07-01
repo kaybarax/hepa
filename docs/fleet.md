@@ -77,4 +77,6 @@ HEPA-created runtime state and preserves unrelated user changes.
 from the same project, task, scheduler, and wait-reason registry that Hermes and
 the CLI use. It is a local degraded-mode package for reviewing fleet state when
 live Hermes dashboard access is unavailable; it redacts repo paths by omission
-and remains a read-only view over HEPA's authoritative state.
+and remains a read-only view over HEPA's authoritative state. The dashboard also
+lists lane-local stream artifacts with short tails so parallel run activity can
+be inspected without opening each lane directory by hand.

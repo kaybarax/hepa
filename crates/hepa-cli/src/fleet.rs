@@ -565,6 +565,7 @@ struct HepaDesktopDashboardSnapshot {
     scheduler: HepaDesktopSchedulerSnapshot,
     projects: Vec<HepaDesktopProjectSnapshot>,
     tasks: Vec<HepaDesktopTaskSnapshot>,
+    lane_streams: Vec<HepaDesktopLaneStreamSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -607,6 +608,14 @@ struct HepaDesktopTaskSnapshot {
     card_configured: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct HepaDesktopLaneStreamSnapshot {
+    lane_id: String,
+    stream_count: usize,
+    streams: Vec<String>,
+    tail: Vec<String>,
+}
+
 fn desktop_dashboard_snapshot(
     control_root: &Path,
     projects: &[HepaRegisteredProject],
@@ -627,6 +636,7 @@ fn desktop_dashboard_snapshot(
             &active,
         )
         .map_err(|error| error.to_string())?;
+    let lane_streams = dashboard_lane_streams(control_root, tasks)?;
     Ok(HepaDesktopDashboardSnapshot {
         schema_version: CONTRACT_SCHEMA_VERSION,
         surface: "desktop-dashboard-snapshot".to_string(),
@@ -680,7 +690,42 @@ fn desktop_dashboard_snapshot(
                 card_configured: task.external_card_id.is_some(),
             })
             .collect(),
+        lane_streams,
     })
+}
+
+fn dashboard_lane_streams(
+    control_root: &Path,
+    tasks: &[HepaFleetTask],
+) -> Result<Vec<HepaDesktopLaneStreamSnapshot>, String> {
+    let mut lanes = tasks
+        .iter()
+        .flat_map(|task| task.lane_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    lanes.sort();
+    lanes.dedup();
+    lanes
+        .into_iter()
+        .map(|lane_id| {
+            let streams =
+                find_lane_stream_logs(control_root, &lane_id).map_err(|error| error.to_string())?;
+            let mut tail = Vec::new();
+            for stream in &streams {
+                for line in tail_file_lines(stream, 3)? {
+                    tail.push(format!("{}: {line}", stream.display()));
+                }
+            }
+            Ok(HepaDesktopLaneStreamSnapshot {
+                lane_id,
+                stream_count: streams.len(),
+                streams: streams
+                    .iter()
+                    .map(|stream| stream.display().to_string())
+                    .collect(),
+                tail,
+            })
+        })
+        .collect()
 }
 
 fn dashboard_json_path(html_path: &Path) -> PathBuf {
@@ -748,6 +793,30 @@ fn render_desktop_dashboard(snapshot: &HepaDesktopDashboardSnapshot) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let stream_rows = snapshot
+        .lane_streams
+        .iter()
+        .map(|stream| {
+            let tail = if stream.tail.is_empty() {
+                "none".to_string()
+            } else {
+                stream
+                    .tail
+                    .iter()
+                    .map(|line| html_escape(line))
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&stream.lane_id),
+                stream.stream_count,
+                html_escape(&stream.streams.join(", ")),
+                tail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -801,6 +870,12 @@ ul {{ background: white; border: 1px solid #dbe4e1; border-radius: 6px; padding:
 </tbody></table>
 </section>
 <section>
+<h2>Lane Streams</h2>
+<table><thead><tr><th>Lane</th><th>Streams</th><th>Paths</th><th>Tail</th></tr></thead><tbody>
+{}
+</tbody></table>
+</section>
+<section>
 <h2>Wait Reasons</h2>
 <ul>{}</ul>
 </section>
@@ -817,6 +892,11 @@ ul {{ background: white; border: 1px solid #dbe4e1; border-radius: 6px; padding:
         html_escape(&snapshot.scheduler.run_state),
         project_cards,
         task_rows,
+        if stream_rows.is_empty() {
+            "<tr><td colspan=\"4\">none</td></tr>".to_string()
+        } else {
+            stream_rows
+        },
         if waits.is_empty() {
             "<li>none</li>".to_string()
         } else {
@@ -1639,7 +1719,7 @@ mod tests {
                 status: HepaTaskStatus::Ready,
                 readiness: HepaReadinessState::Ready,
                 dependencies: Vec::new(),
-                lane_ids: Vec::new(),
+                lane_ids: vec!["lane-1".to_string()],
                 external_card_id: Some("card-1".to_string()),
                 priority: 5,
                 created_at: "t0".to_string(),
@@ -1647,6 +1727,13 @@ mod tests {
                 completed_at: None,
             })
             .expect("create task");
+        let stream_dir = root.join("runs/run-1/tasks/task-1/lanes/lane-1/streams");
+        std::fs::create_dir_all(&stream_dir).expect("stream dir");
+        std::fs::write(
+            stream_dir.join("manager-tool-summary-stream.jsonl"),
+            "{\"event\":\"tool_activity_summary\",\"tool_event_count\":2}\n",
+        )
+        .expect("stream fixture");
         scheduler_command(&s(&["start", "--control-root", &control])).expect("start scheduler");
 
         let html_path = root.join("desktop").join("index.html");
@@ -1666,6 +1753,9 @@ mod tests {
         assert!(html.contains("HEPA Fleet Dashboard"));
         assert!(html.contains("Demo &lt;Project&gt;"));
         assert!(html.contains("Fix &lt;dashboard&gt;"));
+        assert!(html.contains("Lane Streams"));
+        assert!(html.contains("manager-tool-summary-stream.jsonl"));
+        assert!(html.contains("tool_activity_summary"));
         assert!(!html.contains("<REPO_A>"));
 
         let json_path = dashboard_json_path(&html_path);
@@ -1673,6 +1763,8 @@ mod tests {
         assert!(json.contains("\"surface\": \"desktop-dashboard-snapshot\""));
         assert!(json.contains("\"run_state\": \"Running\""));
         assert!(json.contains("\"card_configured\": true"));
+        assert!(json.contains("\"lane_streams\""));
+        assert!(json.contains("manager-tool-summary-stream.jsonl"));
         assert!(!json.contains("<REPO_A>"));
 
         std::fs::remove_dir_all(&root).ok();

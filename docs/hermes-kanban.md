@@ -126,10 +126,11 @@ Live adapter stdout/stderr chunks are written as lane-local JSONL streams under
 `streams/reviewer-adapter-stream.jsonl`. Manager-owned validation summaries are
 written to `streams/manager-validation-stream.jsonl`. Pi tool activity summaries
 are written to `streams/manager-tool-summary-stream.jsonl` as event counts and
-event-type names only; HEPA does not stream model message content or hidden
-reasoning. These files are the per-lane stream source for terminal/dashboard
-views during parallel Hermes-led work; final `stdout.log`, `stderr.log`, and
-validation summary artifacts remain the complete post-run captures.
+event-type names plus a redacted, bounded preview of model-visible final output
+when available; HEPA does not stream hidden reasoning. These files are the
+per-lane stream source for terminal/dashboard views during parallel Hermes-led
+work; final `stdout.log`, `stderr.log`, and validation summary artifacts remain
+the complete post-run captures.
 
 ```bash
 hepa task sync-kanban   # push task records to Hermes (degrades if unavailable)
