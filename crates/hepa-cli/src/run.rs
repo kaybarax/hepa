@@ -1785,6 +1785,12 @@ fn live_run_brief(config: &HepaFakeRunConfig) -> Result<Option<HepaHermesRunBrie
         return live_run_brief_from_runtime_command(&command, config).map(Some);
     }
     let Ok(brief_path) = std::env::var("HEPA_HERMES_RUN_BRIEF_FILE") else {
+        if hermes_required() {
+            return Err(
+                "Hermes-present mode requires HEPA_HERMES_RUN_BRIEF_COMMAND or HEPA_HERMES_RUN_BRIEF_FILE"
+                    .to_string(),
+            );
+        }
         return Ok(None);
     };
     let brief = hermes_run_brief_from_file(Path::new(&brief_path))?;
@@ -1886,6 +1892,12 @@ fn live_pr_request(
             Path::new(&intent_path),
             base_branch.to_string(),
             head_branch.to_string(),
+        );
+    }
+    if hermes_required() {
+        return Err(
+            "Hermes-present mode requires HEPA_HERMES_PR_INTENT_COMMAND or HEPA_HERMES_PR_INTENT_FILE"
+                .to_string(),
         );
     }
 
@@ -2483,6 +2495,12 @@ fn live_review_fanout(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, S
             "Hermes review policy",
         );
     }
+    if hermes_required() {
+        return Err(
+            "Hermes-present mode requires HEPA_HERMES_REVIEWER_COMMAND or HEPA_HERMES_REVIEW_ARTIFACT_FILE"
+                .to_string(),
+        );
+    }
     if live_adapter_review_enabled() {
         return live_adapter_review(input);
     }
@@ -2742,6 +2760,7 @@ fn live_review_outcome_from_signals(
     signals: Vec<HepaReviewSignal>,
     pass_policy_label: &str,
 ) -> Result<LiveReviewOutcome, String> {
+    let requires_review_manager = hermes_required() && review_signals_need_manager(&signals);
     let manager_artifact = live_review_manager_artifact(config, lane_paths, &signals)?;
     if let Some(artifact) = &manager_artifact {
         write_json(
@@ -2751,11 +2770,41 @@ fn live_review_outcome_from_signals(
             artifact,
         )
         .map_err(|error| error.to_string())?;
+    } else if requires_review_manager {
+        return Err(
+            "Hermes-present mode requires HEPA_HERMES_REVIEW_MANAGER_COMMAND or HEPA_HERMES_REVIEW_MANAGER_ARTIFACT_FILE when reviewer findings need manager arbitration"
+                .to_string(),
+        );
     }
     live_review_outcome_from_signals_and_manager(
         signals,
         manager_artifact.map(|artifact| artifact.arbitration),
         pass_policy_label,
+    )
+}
+
+fn review_signals_need_manager(signals: &[HepaReviewSignal]) -> bool {
+    signals
+        .iter()
+        .any(|signal| signal.status != HepaReviewStatus::Approved || !signal.findings.is_empty())
+}
+
+fn hermes_required() -> bool {
+    env_flag("HEPA_HERMES_REQUIRED")
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .as_deref()
+        .map(is_truthy_env_value)
+        .unwrap_or(false)
+}
+
+fn is_truthy_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "required"
     )
 }
 
@@ -4204,6 +4253,7 @@ mod tests {
     use std::{
         os::unix::fs::PermissionsExt,
         process::Command,
+        sync::{Mutex, MutexGuard, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -4619,6 +4669,108 @@ mod tests {
             "local/mlx-community/Qwen3-30B-A3B-4bit",
             &base_url
         ));
+    }
+
+    #[test]
+    fn hermes_required_mode_requires_worker_brief_source() {
+        let _env = ScopedEnv::set_many(&[
+            ("HEPA_HERMES_REQUIRED", Some("true")),
+            ("HEPA_HERMES_RUN_BRIEF_COMMAND", None),
+            ("HEPA_HERMES_RUN_BRIEF_FILE", None),
+        ]);
+        let root = unique_test_dir("hepa-hermes-required-worker");
+        let config = runtime_review_config(&root);
+
+        let error = live_run_brief(&config).expect_err("Hermes-required mode must not fall back");
+
+        assert!(error.contains("HEPA_HERMES_RUN_BRIEF_COMMAND"));
+        assert!(error.contains("HEPA_HERMES_RUN_BRIEF_FILE"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_required_mode_requires_reviewer_source_before_fallback_review() {
+        let _env = ScopedEnv::set_many(&[
+            ("HEPA_HERMES_REQUIRED", Some("required")),
+            ("HEPA_HERMES_REVIEWER_COMMAND", None),
+            ("HEPA_HERMES_REVIEW_ARTIFACT_FILE", None),
+        ]);
+        let root = unique_test_dir("hermes-required-reviewer");
+        let config = runtime_review_config(&root);
+        let (lane_paths, allocation) = runtime_review_paths(&config);
+        let spec = dummy_pi_spec();
+        let environment = std::collections::BTreeMap::new();
+        let validation = passed_validation();
+        let changed_files = vec!["README.md".to_string()];
+
+        let error = live_review_fanout(LiveReviewInput {
+            config: &config,
+            adapter_id: "pi",
+            spec: &spec,
+            environment: &environment,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            changed_files: &changed_files,
+            validation: &validation,
+            diff_context: "diff --git a/README.md b/README.md",
+        })
+        .expect_err("Hermes-required mode must not use deterministic or adapter review fallback");
+
+        assert!(error.contains("HEPA_HERMES_REVIEWER_COMMAND"));
+        assert!(error.contains("HEPA_HERMES_REVIEW_ARTIFACT_FILE"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_required_mode_requires_pr_intent_source_before_fallback_body() {
+        let _env = ScopedEnv::set_many(&[
+            ("HEPA_HERMES_REQUIRED", Some("1")),
+            ("HEPA_HERMES_PR_INTENT_COMMAND", None),
+            ("HEPA_HERMES_PR_INTENT_FILE", None),
+        ]);
+        let root = unique_test_dir("hermes-required-pr-intent");
+        let config = runtime_review_config(&root);
+        let task_spec = live_task_spec(&config);
+        let validation = passed_validation();
+        let review = HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: "review-1".to_string(),
+            lane_id: config.lane_id.clone(),
+            adapter_id: "hepa-reviewer:primary".to_string(),
+            status: HepaReviewStatus::Approved,
+            findings: Vec::new(),
+            summary: vec!["No blocking findings.".to_string()],
+            completed_at: "2026-06-16T00:00:06Z".to_string(),
+        };
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 1.0,
+            validation_duration_seconds: 0.1,
+            review_duration_seconds: 0.1,
+            reviewer_passes: 1,
+            terminal_phase: LivePipelinePhase::Completed,
+            repair_timing: None,
+        });
+        let terminal_report = terminal_report(&config, validation, review, timing);
+        let lane = completed_lane(&config);
+
+        let error = live_pr_request(
+            &config,
+            &task_spec,
+            &terminal_report,
+            &lane,
+            "main",
+            "hepa/manager/lane-live",
+        )
+        .expect_err("Hermes-required mode must not build fallback PR bodies");
+
+        assert!(error.contains("HEPA_HERMES_PR_INTENT_COMMAND"));
+        assert!(error.contains("HEPA_HERMES_PR_INTENT_FILE"));
+
+        remove_test_dir(root);
     }
 
     #[test]
@@ -5065,6 +5217,87 @@ JSON
             .expect_err("unresolved review-manager artifact should be rejected");
 
         assert!(error.contains("Hermes review-manager artifact failed validation"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_required_mode_requires_review_manager_when_review_has_findings() {
+        let _env = ScopedEnv::set_many(&[
+            ("HEPA_HERMES_REQUIRED", Some("yes")),
+            ("HEPA_HERMES_REVIEW_MANAGER_COMMAND", None),
+            ("HEPA_HERMES_REVIEW_MANAGER_ARTIFACT_FILE", None),
+        ]);
+        let root = unique_test_dir("hermes-required-review-manager");
+        let config = runtime_review_config(&root);
+        let (lane_paths, _) = runtime_review_paths(&config);
+        let signal = HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: "review-1".to_string(),
+            lane_id: config.lane_id.clone(),
+            adapter_id: "hepa-reviewer:primary".to_string(),
+            status: HepaReviewStatus::Approved,
+            findings: vec![HepaReviewFinding {
+                finding_id: "finding-1".to_string(),
+                severity: HepaFindingSeverity::Medium,
+                category: "maintainability".to_string(),
+                evidence: "Reviewer requested manager judgment.".to_string(),
+                in_scope: true,
+                release_risk: false,
+                recommended_action: "Manager should arbitrate.".to_string(),
+                file_ref: None,
+                line: None,
+                message: "Needs arbitration.".to_string(),
+                accepted: true,
+            }],
+            summary: vec!["Finding requires manager arbitration.".to_string()],
+            completed_at: "2026-06-16T00:00:06Z".to_string(),
+        };
+
+        let error = live_review_outcome_from_signals(
+            &config,
+            &lane_paths,
+            vec![signal],
+            "Hermes review policy",
+        )
+        .expect_err("Hermes-required findings must not use deterministic arbitration");
+
+        assert!(error.contains("HEPA_HERMES_REVIEW_MANAGER_COMMAND"));
+        assert!(error.contains("HEPA_HERMES_REVIEW_MANAGER_ARTIFACT_FILE"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_required_mode_allows_clean_reviewer_signal_without_review_manager() {
+        let _env = ScopedEnv::set_many(&[
+            ("HEPA_HERMES_REQUIRED", Some("on")),
+            ("HEPA_HERMES_REVIEW_MANAGER_COMMAND", None),
+            ("HEPA_HERMES_REVIEW_MANAGER_ARTIFACT_FILE", None),
+        ]);
+        let root = unique_test_dir("hermes-required-clean-review");
+        let config = runtime_review_config(&root);
+        let (lane_paths, _) = runtime_review_paths(&config);
+
+        let outcome = live_review_outcome_from_signals(
+            &config,
+            &lane_paths,
+            vec![HepaReviewSignal {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                review_id: "review-1".to_string(),
+                lane_id: config.lane_id.clone(),
+                adapter_id: "hepa-reviewer:primary".to_string(),
+                status: HepaReviewStatus::Approved,
+                findings: Vec::new(),
+                summary: vec!["No blocking findings.".to_string()],
+                completed_at: "2026-06-16T00:00:06Z".to_string(),
+            }],
+            "Hermes review policy",
+        )
+        .expect("clean Hermes review can proceed without a review-manager artifact");
+
+        assert!(outcome.staging_allowed);
+        assert_eq!(outcome.reviewer_passes, 1);
 
         remove_test_dir(root);
     }
@@ -6787,6 +7020,51 @@ JSON
     fn remove_test_dir(root: PathBuf) {
         if root.exists() {
             fs::remove_dir_all(root).expect("test dir cleanup");
+        }
+    }
+
+    struct ScopedEnv {
+        _guard: MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl ScopedEnv {
+        fn set_many(changes: &[(&'static str, Option<&str>)]) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let guard = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env lock");
+            let mut previous = Vec::new();
+            for (key, value) in changes {
+                previous.push((*key, std::env::var(key).ok()));
+                // Tests serialize environment mutation with ENV_LOCK.
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                if let Some(previous) = previous {
+                    // Tests serialize environment mutation with ENV_LOCK.
+                    unsafe { std::env::set_var(key, previous) };
+                } else {
+                    // Tests serialize environment mutation with ENV_LOCK.
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
         }
     }
 }

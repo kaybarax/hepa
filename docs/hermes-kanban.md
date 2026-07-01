@@ -99,6 +99,11 @@ worker profile runtime, captures stdout/stderr, validates the produced
 `HepaHermesRunBrief`, and derives the coding adapter task spec from that finite
 brief instead of the broad fallback task text.
 
+Set `HEPA_HERMES_REQUIRED=true` for release validation runs where Hermes is
+available and must lead the workflow. In that mode HEPA refuses the headless
+fallback path unless a Hermes worker brief source is configured through
+`HEPA_HERMES_RUN_BRIEF_COMMAND` or `HEPA_HERMES_RUN_BRIEF_FILE`.
+
 When review passes, the manager profile writes PR intent: title, body, audit
 summary, and human-review requirement. HEPA validates that the intent came from
 `hepa-manager`, rejects generic validation-template bodies, appends the HEPA
@@ -116,6 +121,10 @@ writes `review/hermes-review-context.json`, expects the command to write the
 artifact path in `HEPA_HERMES_ARTIFACT_OUT`, captures runtime stdout/stderr, and
 validates the artifact before advancing.
 
+With `HEPA_HERMES_REQUIRED=true`, HEPA also refuses deterministic or adapter
+review fallback unless a Hermes reviewer source is configured through
+`HEPA_HERMES_REVIEWER_COMMAND` or `HEPA_HERMES_REVIEW_ARTIFACT_FILE`.
+
 When reviewer findings need manager judgment, the Hermes review manager can
 hand HEPA settled arbitration by setting
 `HEPA_HERMES_REVIEW_MANAGER_ARTIFACT_FILE` to a JSON
@@ -128,6 +137,10 @@ provides the matching runtime bridge for arbitration: HEPA writes
 `review/hermes-review-manager-context.json`, captures runtime stdout/stderr, and
 validates the settled arbitration artifact before using it.
 
+In required Hermes mode, a review-manager source becomes mandatory when reviewer
+signals contain findings or a non-approved status. Clean approved review signals
+can proceed without a separate review-manager artifact.
+
 During the runtime transition, a Hermes manager can hand HEPA an intent artifact
 by setting `HEPA_HERMES_PR_INTENT_FILE` to a JSON `HepaHermesPrIntent` file.
 When this variable is present, live PR creation uses that validated intent; when
@@ -136,6 +149,10 @@ work. In Hermes-present runs, `HEPA_HERMES_PR_INTENT_COMMAND` can point to the
 manager profile runtime; HEPA writes a PR-intent context JSON file, captures
 runtime stdout/stderr, requires a manager-authored intent artifact, and only
 then performs the manager-owned staging/push/PR operation.
+
+With `HEPA_HERMES_REQUIRED=true`, HEPA refuses the generic fallback PR body and
+requires `HEPA_HERMES_PR_INTENT_COMMAND` or `HEPA_HERMES_PR_INTENT_FILE` before
+PR creation can proceed.
 
 ## Card transitions
 
