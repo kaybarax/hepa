@@ -123,9 +123,11 @@ fails.
 
 Live adapter stdout/stderr chunks are written as lane-local JSONL streams under
 `streams/worker-adapter-stream.jsonl` and
-`streams/reviewer-adapter-stream.jsonl`. These files are the per-lane stream
-source for terminal/dashboard views during parallel Hermes-led work; final
-`stdout.log` and `stderr.log` remain the complete post-run captures.
+`streams/reviewer-adapter-stream.jsonl`. Manager-owned validation summaries are
+written to `streams/manager-validation-stream.jsonl`. These files are the
+per-lane stream source for terminal/dashboard views during parallel Hermes-led
+work; final `stdout.log`, `stderr.log`, and validation summary artifacts remain
+the complete post-run captures.
 
 ```bash
 hepa task sync-kanban   # push task records to Hermes (degrades if unavailable)

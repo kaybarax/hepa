@@ -59,7 +59,8 @@ use hepa_review::{
 };
 use serde::Serialize;
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Mutex, MutexGuard, OnceLock, TryLockError},
@@ -425,6 +426,7 @@ pub fn run_live_task(
     }
     let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
     write_json(&lane_paths.validation_summary, &validation).map_err(|error| error.to_string())?;
+    append_validation_stream_event(&lane_paths, 1, &validation)?;
     if live_force_git_lifecycle_violation() {
         let blocked = controlled_git_lifecycle_block()?;
         transition_and_record(
@@ -1255,6 +1257,38 @@ fn write_live_adapter_stream_logs(
     Ok(())
 }
 
+fn append_validation_stream_event(
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    round: u32,
+    validation: &HepaValidationSummary,
+) -> Result<(), String> {
+    let stream_path = lane_paths
+        .lane_dir
+        .join("streams")
+        .join("manager-validation-stream.jsonl");
+    if let Some(parent) = stream_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stream_path)
+        .map_err(|error| error.to_string())?;
+    let event = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "source": "hepa-manager",
+        "event": "validation_summary",
+        "round": round,
+        "status": &validation.status,
+        "command_count": validation.commands.len(),
+        "failure_type": &validation.failure_type,
+        "summary": &validation.summary,
+    });
+    serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())
+}
+
 struct RunLiveRepairInput<'a> {
     config: &'a HepaFakeRunConfig,
     lane_paths: &'a hepa_core::artifacts::HepaLaneArtifactPaths,
@@ -1434,6 +1468,7 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
     let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
     write_json(&repair_dir.join("round-2-validation.json"), &validation)
         .map_err(|error| error.to_string())?;
+    append_validation_stream_event(lane_paths, repair_round, &validation)?;
     Ok(LiveRepairOutcome {
         worker_duration_seconds: attempt.duration_seconds,
         validation_duration_seconds,
@@ -5260,6 +5295,50 @@ mod tests {
         assert!(sanitized.contains("<VALIDATION_RUNTIME>"));
         assert!(!sanitized.contains("/tmp/hepa-validation"));
         assert!(!sanitized.contains(".hepa/worktrees/lane-cli-fake"));
+    }
+
+    #[test]
+    fn validation_stream_events_record_manager_summaries() {
+        let root = unique_test_dir("validation-stream");
+        let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
+            .expect("artifact layout");
+        let run_paths = layout
+            .run("run-live", "task-live")
+            .expect("run artifact paths");
+        let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
+        let passed = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 0,
+                duration_ms: 7,
+            }],
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["`git diff --check` exited 0.".to_string()],
+        };
+        let mut failed = passed.clone();
+        failed.status = HepaValidationStatus::Failed;
+        failed.failure_type = Some("validation_failed".to_string());
+        failed.summary = vec!["`cargo test` exited 1.".to_string()];
+
+        append_validation_stream_event(&lane_paths, 1, &passed).expect("round 1 stream");
+        append_validation_stream_event(&lane_paths, 2, &failed).expect("round 2 stream");
+
+        let stream = fs::read_to_string(
+            lane_paths
+                .lane_dir
+                .join("streams/manager-validation-stream.jsonl"),
+        )
+        .expect("validation stream");
+        assert!(stream.contains("\"source\":\"hepa-manager\""));
+        assert!(stream.contains("\"event\":\"validation_summary\""));
+        assert!(stream.contains("\"round\":1"));
+        assert!(stream.contains("\"round\":2"));
+        assert!(stream.contains("\"failure_type\":\"validation_failed\""));
+
+        remove_test_dir(root);
     }
 
     #[test]
