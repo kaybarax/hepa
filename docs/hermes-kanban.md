@@ -73,6 +73,12 @@ summary, and human-review requirement. HEPA validates that the intent came from
 audit section, and performs the manager-owned GitHub operation. The PR remains
 for human review; HEPA does not auto-merge.
 
+During the runtime transition, a Hermes manager can hand HEPA an intent artifact
+by setting `HEPA_HERMES_PR_INTENT_FILE` to a JSON `HepaHermesPrIntent` file.
+When this variable is present, live PR creation uses that validated intent; when
+it is absent, HEPA keeps the headless fallback body so degraded CLI runs still
+work.
+
 ## Card transitions
 
 As a task progresses, its lane state advances and the card status is projected

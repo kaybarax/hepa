@@ -30,7 +30,7 @@ worker-brief generation, review, arbitration, repair loops, and PR intent:
 | Runtime route from Hermes Kanban task to worker profile brief to coding adapter lane | Required |
 | Per-lane live terminal/log streams for parallel Hermes-led runs | Required |
 | Hermes reviewer and review-manager arbitration runtime, with Pi limited to code implementation in the default path | Required |
-| Manager-authored PR intent wired into live PR creation, with HEPA validating and publishing safely | Required |
+| Manager-authored PR intent wired into live PR creation, with HEPA validating and publishing safely | Intent-file hook tests passed; full Hermes runtime still required |
 | Three-round task/work/review cap with human-intervention terminal state | Required |
 | Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Required |
 

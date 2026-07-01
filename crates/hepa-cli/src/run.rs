@@ -13,12 +13,12 @@ use hepa_core::{
     artifacts::{HepaArchiveOutcome, HepaArtifactLayout, HepaStateTransitionRecord},
     contracts::{
         CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaArbitrationSummary, HepaAttemptReport,
-        HepaFindingSeverity, HepaFleetTask, HepaLane, HepaLaneState, HepaPhaseStatus,
-        HepaReadinessResult, HepaReadinessState, HepaReadinessStatus, HepaReviewFinding,
-        HepaReviewSignal, HepaReviewStatus, HepaRiskLevel, HepaTaskSpec, HepaTaskStatus,
-        HepaTerminalStatus, HepaTerminalTaskReport, HepaTimingCounters, HepaTimingPhase,
-        HepaTimingRecord, HepaValidate, HepaValidationCommandResult, HepaValidationStatus,
-        HepaValidationSummary,
+        HepaFindingSeverity, HepaFleetTask, HepaHermesPrIntent, HepaLane, HepaLaneState,
+        HepaPhaseStatus, HepaReadinessResult, HepaReadinessState, HepaReadinessStatus,
+        HepaReviewFinding, HepaReviewSignal, HepaReviewStatus, HepaRiskLevel, HepaTaskSpec,
+        HepaTaskStatus, HepaTerminalStatus, HepaTerminalTaskReport, HepaTimingCounters,
+        HepaTimingPhase, HepaTimingRecord, HepaValidate, HepaValidationCommandResult,
+        HepaValidationStatus, HepaValidationSummary,
     },
     cost_accounting::{HepaAdapterUsageEntry, HepaLaneCostReport},
     hard_blockers::block_from_monitor_stop,
@@ -29,7 +29,7 @@ use hepa_core::{config::HepaConfigOverrides, redaction::redact_secrets};
 use hepa_git::{
     pr::{
         HepaCommitMessage, HepaManagerGitLifecycle, HepaPrBodyInput, HepaPrRequest,
-        HepaSystemProcessRunner, build_pr_body,
+        HepaSystemProcessRunner, build_pr_body, pr_request_from_hermes_intent,
     },
     staging::HepaSafeStaging,
     worktree::{HepaWorktreeAllocation, HepaWorktreeAllocator},
@@ -839,13 +839,43 @@ pub fn run_live_task(
             ),
         ],
     );
-    let pr_body = build_pr_body(&HepaPrBodyInput {
-        task_spec: &task_spec,
-        terminal_report: &terminal_report,
-        lane: &lane,
-        external_card_id: None,
-    });
     let branch = lane.branch.clone();
+    let pr_request =
+        match live_pr_request(config, &task_spec, &terminal_report, &lane, "main", &branch) {
+            Ok(request) => request,
+            Err(error) => {
+                transition_and_record(
+                    &lane_paths,
+                    &mut lane,
+                    6,
+                    HepaLaneState::Blocked,
+                    "live Hermes PR intent failed",
+                    "2026-06-16T00:00:06Z",
+                )?;
+                return finish_blocked_live_run(FinishBlockedInput {
+                    config,
+                    task,
+                    run_paths: &run_paths,
+                    lane_paths: &lane_paths,
+                    allocator: &allocator,
+                    lane: &mut lane,
+                    validation,
+                    review_signals: review_outcome.signals.clone(),
+                    arbitration: Some(review_outcome.arbitration.clone()),
+                    timing: live_timing_record(LiveTimingInput {
+                        config,
+                        adapter_id,
+                        worker_duration_seconds: attempt_outcome.duration_seconds,
+                        validation_duration_seconds,
+                        review_duration_seconds,
+                        reviewer_passes: review_outcome.reviewer_passes,
+                        terminal_phase: LivePipelinePhase::PrFailed,
+                        repair_timing,
+                    }),
+                    reason: error,
+                });
+            }
+        };
     let lifecycle = HepaManagerGitLifecycle::manager(&allocation.worktree_path);
     if let Err(error) = lifecycle.push_branch("origin", &branch, &HepaSystemProcessRunner) {
         transition_and_record(
@@ -879,15 +909,6 @@ pub fn run_live_task(
             reason: format!("Manager push failed before PR creation: {error}"),
         });
     }
-    let pr_request = HepaPrRequest {
-        title: format!(
-            "HEPA validation: {}",
-            commit_title(&sanitized_task_text(config))
-        ),
-        body: pr_body,
-        base_branch: "main".to_string(),
-        head_branch: branch.clone(),
-    };
     let pr = match lifecycle.create_pr(&pr_request, &HepaSystemProcessRunner) {
         Ok(pr) => pr,
         Err(error) => {
@@ -1459,6 +1480,52 @@ fn optional_env(key: &str) -> Option<Option<String>> {
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => None,
     }
+}
+
+fn live_pr_request(
+    config: &HepaFakeRunConfig,
+    task_spec: &HepaTaskSpec,
+    terminal_report: &HepaTerminalTaskReport,
+    lane: &HepaLane,
+    base_branch: &str,
+    head_branch: &str,
+) -> Result<HepaPrRequest, String> {
+    if let Ok(intent_path) = std::env::var("HEPA_HERMES_PR_INTENT_FILE") {
+        return pr_request_from_hermes_intent_file(
+            Path::new(&intent_path),
+            base_branch.to_string(),
+            head_branch.to_string(),
+        );
+    }
+
+    let pr_body = build_pr_body(&HepaPrBodyInput {
+        task_spec,
+        terminal_report,
+        lane,
+        external_card_id: None,
+    });
+    Ok(HepaPrRequest {
+        title: format!(
+            "HEPA validation: {}",
+            commit_title(&sanitized_task_text(config))
+        ),
+        body: pr_body,
+        base_branch: base_branch.to_string(),
+        head_branch: head_branch.to_string(),
+    })
+}
+
+fn pr_request_from_hermes_intent_file(
+    intent_path: &Path,
+    base_branch: String,
+    head_branch: String,
+) -> Result<HepaPrRequest, String> {
+    let raw = fs::read_to_string(intent_path)
+        .map_err(|error| format!("Hermes PR intent could not be read: {error}"))?;
+    let intent: HepaHermesPrIntent = serde_json::from_str(&raw)
+        .map_err(|error| format!("Hermes PR intent JSON is invalid: {error}"))?;
+    pr_request_from_hermes_intent(&intent, base_branch, head_branch)
+        .map_err(|error| format!("Hermes PR intent failed validation: {error}"))
 }
 
 fn live_monitor_policy() -> HepaMonitorPolicy {
@@ -3761,6 +3828,86 @@ mod tests {
             "local/mlx-community/Qwen3-30B-A3B-4bit",
             &base_url
         ));
+    }
+
+    #[test]
+    fn hermes_pr_intent_file_builds_live_pr_request() {
+        let root = unique_test_dir("hermes-pr-intent");
+        let intent_path = root.join("intent.json");
+        let intent = HepaHermesPrIntent {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            title: "Add starter template readiness badge".to_string(),
+            body: "## Summary\nAdds the requested app readiness badge.\n\n## Validation\n- yarn test:e2e passed\n".to_string(),
+            audit_summary: vec![
+                "HEPA validated staging before publishing.".to_string(),
+                "Human review remains required.".to_string(),
+            ],
+            human_review_required: true,
+        };
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &intent_path,
+            serde_json::to_string_pretty(&intent).expect("intent json"),
+        )
+        .expect("write intent");
+
+        let request = pr_request_from_hermes_intent_file(
+            &intent_path,
+            "main".to_string(),
+            "hepa/manager/lane-1".to_string(),
+        )
+        .expect("valid Hermes intent should build live PR request");
+
+        assert_eq!(request.title, intent.title);
+        assert_eq!(request.base_branch, "main");
+        assert_eq!(request.head_branch, "hepa/manager/lane-1");
+        assert!(
+            request
+                .body
+                .contains("Adds the requested app readiness badge")
+        );
+        assert!(request.body.contains("## HEPA audit"));
+        assert!(request.body.contains("PR intent author: hepa-manager"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_pr_intent_file_rejects_generic_live_pr_body() {
+        let root = unique_test_dir("hermes-pr-intent-generic");
+        let intent_path = root.join("intent.json");
+        let intent = HepaHermesPrIntent {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            title: "HEPA validation: Update app".to_string(),
+            body: "## Summary\n- Task: HEPA validation: update app\n\n## Validation\n- passed\n"
+                .to_string(),
+            audit_summary: vec!["validation passed".to_string()],
+            human_review_required: true,
+        };
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &intent_path,
+            serde_json::to_string_pretty(&intent).expect("intent json"),
+        )
+        .expect("write intent");
+
+        let error = pr_request_from_hermes_intent_file(
+            &intent_path,
+            "main".to_string(),
+            "hepa/manager/lane-1".to_string(),
+        )
+        .expect_err("generic Hermes PR body should be rejected");
+
+        assert!(error.contains("Hermes PR intent failed validation"));
+        assert!(error.contains("generic HEPA validation"));
+
+        remove_test_dir(root);
     }
 
     #[test]
