@@ -144,3 +144,11 @@ and [docs/performance.md](docs/performance.md).
 ```bash
 bin/hepa-check
 ```
+
+## Installing HEPA
+
+HEPA v1.0.0 publishes prebuilt binaries as GitHub Release assets for macOS
+Apple Silicon, macOS Intel, Linux x64, Linux ARM64, and Windows x64. Each
+archive contains a `hepa` executable and the release includes a
+`SHA256SUMS.txt` checksum manifest. Building from source remains available, but
+requires the Rust toolchain. See [docs/releasing.md](docs/releasing.md).

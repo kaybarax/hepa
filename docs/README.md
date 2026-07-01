@@ -10,5 +10,7 @@ Implementation documentation for the HEPA workspace.
   mitigations, container mode, local-only policy
 - [performance.md](performance.md) — one-loop model, targets, benchmark harness
 - [fleet.md](fleet.md) — projects, scheduler, resource/conflict rules, monitor
+- [releasing.md](releasing.md) — GitHub Release binary matrix, checksums,
+  prebuilt install, source fallback
 - [hoca-parity.md](hoca-parity.md) — HOCA read-only reference notes
 - [stretch-phase-11.md](stretch-phase-11.md) — Phase 11 evidence ledger
