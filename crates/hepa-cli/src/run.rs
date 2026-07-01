@@ -1,7 +1,7 @@
 use hepa_adapters::{
     engine::{HepaOneshotAdapterExecutor, HepaOneshotAdapterInvocation},
     fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput},
-    pi::parse_pi_json_events,
+    pi::{HepaPiParsedOutput, parse_pi_json_events},
     registry::HepaAdapterRegistry,
     routing::{HepaReviewFanout, HepaReviewPassPolicy},
     spec::{HepaAdapterOutputCapture, HepaAdapterRole, HepaAdapterTemplateContext},
@@ -1179,33 +1179,36 @@ fn execute_live_worker_attempt(
     write_live_adapter_stream_logs(&attempt_paths, &result.stdout, &result.stderr)?;
     let changed_files = collect_changed_files(&allocation.worktree_path)?;
     if adapter_id == "pi" {
-        if let Err(error) = parse_pi_json_events(&result.stdout) {
-            let attempt = HepaAttemptReport {
-                schema_version: CONTRACT_SCHEMA_VERSION,
-                attempt_id: attempt_id.to_string(),
-                lane_id: config.lane_id.clone(),
-                task_id: config.task_id.clone(),
-                round,
-                role: HepaAgentRole::Worker,
-                adapter_id: adapter_id.to_string(),
-                status: hepa_core::contracts::HepaAttemptStatus::Blocked,
-                commands_run: vec![result.command],
-                changed_files,
-                summary: live_attempt_summary(
-                    &allocation.worktree_path,
-                    &result.stdout,
-                    &result.stderr,
-                ),
-                blocked_reason: Some(format!(
+        match parse_pi_json_events(&result.stdout) {
+            Ok(parsed) => append_tool_summary_stream_event(lane_paths, round, &parsed)?,
+            Err(error) => {
+                let attempt = HepaAttemptReport {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    attempt_id: attempt_id.to_string(),
+                    lane_id: config.lane_id.clone(),
+                    task_id: config.task_id.clone(),
+                    round,
+                    role: HepaAgentRole::Worker,
+                    adapter_id: adapter_id.to_string(),
+                    status: hepa_core::contracts::HepaAttemptStatus::Blocked,
+                    commands_run: vec![result.command],
+                    changed_files,
+                    summary: live_attempt_summary(
+                        &allocation.worktree_path,
+                        &result.stdout,
+                        &result.stderr,
+                    ),
+                    blocked_reason: Some(format!(
+                        "local_provider_empty_or_malformed_response: {error}"
+                    )),
+                    started_at: started_at.to_string(),
+                    completed_at: Some(completed_at.to_string()),
+                };
+                write_attempt(lane_paths, &attempt)?;
+                return Err(format!(
                     "local_provider_empty_or_malformed_response: {error}"
-                )),
-                started_at: started_at.to_string(),
-                completed_at: Some(completed_at.to_string()),
-            };
-            write_attempt(lane_paths, &attempt)?;
-            return Err(format!(
-                "local_provider_empty_or_malformed_response: {error}"
-            ));
+                ));
+            }
         }
     }
     let usage_entries = extract_live_usage_entries(
@@ -1283,6 +1286,40 @@ fn append_validation_stream_event(
         "command_count": validation.commands.len(),
         "failure_type": &validation.failure_type,
         "summary": &validation.summary,
+    });
+    serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())
+}
+
+fn append_tool_summary_stream_event(
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    round: u32,
+    parsed: &HepaPiParsedOutput,
+) -> Result<(), String> {
+    let stream_path = lane_paths
+        .lane_dir
+        .join("streams")
+        .join("manager-tool-summary-stream.jsonl");
+    if let Some(parent) = stream_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut tool_activity = parsed.tool_activity.clone();
+    tool_activity.sort();
+    tool_activity.dedup();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stream_path)
+        .map_err(|error| error.to_string())?;
+    let event = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "source": "hepa-manager",
+        "event": "tool_activity_summary",
+        "round": round,
+        "tool_event_count": parsed.tool_activity.len(),
+        "tool_event_types": tool_activity,
+        "final_message_bytes": parsed.final_message.len(),
     });
     serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
     file.write_all(b"\n").map_err(|error| error.to_string())?;
@@ -5337,6 +5374,42 @@ mod tests {
         assert!(stream.contains("\"round\":1"));
         assert!(stream.contains("\"round\":2"));
         assert!(stream.contains("\"failure_type\":\"validation_failed\""));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn tool_summary_stream_events_omit_model_message_content() {
+        let root = unique_test_dir("tool-summary-stream");
+        let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
+            .expect("artifact layout");
+        let run_paths = layout
+            .run("run-live", "task-live")
+            .expect("run artifact paths");
+        let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
+        let parsed = HepaPiParsedOutput {
+            final_message: "Edited README.md and ran validation.".to_string(),
+            tool_activity: vec![
+                "tool_call".to_string(),
+                "tool_result".to_string(),
+                "tool_call".to_string(),
+            ],
+        };
+
+        append_tool_summary_stream_event(&lane_paths, 1, &parsed).expect("tool summary stream");
+
+        let stream = fs::read_to_string(
+            lane_paths
+                .lane_dir
+                .join("streams/manager-tool-summary-stream.jsonl"),
+        )
+        .expect("tool summary stream");
+        assert!(stream.contains("\"event\":\"tool_activity_summary\""));
+        assert!(stream.contains("\"tool_event_count\":3"));
+        assert!(stream.contains("\"tool_call\""));
+        assert!(stream.contains("\"tool_result\""));
+        assert!(stream.contains("\"final_message_bytes\":36"));
+        assert!(!stream.contains("Edited README"));
 
         remove_test_dir(root);
     }
