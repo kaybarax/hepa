@@ -64,7 +64,10 @@ non-interactive Pi runs from trusting project-local Pi settings, packages,
 skills, or extensions unless HEPA adds an explicit adapter policy for them.
 `--no-session` avoids a second persistent transcript outside HEPA's lane
 artifacts, while the `--no-*` discovery flags keep the adapter surface
-deterministic.
+deterministic. While an adapter runs, stdout and stderr chunks are also appended
+to `streams/worker-adapter-stream.jsonl` or
+`streams/reviewer-adapter-stream.jsonl` under the lane artifact directory so
+parallel lanes have tail-able live logs.
 
 DeepSeek cloud:
 

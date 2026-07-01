@@ -111,6 +111,12 @@ from the authoritative lane state. A card cannot show done unless the HEPA done
 gate passes — board requests to mark a card done are rejected while readiness
 fails.
 
+Live adapter stdout/stderr chunks are written as lane-local JSONL streams under
+`streams/worker-adapter-stream.jsonl` and
+`streams/reviewer-adapter-stream.jsonl`. These files are the per-lane stream
+source for terminal/dashboard views during parallel Hermes-led work; final
+`stdout.log` and `stderr.log` remain the complete post-run captures.
+
 ```bash
 hepa task sync-kanban   # push task records to Hermes (degrades if unavailable)
 hepa kanban sync        # reconcile cards

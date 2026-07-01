@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt, fs,
-    io::Read,
+    io::{Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
     sync::{Arc, Mutex, mpsc},
@@ -125,7 +125,8 @@ impl HepaOneshotAdapterExecutor {
             })?;
             drop(stdin);
         }
-        let output = wait_with_monitor(child, &invocation.monitor_policy)?;
+        let stream_path = adapter_stream_path(invocation)?;
+        let output = wait_with_monitor(child, &invocation.monitor_policy, Some(stream_path))?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         invocation
@@ -239,6 +240,7 @@ impl Error for HepaAdapterExecutionError {}
 fn wait_with_monitor(
     mut child: std::process::Child,
     policy: &HepaMonitorPolicy,
+    stream_path: Option<PathBuf>,
 ) -> Result<std::process::Output, HepaAdapterExecutionError> {
     let stdout = child.stdout.take().ok_or_else(|| {
         HepaAdapterExecutionError::new("stdout", "failed to capture adapter stdout")
@@ -246,8 +248,23 @@ fn wait_with_monitor(
     let stderr = child.stderr.take().ok_or_else(|| {
         HepaAdapterExecutionError::new("stderr", "failed to capture adapter stderr")
     })?;
-    let stdout_reader = spawn_output_reader(stdout);
-    let stderr_reader = spawn_output_reader(stderr);
+    let stream_lock = Arc::new(Mutex::new(()));
+    let stdout_reader = spawn_output_reader(
+        stdout,
+        stream_path.clone().map(|path| OutputStreamSink {
+            path,
+            stream: "stdout",
+            lock: Arc::clone(&stream_lock),
+        }),
+    );
+    let stderr_reader = spawn_output_reader(
+        stderr,
+        stream_path.map(|path| OutputStreamSink {
+            path,
+            stream: "stderr",
+            lock: stream_lock,
+        }),
+    );
     let started_at = Instant::now();
     loop {
         if let Some(status) = child
@@ -279,7 +296,14 @@ struct OutputReader {
     done: mpsc::Receiver<Result<(), std::io::Error>>,
 }
 
-fn spawn_output_reader<R>(mut stream: R) -> OutputReader
+#[derive(Debug, Clone)]
+struct OutputStreamSink {
+    path: PathBuf,
+    stream: &'static str,
+    lock: Arc<Mutex<()>>,
+}
+
+fn spawn_output_reader<R>(mut stream: R, sink: Option<OutputStreamSink>) -> OutputReader
 where
     R: Read + Send + 'static,
 {
@@ -296,6 +320,11 @@ where
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .extend_from_slice(&chunk[..count]);
+                    if let Some(sink) = &sink {
+                        if let Err(error) = append_stream_chunk(sink, &chunk[..count]) {
+                            break Err(error);
+                        }
+                    }
                 }
                 Err(error) => break Err(error),
             }
@@ -306,6 +335,47 @@ where
         bytes,
         done: receiver,
     }
+}
+
+fn adapter_stream_path(
+    invocation: &HepaOneshotAdapterInvocation,
+) -> Result<PathBuf, HepaAdapterExecutionError> {
+    let role = match invocation.role {
+        HepaAdapterRole::Worker => "worker",
+        HepaAdapterRole::Reviewer => "reviewer",
+    };
+    let stream_path = PathBuf::from(&invocation.context.artifact_dir)
+        .join("streams")
+        .join(format!("{role}-adapter-stream.jsonl"));
+    if let Some(parent) = stream_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            HepaAdapterExecutionError::new(
+                "artifact_dir",
+                format!("failed to create stream directory: {error}"),
+            )
+        })?;
+    }
+    Ok(stream_path)
+}
+
+fn append_stream_chunk(sink: &OutputStreamSink, chunk: &[u8]) -> std::io::Result<()> {
+    let _guard = sink
+        .lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sink.path)?;
+    let event = serde_json::json!({
+        "schema_version": 1,
+        "stream": sink.stream,
+        "bytes": chunk.len(),
+        "text": String::from_utf8_lossy(chunk),
+    });
+    serde_json::to_writer(&mut file, &event)?;
+    file.write_all(b"\n")?;
+    file.flush()
 }
 
 fn receive_output_reader(
@@ -612,6 +682,13 @@ printf 'worker stderr' >&2
         assert_eq!(result.stdout, "worker stdout");
         assert_eq!(result.stderr, "worker stderr");
         assert_eq!(result.workdir, worktree);
+        let stream_log =
+            fs::read_to_string(artifact_dir.join("streams/worker-adapter-stream.jsonl"))
+                .expect("worker stream log");
+        assert!(stream_log.contains("\"stream\":\"stdout\""));
+        assert!(stream_log.contains("worker stdout"));
+        assert!(stream_log.contains("\"stream\":\"stderr\""));
+        assert!(stream_log.contains("worker stderr"));
         assert!(env_capture.contains("ALLOWED_CONTEXT=visible"));
         assert!(env_capture.contains("HEPA_ADAPTER_ROLE=worker"));
         assert!(!env_capture.contains("UNLISTED_CONTEXT"));
