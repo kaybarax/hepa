@@ -27,7 +27,7 @@ worker-brief generation, review, arbitration, repair loops, and PR intent:
 | --- | --- |
 | Bundled `hepa-manager`, `hepa-worker`, `hepa-reviewer`, and `hepa-review-manager` profile contracts | Contract tests passed |
 | Manager-authored `HepaHermesPrIntent` contract that rejects generic HEPA validation-template PR bodies | Contract and PR-request tests passed |
-| Runtime route from Hermes Kanban task to worker profile brief to coding adapter lane | Required |
+| Runtime route from Hermes Kanban task to worker profile brief to coding adapter lane | Worker brief artifact hook tests passed; full Hermes manager/worker runtime still required |
 | Per-lane live terminal/log streams for parallel Hermes-led runs | Required |
 | Hermes reviewer and review-manager arbitration runtime, with Pi limited to code implementation in the default path | Required |
 | Manager-authored PR intent wired into live PR creation, with HEPA validating and publishing safely | Intent-file hook tests passed; full Hermes runtime still required |

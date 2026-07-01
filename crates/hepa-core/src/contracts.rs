@@ -719,6 +719,52 @@ pub enum HepaTerminalStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaHermesRunBrief {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub lane_id: String,
+    pub author_profile_id: String,
+    pub task_prompt: String,
+    pub expected_areas: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub validation_commands: Vec<String>,
+    pub max_total_rounds: u32,
+}
+
+impl HepaValidate for HepaHermesRunBrief {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("author_profile_id", &self.author_profile_id)?;
+        if self.author_profile_id != "hepa-worker" {
+            return Err(HepaContractError::new(
+                "author_profile_id",
+                "run brief must be authored by the hepa-worker Hermes profile",
+            ));
+        }
+        require_non_empty("task_prompt", &self.task_prompt)?;
+        reject_secret_like_ref("task_prompt", &self.task_prompt)?;
+        require_string_list("expected_areas", &self.expected_areas)?;
+        require_string_list("acceptance_criteria", &self.acceptance_criteria)?;
+        require_string_list("validation_commands", &self.validation_commands)?;
+        if self.acceptance_criteria.is_empty() {
+            return Err(HepaContractError::new(
+                "acceptance_criteria",
+                "Hermes worker run brief must include finite acceptance criteria",
+            ));
+        }
+        if self.max_total_rounds == 0 || self.max_total_rounds > 3 {
+            return Err(HepaContractError::new(
+                "max_total_rounds",
+                "Hermes worker run brief must allow one to three total rounds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaHermesPrIntent {
     pub schema_version: u32,
     pub task_id: String,
@@ -1227,5 +1273,51 @@ mod tests {
 
         assert_eq!(error.field, "body");
         assert!(error.message.contains("generic HEPA validation"));
+    }
+
+    #[test]
+    fn hermes_run_brief_requires_worker_authored_finite_task() {
+        let brief = HepaHermesRunBrief {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-worker".to_string(),
+            task_prompt: "Update the login form validation copy only.".to_string(),
+            expected_areas: vec!["src/login-form.tsx".to_string()],
+            acceptance_criteria: vec!["Copy matches the product request.".to_string()],
+            validation_commands: vec!["yarn test:e2e".to_string()],
+            max_total_rounds: 3,
+        };
+
+        brief
+            .validate()
+            .expect("worker-authored run brief should validate");
+    }
+
+    #[test]
+    fn hermes_run_brief_rejects_non_worker_or_unbounded_rounds() {
+        let mut brief = HepaHermesRunBrief {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            task_prompt: "Update docs.".to_string(),
+            expected_areas: vec!["README.md".to_string()],
+            acceptance_criteria: vec!["Docs updated.".to_string()],
+            validation_commands: vec!["git diff --check".to_string()],
+            max_total_rounds: 1,
+        };
+
+        let author_error = brief
+            .validate()
+            .expect_err("manager-authored worker brief should fail");
+        assert_eq!(author_error.field, "author_profile_id");
+
+        brief.author_profile_id = "hepa-worker".to_string();
+        brief.max_total_rounds = 4;
+        let rounds_error = brief
+            .validate()
+            .expect_err("unbounded worker brief should fail");
+        assert_eq!(rounds_error.field, "max_total_rounds");
     }
 }

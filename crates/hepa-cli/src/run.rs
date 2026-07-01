@@ -13,12 +13,12 @@ use hepa_core::{
     artifacts::{HepaArchiveOutcome, HepaArtifactLayout, HepaStateTransitionRecord},
     contracts::{
         CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaArbitrationSummary, HepaAttemptReport,
-        HepaFindingSeverity, HepaFleetTask, HepaHermesPrIntent, HepaLane, HepaLaneState,
-        HepaPhaseStatus, HepaReadinessResult, HepaReadinessState, HepaReadinessStatus,
-        HepaReviewFinding, HepaReviewSignal, HepaReviewStatus, HepaRiskLevel, HepaTaskSpec,
-        HepaTaskStatus, HepaTerminalStatus, HepaTerminalTaskReport, HepaTimingCounters,
-        HepaTimingPhase, HepaTimingRecord, HepaValidate, HepaValidationCommandResult,
-        HepaValidationStatus, HepaValidationSummary,
+        HepaFindingSeverity, HepaFleetTask, HepaHermesPrIntent, HepaHermesRunBrief, HepaLane,
+        HepaLaneState, HepaPhaseStatus, HepaReadinessResult, HepaReadinessState,
+        HepaReadinessStatus, HepaReviewFinding, HepaReviewSignal, HepaReviewStatus, HepaRiskLevel,
+        HepaTaskSpec, HepaTaskStatus, HepaTerminalStatus, HepaTerminalTaskReport,
+        HepaTimingCounters, HepaTimingPhase, HepaTimingRecord, HepaValidate,
+        HepaValidationCommandResult, HepaValidationStatus, HepaValidationSummary,
     },
     cost_accounting::{HepaAdapterUsageEntry, HepaLaneCostReport},
     hard_blockers::block_from_monitor_stop,
@@ -256,7 +256,12 @@ pub fn run_live_task(
     adapter_id: &str,
 ) -> Result<HepaFakeRunResult, String> {
     validate_config(config)?;
-    let task_spec = live_task_spec(config);
+    let hermes_run_brief = live_run_brief(config)?;
+    let task_spec = if let Some(brief) = &hermes_run_brief {
+        live_task_spec_from_hermes_brief(config, brief)
+    } else {
+        live_task_spec(config)
+    };
     task_spec.validate().map_err(|error| error.to_string())?;
     let mut task = fleet_task(config);
     let layout = HepaArtifactLayout::new(&config.control_root, &config.archive_root)
@@ -273,6 +278,10 @@ pub fn run_live_task(
         .map_err(|error| error.to_string())?;
 
     fs::create_dir_all(&lane_paths.lane_dir).map_err(|error| error.to_string())?;
+    if let Some(brief) = &hermes_run_brief {
+        write_json(&lane_paths.lane_dir.join("hermes-run-brief.json"), brief)
+            .map_err(|error| error.to_string())?;
+    }
     write_json(&run_paths.task_state, &task_spec).map_err(|error| error.to_string())?;
 
     let mut lane = initial_lane(config, &allocation);
@@ -335,8 +344,12 @@ pub fn run_live_task(
             environment.insert(provider_key_env.clone(), value);
         }
     }
-    let prompt =
-        live_worker_prompt_for_adapter(&sanitized_task_text(config), adapter_id, &live_config);
+    let fallback_task_prompt = sanitized_task_text(config);
+    let task_prompt = hermes_run_brief
+        .as_ref()
+        .map(|brief| brief.task_prompt.as_str())
+        .unwrap_or(fallback_task_prompt.as_str());
+    let prompt = live_worker_prompt_for_adapter(task_prompt, adapter_id, &live_config);
     let mut repair_timing = None;
     let mut attempt_outcome = match execute_live_worker_attempt(ExecuteLiveAttemptInput {
         config,
@@ -1482,6 +1495,37 @@ fn optional_env(key: &str) -> Option<Option<String>> {
     }
 }
 
+fn live_run_brief(config: &HepaFakeRunConfig) -> Result<Option<HepaHermesRunBrief>, String> {
+    let Ok(brief_path) = std::env::var("HEPA_HERMES_RUN_BRIEF_FILE") else {
+        return Ok(None);
+    };
+    let brief = hermes_run_brief_from_file(Path::new(&brief_path))?;
+    if brief.task_id != config.task_id {
+        return Err(format!(
+            "Hermes run brief task_id mismatch: expected {} got {}",
+            config.task_id, brief.task_id
+        ));
+    }
+    if brief.lane_id != config.lane_id {
+        return Err(format!(
+            "Hermes run brief lane_id mismatch: expected {} got {}",
+            config.lane_id, brief.lane_id
+        ));
+    }
+    Ok(Some(brief))
+}
+
+fn hermes_run_brief_from_file(brief_path: &Path) -> Result<HepaHermesRunBrief, String> {
+    let raw = fs::read_to_string(brief_path)
+        .map_err(|error| format!("Hermes run brief could not be read: {error}"))?;
+    let brief: HepaHermesRunBrief = serde_json::from_str(&raw)
+        .map_err(|error| format!("Hermes run brief JSON is invalid: {error}"))?;
+    brief
+        .validate()
+        .map_err(|error| format!("Hermes run brief failed validation: {error}"))?;
+    Ok(brief)
+}
+
 fn live_pr_request(
     config: &HepaFakeRunConfig,
     task_spec: &HepaTaskSpec,
@@ -1657,6 +1701,34 @@ fn live_task_spec(config: &HepaFakeRunConfig) -> HepaTaskSpec {
         target_branch: Some("main".to_string()),
         risk_level: HepaRiskLevel::Low,
         max_total_rounds: 1,
+        created_at: "2026-06-16T00:00:00Z".to_string(),
+    }
+}
+
+fn live_task_spec_from_hermes_brief(
+    config: &HepaFakeRunConfig,
+    brief: &HepaHermesRunBrief,
+) -> HepaTaskSpec {
+    HepaTaskSpec {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: config.task_id.clone(),
+        project_id: "project-1".to_string(),
+        goal: brief.task_prompt.clone(),
+        non_goals: vec![
+            "Adapter must not commit, push, create branches, or open pull requests.".to_string(),
+            "Hermes worker brief scope must not be expanded by the coding adapter.".to_string(),
+        ],
+        expected_areas: if brief.expected_areas.is_empty() {
+            expected_areas_from_task(&brief.task_prompt)
+        } else {
+            brief.expected_areas.clone()
+        },
+        acceptance_criteria: brief.acceptance_criteria.clone(),
+        validation_commands: brief.validation_commands.clone(),
+        dependencies: Vec::new(),
+        target_branch: Some("main".to_string()),
+        risk_level: HepaRiskLevel::Low,
+        max_total_rounds: brief.max_total_rounds,
         created_at: "2026-06-16T00:00:00Z".to_string(),
     }
 }
@@ -3906,6 +3978,89 @@ mod tests {
 
         assert!(error.contains("Hermes PR intent failed validation"));
         assert!(error.contains("generic HEPA validation"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_run_brief_file_builds_live_task_spec() {
+        let root = unique_test_dir("hermes-run-brief");
+        let brief_path = root.join("brief.json");
+        let brief = HepaHermesRunBrief {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            author_profile_id: "hepa-worker".to_string(),
+            task_prompt: "Update src/app/login.tsx to show the requested copy.".to_string(),
+            expected_areas: vec!["src/app/login.tsx".to_string()],
+            acceptance_criteria: vec!["Login copy matches the task request.".to_string()],
+            validation_commands: vec!["yarn test:e2e".to_string()],
+            max_total_rounds: 3,
+        };
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &brief_path,
+            serde_json::to_string_pretty(&brief).expect("brief json"),
+        )
+        .expect("write brief");
+
+        let loaded =
+            hermes_run_brief_from_file(&brief_path).expect("valid Hermes brief should load");
+        let config = HepaFakeRunConfig {
+            repo_path: PathBuf::from("repo"),
+            control_root: PathBuf::from("control"),
+            worktree_root: PathBuf::from("worktrees"),
+            archive_root: PathBuf::from("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Headless fallback text that should not drive the brief.".to_string(),
+            timing: true,
+        };
+        let task_spec = live_task_spec_from_hermes_brief(&config, &loaded);
+
+        assert_eq!(task_spec.goal, brief.task_prompt);
+        assert_eq!(task_spec.expected_areas, vec!["src/app/login.tsx"]);
+        assert_eq!(task_spec.acceptance_criteria, brief.acceptance_criteria);
+        assert_eq!(task_spec.validation_commands, vec!["yarn test:e2e"]);
+        assert_eq!(task_spec.max_total_rounds, 3);
+        assert!(
+            task_spec
+                .non_goals
+                .iter()
+                .any(|line| line.contains("Hermes worker brief scope"))
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_run_brief_file_rejects_non_worker_author() {
+        let root = unique_test_dir("hermes-run-brief-author");
+        let brief_path = root.join("brief.json");
+        let brief = HepaHermesRunBrief {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            task_prompt: "Update README.md.".to_string(),
+            expected_areas: vec!["README.md".to_string()],
+            acceptance_criteria: vec!["README updated.".to_string()],
+            validation_commands: vec!["git diff --check".to_string()],
+            max_total_rounds: 1,
+        };
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &brief_path,
+            serde_json::to_string_pretty(&brief).expect("brief json"),
+        )
+        .expect("write brief");
+
+        let error = hermes_run_brief_from_file(&brief_path)
+            .expect_err("non-worker Hermes brief should be rejected");
+
+        assert!(error.contains("Hermes run brief failed validation"));
+        assert!(error.contains("hepa-worker"));
 
         remove_test_dir(root);
     }
