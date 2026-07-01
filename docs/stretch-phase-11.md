@@ -31,7 +31,7 @@ worker-brief generation, review, arbitration, repair loops, and PR intent:
 | Per-lane live terminal/log streams for parallel Hermes-led runs | Required |
 | Hermes reviewer and review-manager arbitration runtime, with Pi limited to code implementation in the default path | Reviewer and review-manager artifact hook tests passed; full Hermes reviewer/review-manager runtime still required |
 | Manager-authored PR intent wired into live PR creation, with HEPA validating and publishing safely | Intent-file hook tests passed; full Hermes runtime still required |
-| Three-round task/work/review cap with human-intervention terminal state | Required |
+| Three-round task/work/review cap with human-intervention terminal state | Worker brief cap contract and repair-budget block tests passed; full multi-round Hermes review/repair loop still required |
 | Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Required |
 
 The Phase 11 privacy scan found only pre-existing placeholder examples and

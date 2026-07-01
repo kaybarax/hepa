@@ -1268,6 +1268,7 @@ struct RunLiveRepairInput<'a> {
     first_changed_files: Vec<String>,
 }
 
+#[derive(Debug)]
 struct LiveRepairOutcome {
     worker_duration_seconds: f64,
     validation_duration_seconds: f64,
@@ -1317,9 +1318,10 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         failed_validation,
         first_changed_files,
     } = input;
+    let max_total_attempts = task_spec.max_total_rounds.clamp(1, 3);
     let policy = HepaRepairRoundPolicy {
-        max_repair_rounds: 2,
-        max_total_attempts: 2,
+        max_repair_rounds: max_total_attempts.saturating_sub(1).max(1),
+        max_total_attempts,
     };
     let repair_round = 2;
     let decision = enforce_repair_round_budget(
@@ -1701,7 +1703,7 @@ fn live_task_spec(config: &HepaFakeRunConfig) -> HepaTaskSpec {
         dependencies: Vec::new(),
         target_branch: Some("main".to_string()),
         risk_level: HepaRiskLevel::Low,
-        max_total_rounds: 1,
+        max_total_rounds: 3,
         created_at: "2026-06-16T00:00:00Z".to_string(),
     }
 }
@@ -4661,6 +4663,98 @@ mod tests {
         assert!(prompt.contains("Pi tool path rules"));
         assert!(prompt.contains("find call uses a search root"));
         assert!(!prompt.contains("/no_think"));
+    }
+
+    #[test]
+    fn live_repair_respects_one_round_hermes_budget_before_worker_launch() {
+        let root = unique_test_dir("repair-budget-one-round");
+        let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
+            .expect("artifact layout");
+        let run_paths = layout
+            .run("run-live", "task-live")
+            .expect("run artifact paths");
+        let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
+        let config = HepaFakeRunConfig {
+            repo_path: root.join("repo"),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let mut task_spec = live_task_spec(&config);
+        task_spec.max_total_rounds = 1;
+        let allocation = HepaWorktreeAllocation {
+            lane_id: "lane-live".to_string(),
+            branch: "hepa/lane-live".to_string(),
+            worktree_path: root.join("worktree"),
+            base_commit: "base".to_string(),
+            metadata_path: root.join("worktree/.hepa-worktree.json"),
+        };
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi Coding Agent".to_string(),
+            roles: vec![HepaAdapterRole::Worker],
+            mode: HepaAdapterMode::Oneshot,
+            command: "unused".to_string(),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: Vec::new(),
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: false,
+            supports_json_output: true,
+            capabilities: Vec::new(),
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 1,
+            max_concurrency: 1,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        };
+        let failed_validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Failed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 1,
+                duration_ms: 10,
+            }],
+            no_tests_detected: false,
+            failure_type: Some("validation_failed".to_string()),
+            summary: vec!["`git diff --check` exited 1.".to_string()],
+        };
+
+        let error = run_live_repair_round(RunLiveRepairInput {
+            config: &config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            task_spec: &task_spec,
+            spec,
+            adapter_id: "pi",
+            environment: std::collections::BTreeMap::new(),
+            prior_prompt: "Update README.md".to_string(),
+            failed_validation,
+            first_changed_files: vec!["README.md".to_string()],
+        })
+        .expect_err("one-round budget should block repair before worker launch");
+
+        assert!(error.contains("repair budget blocked round 2"));
+        let budget = fs::read_to_string(lane_paths.lane_dir.join("repair/round-2-budget.json"))
+            .expect("budget artifact");
+        assert!(budget.contains("\"max_total_attempts\": 1"));
+        assert!(budget.contains("\"allowed\": false"));
+        assert!(
+            !lane_paths
+                .lane_dir
+                .join("repair/round-2-prompt.md")
+                .exists()
+        );
+
+        remove_test_dir(root);
     }
 
     #[test]

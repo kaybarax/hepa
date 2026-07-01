@@ -71,7 +71,10 @@ During the runtime transition, a Hermes worker can hand HEPA a finite run brief
 by setting `HEPA_HERMES_RUN_BRIEF_FILE` to a JSON `HepaHermesRunBrief` file.
 The brief must be authored by `hepa-worker`, match the active task/lane, include
 acceptance criteria, and cap the task at one to three rounds. HEPA persists the
-consumed brief into the lane artifacts before invoking the coding adapter.
+consumed brief into the lane artifacts before invoking the coding adapter. HEPA
+honors that cap during repair: if the next repair would exceed the brief's total
+round budget, HEPA records a repair-budget artifact and blocks the lane for
+human manager attention before launching another worker attempt.
 
 When review passes, the manager profile writes PR intent: title, body, audit
 summary, and human-review requirement. HEPA validates that the intent came from
