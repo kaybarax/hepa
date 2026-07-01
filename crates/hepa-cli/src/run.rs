@@ -2349,6 +2349,12 @@ fn live_adapter_review_enabled() -> bool {
 }
 
 fn live_adapter_review(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, String> {
+    if input.adapter_id == "pi" {
+        return Err(
+            "Pi is implementation-only in the Hermes-led workflow; review must use Hermes reviewer profiles"
+                .to_string(),
+        );
+    }
     let review_id = "review-live-adapter";
     let mut prompt = live_review_prompt(
         input.config,
@@ -4466,6 +4472,84 @@ mod tests {
 
         assert!(error.contains("Hermes review artifact failed validation"));
         assert!(error.contains("Hermes reviewer profile"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn pi_adapter_cannot_run_live_review_in_hermes_led_workflow() {
+        let root = unique_test_dir("pi-review-blocked");
+        let config = HepaFakeRunConfig {
+            repo_path: root.join("repo"),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let layout =
+            HepaArtifactLayout::new(&config.control_root, &config.archive_root).expect("layout");
+        let lane_paths = layout
+            .run(&config.run_id, &config.task_id)
+            .expect("run paths")
+            .lane(&config.lane_id)
+            .expect("lane paths");
+        let allocation = HepaWorktreeAllocation {
+            lane_id: config.lane_id.clone(),
+            branch: "hepa/lane-live".to_string(),
+            worktree_path: root.join("worktree"),
+            base_commit: "base".to_string(),
+            metadata_path: root.join("worktree/.hepa-worktree.json"),
+        };
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi Coding Agent".to_string(),
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: "unused".to_string(),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: Vec::new(),
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: false,
+            supports_json_output: true,
+            capabilities: Vec::new(),
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 1,
+            max_concurrency: 1,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        };
+        let environment = std::collections::BTreeMap::new();
+        let validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: Vec::new(),
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["Validation passed.".to_string()],
+        };
+        let changed_files = vec!["README.md".to_string()];
+        let error = live_adapter_review(LiveReviewInput {
+            config: &config,
+            adapter_id: "pi",
+            spec: &spec,
+            environment: &environment,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            changed_files: &changed_files,
+            validation: &validation,
+            diff_context: "diff --git a/README.md b/README.md",
+        })
+        .expect_err("Pi must not be allowed to run review");
+
+        assert!(error.contains("implementation-only"));
+        assert!(error.contains("Hermes reviewer profiles"));
 
         remove_test_dir(root);
     }

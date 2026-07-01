@@ -75,7 +75,8 @@ Hermes-led runs use bundled profiles as the engineering brain:
 The default coding path is Hermes manager/worker orchestration plus the Pi
 coding adapter. Pi performs code implementation only in this path; review is
 owned by Hermes reviewer profiles. HEPA validates each profile output before it
-changes authoritative state.
+changes authoritative state. Even when live adapter review mode is explicitly
+requested, HEPA rejects `pi` as the reviewer in this Hermes-led path.
 
 During the runtime transition, a Hermes worker can hand HEPA a finite run brief
 by setting `HEPA_HERMES_RUN_BRIEF_FILE` to a JSON `HepaHermesRunBrief` file.
