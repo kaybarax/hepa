@@ -32,6 +32,7 @@ worker-brief generation, review, arbitration, repair loops, and PR intent:
 | Hermes reviewer and review-manager arbitration runtime, with Pi limited to code implementation in the default path | Pi reviewer execution is blocked in Hermes-led adapter-review mode; reviewer/review-manager artifact hooks and command-runtime bridge tests passed |
 | Manager-authored PR intent wired into live PR creation, with HEPA validating and publishing safely | Intent-file and manager command-runtime bridge tests passed |
 | Three-round task/work/review cap with human-intervention terminal state | Worker brief cap, review-to-worker repair mediation, round-3 allowance, and round-4 human-intervention cap tests passed |
+| Headless/degraded fallback labels PR bodies as fallback evidence, not Hermes-authored project intent | Fallback PR body and Hermes intent separation tests passed |
 | Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Required |
 
 The Phase 11 privacy scan found only pre-existing placeholder examples and

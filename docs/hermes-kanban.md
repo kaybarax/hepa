@@ -167,8 +167,10 @@ hepa fleet reconcile
 If Hermes is unavailable, board sync degrades and catches up later rather than
 blocking local operation. Headless PR bodies are fallback evidence artifacts; a
 Hermes-present release run must use manager-authored PR intent for
-project-specific PR content. All board payloads, comments, and diagnostics pass
-the same redaction and privacy rules as run artifacts and PR bodies.
+project-specific PR content. HEPA labels deterministic fallback PR bodies with
+`## Fallback Evidence Artifact` so they cannot be mistaken for Hermes-authored
+project intent. All board payloads, comments, and diagnostics pass the same
+redaction and privacy rules as run artifacts and PR bodies.
 
 For desktop review during degraded Hermes access, package the local fleet state
 as a static dashboard snapshot:

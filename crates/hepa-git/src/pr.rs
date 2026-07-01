@@ -329,6 +329,16 @@ pub fn build_pr_body(input: &HepaPrBodyInput) -> String {
     let report = input.terminal_report;
     let mut lines = Vec::new();
 
+    lines.push("## Fallback Evidence Artifact".to_string());
+    lines.push(
+        "- This body is HEPA's deterministic headless/degraded fallback evidence artifact, not Hermes-authored project PR intent."
+            .to_string(),
+    );
+    lines.push(
+        "- In Hermes-present release runs, `hepa-manager` must author `HepaHermesPrIntent` for project-specific PR content."
+            .to_string(),
+    );
+    lines.push(String::new());
     lines.push("## Summary".to_string());
     lines.push(format!("- Status: {}", terminal_status_label(report)));
     lines.push(format!("- Task: {}", input.task_spec.goal));
@@ -796,6 +806,12 @@ mod tests {
         assert_eq!(request.head_branch, "hepa/manager/lane-1");
         assert!(request.body.contains("Adds the readiness badge"));
         assert!(request.body.contains("## HEPA audit"));
+        assert!(!request.body.contains("Fallback Evidence Artifact"));
+        assert!(
+            !request
+                .body
+                .contains("not Hermes-authored project PR intent")
+        );
         assert!(
             request
                 .body
@@ -963,6 +979,7 @@ mod tests {
         });
 
         for section in [
+            "## Fallback Evidence Artifact",
             "## Summary",
             "## Validation",
             "## Review",
@@ -975,6 +992,8 @@ mod tests {
         }
         // Honest reconstruction: failed validation, the real finding, declared
         // risk, adapters, manager passes, and the card link all appear.
+        assert!(body.contains("not Hermes-authored project PR intent"));
+        assert!(body.contains("HepaHermesPrIntent"));
         assert!(body.contains("Status: blocked"));
         assert!(body.contains("Result: failed"));
         assert!(body.contains("`cargo test` exited 101"));
