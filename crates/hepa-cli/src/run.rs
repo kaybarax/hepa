@@ -2149,6 +2149,22 @@ struct LiveReviewInput<'a> {
 }
 
 fn live_review_fanout(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, String> {
+    if let Some(artifact) = live_review_artifact_from_runtime(&input)? {
+        write_json(
+            &input
+                .lane_paths
+                .lane_dir
+                .join("review/hermes-review-artifact.json"),
+            &artifact,
+        )
+        .map_err(|error| error.to_string())?;
+        return live_review_outcome_from_signals(
+            input.config,
+            input.lane_paths,
+            artifact.signals,
+            "Hermes reviewer runtime policy",
+        );
+    }
     if let Some(artifact) = live_review_artifact(input.config)? {
         write_json(
             &input
@@ -2176,6 +2192,61 @@ fn live_review_fanout(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, S
         input.validation,
         input.diff_context,
     )
+}
+
+fn live_review_artifact_from_runtime(
+    input: &LiveReviewInput<'_>,
+) -> Result<Option<HepaHermesReviewArtifact>, String> {
+    let Ok(command) = std::env::var("HEPA_HERMES_REVIEWER_COMMAND") else {
+        return Ok(None);
+    };
+    live_review_artifact_from_runtime_command(&command, input).map(Some)
+}
+
+fn live_review_artifact_from_runtime_command(
+    command: &str,
+    input: &LiveReviewInput<'_>,
+) -> Result<HepaHermesReviewArtifact, String> {
+    let review_dir = input.lane_paths.lane_dir.join("review");
+    fs::create_dir_all(&review_dir).map_err(|error| error.to_string())?;
+    let context_path = review_dir.join("hermes-review-context.json");
+    let output_path = review_dir.join("hermes-review-artifact.runtime.json");
+    let stdout_path = review_dir.join("hermes-reviewer-runtime.stdout.log");
+    let stderr_path = review_dir.join("hermes-reviewer-runtime.stderr.log");
+    let context = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "profile_id": "hepa-reviewer",
+        "task_id": input.config.task_id,
+        "lane_id": input.config.lane_id,
+        "task_text": sanitized_task_text(input.config),
+        "changed_files": input.changed_files,
+        "validation": input.validation,
+        "diff_context": input.diff_context,
+        "artifact_output": output_path,
+    });
+    write_json(&context_path, &context).map_err(|error| error.to_string())?;
+    run_hermes_profile_runtime_command(HermesProfileRuntimeCommand {
+        command,
+        profile_id: "hepa-reviewer",
+        context_path: &context_path,
+        output_path: &output_path,
+        stdout_path: &stdout_path,
+        stderr_path: &stderr_path,
+    })?;
+    let artifact = hermes_review_artifact_from_file(&output_path)?;
+    if artifact.task_id != input.config.task_id {
+        return Err(format!(
+            "Hermes reviewer runtime artifact task_id mismatch: expected {} got {}",
+            input.config.task_id, artifact.task_id
+        ));
+    }
+    if artifact.lane_id != input.config.lane_id {
+        return Err(format!(
+            "Hermes reviewer runtime artifact lane_id mismatch: expected {} got {}",
+            input.config.lane_id, artifact.lane_id
+        ));
+    }
+    Ok(artifact)
 }
 
 fn live_review_artifact(
@@ -2215,7 +2286,13 @@ fn hermes_review_artifact_from_file(
 
 fn live_review_manager_artifact(
     config: &HepaFakeRunConfig,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    signals: &[HepaReviewSignal],
 ) -> Result<Option<HepaHermesReviewManagerArtifact>, String> {
+    if let Some(artifact) = live_review_manager_artifact_from_runtime(config, lane_paths, signals)?
+    {
+        return Ok(Some(artifact));
+    }
     let Ok(artifact_path) = std::env::var("HEPA_HERMES_REVIEW_MANAGER_ARTIFACT_FILE") else {
         return Ok(None);
     };
@@ -2233,6 +2310,115 @@ fn live_review_manager_artifact(
         ));
     }
     Ok(Some(artifact))
+}
+
+fn live_review_manager_artifact_from_runtime(
+    config: &HepaFakeRunConfig,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    signals: &[HepaReviewSignal],
+) -> Result<Option<HepaHermesReviewManagerArtifact>, String> {
+    let Ok(command) = std::env::var("HEPA_HERMES_REVIEW_MANAGER_COMMAND") else {
+        return Ok(None);
+    };
+    live_review_manager_artifact_from_runtime_command(&command, config, lane_paths, signals)
+        .map(Some)
+}
+
+fn live_review_manager_artifact_from_runtime_command(
+    command: &str,
+    config: &HepaFakeRunConfig,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    signals: &[HepaReviewSignal],
+) -> Result<HepaHermesReviewManagerArtifact, String> {
+    let review_dir = lane_paths.lane_dir.join("review");
+    fs::create_dir_all(&review_dir).map_err(|error| error.to_string())?;
+    let context_path = review_dir.join("hermes-review-manager-context.json");
+    let output_path = review_dir.join("hermes-review-manager-artifact.runtime.json");
+    let stdout_path = review_dir.join("hermes-review-manager-runtime.stdout.log");
+    let stderr_path = review_dir.join("hermes-review-manager-runtime.stderr.log");
+    let context = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "profile_id": "hepa-review-manager",
+        "task_id": config.task_id,
+        "lane_id": config.lane_id,
+        "signals": signals,
+        "artifact_output": output_path,
+    });
+    write_json(&context_path, &context).map_err(|error| error.to_string())?;
+    run_hermes_profile_runtime_command(HermesProfileRuntimeCommand {
+        command,
+        profile_id: "hepa-review-manager",
+        context_path: &context_path,
+        output_path: &output_path,
+        stdout_path: &stdout_path,
+        stderr_path: &stderr_path,
+    })?;
+    let artifact = hermes_review_manager_artifact_from_file(&output_path)?;
+    if artifact.task_id != config.task_id {
+        return Err(format!(
+            "Hermes review-manager runtime artifact task_id mismatch: expected {} got {}",
+            config.task_id, artifact.task_id
+        ));
+    }
+    if artifact.lane_id != config.lane_id {
+        return Err(format!(
+            "Hermes review-manager runtime artifact lane_id mismatch: expected {} got {}",
+            config.lane_id, artifact.lane_id
+        ));
+    }
+    Ok(artifact)
+}
+
+struct HermesProfileRuntimeCommand<'a> {
+    command: &'a str,
+    profile_id: &'a str,
+    context_path: &'a Path,
+    output_path: &'a Path,
+    stdout_path: &'a Path,
+    stderr_path: &'a Path,
+}
+
+fn run_hermes_profile_runtime_command(
+    input: HermesProfileRuntimeCommand<'_>,
+) -> Result<(), String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(input.command)
+        .env("HEPA_HERMES_PROFILE_ID", input.profile_id)
+        .env("HEPA_HERMES_CONTEXT_FILE", input.context_path)
+        .env("HEPA_HERMES_ARTIFACT_OUT", input.output_path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "Hermes {} runtime could not start: {error}",
+                input.profile_id
+            )
+        })?;
+    fs::write(
+        input.stdout_path,
+        redact_secrets(&String::from_utf8_lossy(&output.stdout)),
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        input.stderr_path,
+        redact_secrets(&String::from_utf8_lossy(&output.stderr)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Hermes {} runtime exited {}",
+            input.profile_id,
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    if !input.output_path.exists() {
+        return Err(format!(
+            "Hermes {} runtime did not write {}",
+            input.profile_id,
+            input.output_path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn hermes_review_manager_artifact_from_file(
@@ -2254,7 +2440,7 @@ fn live_review_outcome_from_signals(
     signals: Vec<HepaReviewSignal>,
     pass_policy_label: &str,
 ) -> Result<LiveReviewOutcome, String> {
-    let manager_artifact = live_review_manager_artifact(config)?;
+    let manager_artifact = live_review_manager_artifact(config, lane_paths, &signals)?;
     if let Some(artifact) = &manager_artifact {
         write_json(
             &lane_paths
@@ -4477,6 +4663,199 @@ mod tests {
     }
 
     #[test]
+    fn hermes_reviewer_runtime_command_builds_live_review_outcome() {
+        let root = unique_test_dir("hermes-reviewer-runtime");
+        let script = root.join("fake-hermes-reviewer");
+        write_executable(
+            &script,
+            r#"#!/usr/bin/env sh
+printf '%s\n' "reviewer runtime invoked"
+cat > "$HEPA_HERMES_ARTIFACT_OUT" <<'JSON'
+{
+  "schema_version": 1,
+  "task_id": "task-live",
+  "lane_id": "lane-live",
+  "author_profile_id": "hepa-reviewer",
+  "signals": [
+    {
+      "schema_version": 1,
+      "review_id": "review-runtime-1",
+      "lane_id": "lane-live",
+      "adapter_id": "hepa-reviewer:runtime-primary",
+      "status": "approved",
+      "findings": [],
+      "summary": ["Runtime reviewer approved the diff."],
+      "completed_at": "2026-06-16T00:00:06Z"
+    }
+  ],
+  "arbitration_required": false
+}
+JSON
+"#,
+        );
+        let config = runtime_review_config(&root);
+        let (lane_paths, allocation) = runtime_review_paths(&config);
+        let spec = dummy_pi_spec();
+        let environment = std::collections::BTreeMap::new();
+        let validation = passed_validation();
+        let changed_files = vec!["README.md".to_string()];
+
+        let input = LiveReviewInput {
+            config: &config,
+            adapter_id: "pi",
+            spec: &spec,
+            environment: &environment,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            changed_files: &changed_files,
+            validation: &validation,
+            diff_context: "diff --git a/README.md b/README.md",
+        };
+        let artifact =
+            live_review_artifact_from_runtime_command(&script.display().to_string(), &input)
+                .expect("Hermes reviewer runtime should produce artifact");
+        write_json(
+            &lane_paths
+                .lane_dir
+                .join("review/hermes-review-artifact.json"),
+            &artifact,
+        )
+        .expect("persist review artifact");
+        let outcome = live_review_outcome_from_signals(
+            &config,
+            &lane_paths,
+            artifact.signals,
+            "Hermes reviewer runtime policy",
+        )
+        .expect("Hermes reviewer runtime should produce review outcome");
+
+        assert!(outcome.staging_allowed);
+        assert_eq!(outcome.reviewer_passes, 1);
+        assert_eq!(
+            outcome.signals[0].adapter_id,
+            "hepa-reviewer:runtime-primary"
+        );
+        assert!(
+            fs::read_to_string(
+                lane_paths
+                    .lane_dir
+                    .join("review/hermes-reviewer-runtime.stdout.log")
+            )
+            .expect("reviewer runtime stdout")
+            .contains("reviewer runtime invoked")
+        );
+        assert!(
+            lane_paths
+                .lane_dir
+                .join("review/hermes-review-artifact.json")
+                .exists()
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_review_manager_runtime_command_sets_live_arbitration() {
+        let root = unique_test_dir("hermes-review-manager-runtime");
+        let script = root.join("fake-hermes-review-manager");
+        write_executable(
+            &script,
+            r#"#!/usr/bin/env sh
+printf '%s\n' "review-manager runtime invoked"
+cat > "$HEPA_HERMES_ARTIFACT_OUT" <<'JSON'
+{
+  "schema_version": 1,
+  "task_id": "task-live",
+  "lane_id": "lane-live",
+  "author_profile_id": "hepa-review-manager",
+  "arbitration": {
+    "schema_version": 1,
+    "status": "settled",
+    "records": [
+      {
+        "schema_version": 1,
+        "finding_id": "finding-runtime-1",
+        "disposition": "manager_rejected",
+        "rule_id": "manager-judgment",
+        "reason": "Runtime review-manager rejected the advisory.",
+        "severity_before": "medium",
+        "severity_after": "medium",
+        "accepted": false
+      }
+    ],
+    "pr_body_lines": ["- finding-runtime-1 rejected by review manager."],
+    "card_status": "arbitration=settled records=1 accepted=0"
+  }
+}
+JSON
+"#,
+        );
+        let config = runtime_review_config(&root);
+        let (lane_paths, _) = runtime_review_paths(&config);
+        let signal = HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: "review-runtime-1".to_string(),
+            lane_id: config.lane_id.clone(),
+            adapter_id: "hepa-reviewer:runtime-primary".to_string(),
+            status: HepaReviewStatus::Approved,
+            findings: vec![HepaReviewFinding {
+                finding_id: "finding-runtime-1".to_string(),
+                severity: HepaFindingSeverity::Medium,
+                category: "advisory".to_string(),
+                evidence: "Runtime reviewer advisory.".to_string(),
+                in_scope: true,
+                release_risk: false,
+                recommended_action: "Review-manager should arbitrate.".to_string(),
+                file_ref: None,
+                line: None,
+                message: "Advisory finding.".to_string(),
+                accepted: true,
+            }],
+            summary: vec!["Runtime reviewer requested arbitration.".to_string()],
+            completed_at: "2026-06-16T00:00:06Z".to_string(),
+        };
+
+        let artifact = live_review_manager_artifact_from_runtime_command(
+            &script.display().to_string(),
+            &config,
+            &lane_paths,
+            std::slice::from_ref(&signal),
+        )
+        .expect("Hermes review-manager runtime should produce artifact");
+        write_json(
+            &lane_paths
+                .lane_dir
+                .join("review/hermes-review-manager-artifact.json"),
+            &artifact,
+        )
+        .expect("persist review-manager artifact");
+        let outcome = live_review_outcome_from_signals_and_manager(
+            vec![signal],
+            Some(artifact.arbitration),
+            "Hermes reviewer runtime policy",
+        )
+        .expect("Hermes review-manager runtime should settle arbitration");
+
+        assert!(outcome.staging_allowed);
+        assert_eq!(outcome.arbitration.status, "settled");
+        assert_eq!(
+            outcome.arbitration.records[0].disposition,
+            "manager_rejected"
+        );
+        assert!(
+            fs::read_to_string(
+                lane_paths
+                    .lane_dir
+                    .join("review/hermes-review-manager-runtime.stdout.log")
+            )
+            .expect("review-manager runtime stdout")
+            .contains("review-manager runtime invoked")
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn pi_adapter_cannot_run_live_review_in_hermes_led_workflow() {
         let root = unique_test_dir("pi-review-blocked");
         let config = HepaFakeRunConfig {
@@ -5604,15 +5983,93 @@ mod tests {
         git(repo, ["commit", "-m", "initial"]);
     }
 
-    fn write_fake_pi_empty_output(path: &Path) {
-        fs::write(
-            path,
-            "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"agent_start\"}' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[]}]}'\n",
-        )
-        .expect("fake pi write");
+    fn runtime_review_config(root: &Path) -> HepaFakeRunConfig {
+        HepaFakeRunConfig {
+            repo_path: root.join("repo"),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        }
+    }
+
+    fn runtime_review_paths(
+        config: &HepaFakeRunConfig,
+    ) -> (
+        hepa_core::artifacts::HepaLaneArtifactPaths,
+        HepaWorktreeAllocation,
+    ) {
+        let layout =
+            HepaArtifactLayout::new(&config.control_root, &config.archive_root).expect("layout");
+        let lane_paths = layout
+            .run(&config.run_id, &config.task_id)
+            .expect("run paths")
+            .lane(&config.lane_id)
+            .expect("lane paths");
+        let allocation = HepaWorktreeAllocation {
+            lane_id: config.lane_id.clone(),
+            branch: "hepa/lane-live".to_string(),
+            worktree_path: config.worktree_root.join("lane-live"),
+            base_commit: "base".to_string(),
+            metadata_path: config.worktree_root.join("lane-live/.hepa-worktree.json"),
+        };
+        (lane_paths, allocation)
+    }
+
+    fn dummy_pi_spec() -> HepaAdapterSpec {
+        HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi Coding Agent".to_string(),
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: "unused".to_string(),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: Vec::new(),
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: false,
+            supports_json_output: true,
+            capabilities: Vec::new(),
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 1,
+            max_concurrency: 1,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        }
+    }
+
+    fn passed_validation() -> HepaValidationSummary {
+        HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Passed,
+            commands: Vec::new(),
+            no_tests_detected: false,
+            failure_type: None,
+            summary: vec!["Validation passed.".to_string()],
+        }
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("script dir");
+        }
+        fs::write(path, contents).expect("script write");
         let mut permissions = fs::metadata(path).expect("metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    fn write_fake_pi_empty_output(path: &Path) {
+        write_executable(
+            path,
+            "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"agent_start\"}' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[]}]}'\n",
+        );
     }
 
     fn git<const N: usize>(repo: &Path, args: [&str; N]) {

@@ -98,7 +98,11 @@ Hermes reviewer profiles can hand HEPA review output by setting
 The artifact must be authored by `hepa-reviewer` and contain one or more review
 signals labeled with Hermes reviewer profile IDs. HEPA then applies the same
 pass policy, finding aggregation, arbitration, and staging gates it uses for
-headless review fallback.
+headless review fallback. In Hermes-present runs,
+`HEPA_HERMES_REVIEWER_COMMAND` can point to the reviewer profile runtime; HEPA
+writes `review/hermes-review-context.json`, expects the command to write the
+artifact path in `HEPA_HERMES_ARTIFACT_OUT`, captures runtime stdout/stderr, and
+validates the artifact before advancing.
 
 When reviewer findings need manager judgment, the Hermes review manager can
 hand HEPA settled arbitration by setting
@@ -107,7 +111,10 @@ hand HEPA settled arbitration by setting
 `hepa-review-manager`, match the active task/lane, and settle findings as
 accepted, downgraded, or rejected; unresolved `manager_required` arbitration is
 rejected. HEPA persists the artifact into lane review artifacts and uses the
-settled arbitration for the staging gate.
+settled arbitration for the staging gate. `HEPA_HERMES_REVIEW_MANAGER_COMMAND`
+provides the matching runtime bridge for arbitration: HEPA writes
+`review/hermes-review-manager-context.json`, captures runtime stdout/stderr, and
+validates the settled arbitration artifact before using it.
 
 During the runtime transition, a Hermes manager can hand HEPA an intent artifact
 by setting `HEPA_HERMES_PR_INTENT_FILE` to a JSON `HepaHermesPrIntent` file.
