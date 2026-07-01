@@ -107,6 +107,17 @@ llama.cpp (`HEPA_HERMES_REQUIRED=true`, local model id redacted):
 | Pi + GPT-OSS 20B worker/reviewer via llama.cpp, ctx8192 | 2 | 2 | 2 succeeded / 0 failed | 74.82 s | 323.9 MiB | 23.5 MiB | ~12.0 GiB peak observed | PRs opened, then closed/cleaned |
 | Pi + GPT-OSS 20B worker via llama.cpp, ctx8192 / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 75.69 s | 321.9 MiB | 49.6 MiB | ~12.0 GiB peak observed | PRs opened, then closed/cleaned |
 
+Fresh post-DoD stress sample after Phase P/RS summary closure and the Pi
+profile-switching docs/test update (`HEPA_HERMES_REQUIRED=true`, temporary
+Hermes runtime-command profiles, validation repos redacted):
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | External model RSS | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| Pi + GPT-OSS 20B worker/reviewer via llama.cpp, ctx8192 | 2 | 2 | 2 succeeded / 0 failed | 45.94 s | 190.5 MiB | 21.6 MiB | ~12.4 GiB observed | PRs opened, then closed/cleaned |
+| Pi + DeepSeek worker/reviewer | 3 | 3 | 2 succeeded / 1 safe-blocked | 13.55 s | 193.2 MiB | 12.8 MiB | n/a | PRs opened for successful lanes, then closed/cleaned |
+| Pi + DeepSeek worker/reviewer monorepo rerun on non-secret docs file | 1 | 1 | 1 succeeded / 0 failed | 14.10 s | 190.4 MiB | 9.0 MiB | n/a | PR opened, then closed/cleaned |
+| Pi + GPT-OSS 20B worker via llama.cpp, ctx8192 / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 42.97 s | 187.8 MiB | 21.1 MiB | ~12.6 GiB observed | PRs opened, then closed/cleaned |
+
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
 operator waits while HEPA schedules, executes, validates, reviews, stages, opens
@@ -179,6 +190,15 @@ Interpretation:
   commands (`yarn install --frozen-lockfile`; `yarn build`; `git diff --check`).
   Validation PRs were closed, branches deleted, runtime dirs removed, and
   validation repos returned to clean main worktrees.
+- The fresh post-DoD stress sample reconfirmed the Hermes-required path after
+  release-summary closure. Local and hybrid GPT-OSS 20B llama.cpp runs completed
+  2/2 lanes in 45.94 s and 42.97 s respectively, with one worker adapter loop,
+  one manager pass, one Hermes reviewer pass, zero containers, manager-authored
+  PR intent, and cleaned validation PRs. The DeepSeek three-repo cloud sample
+  completed the frontend/docs lanes but safely blocked the monorepo README lane
+  when Pi streamed documented secret-shaped examples from that README; a
+  monorepo rerun against `docs/README.md` then completed in 14.10 s. That block
+  is release-relevant safety evidence, not an unclassified failure.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.
