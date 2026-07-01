@@ -179,7 +179,11 @@ impl HepaWorktreeAllocator {
 
     fn require_clean_tree(&self) -> Result<(), HepaWorktreeError> {
         let status = self.git_output(["status", "--porcelain=v1", "--untracked-files=all"])?;
-        if !status.is_empty() {
+        let dirty_user_status = status
+            .lines()
+            .filter(|line| !status_line_is_hepa_runtime(line))
+            .collect::<Vec<_>>();
+        if !dirty_user_status.is_empty() {
             return Err(HepaWorktreeError::new(
                 "repo_status",
                 "repository must be clean before lane launch",
@@ -187,6 +191,11 @@ impl HepaWorktreeAllocator {
         }
         Ok(())
     }
+}
+
+fn status_line_is_hepa_runtime(line: &str) -> bool {
+    let path = line.get(3..).unwrap_or(line).trim();
+    path == ".hepa" || path.starts_with(".hepa/")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,6 +509,25 @@ mod tests {
         );
         assert!(!worktrees.join("lane-a").exists());
 
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn allocate_lane_ignores_hepa_runtime_artifacts_in_source_tree() {
+        let root = unique_test_dir("hepa-runtime-clean");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        init_repo(&repo);
+        let runtime_dir = repo.join(".hepa/control/hermes-run-brief/run-1/lane-1");
+        fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        fs::write(runtime_dir.join("context.json"), "{}\n").expect("runtime artifact");
+        let allocator = HepaWorktreeAllocator::new(&repo, &worktrees);
+
+        let allocation = allocator
+            .allocate_lane("lane-a")
+            .expect("HEPA runtime artifacts should not dirty the source tree");
+
+        assert!(allocation.worktree_path.exists());
         remove_test_dir(root);
     }
 

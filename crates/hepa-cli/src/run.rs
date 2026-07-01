@@ -1336,7 +1336,34 @@ fn execute_live_worker_attempt(
     let changed_files = collect_changed_files(&allocation.worktree_path)?;
     if adapter_id == "pi" {
         match parse_pi_json_events(&result.stdout) {
-            Ok(parsed) => append_tool_summary_stream_event(lane_paths, round, &parsed)?,
+            Ok(parsed) => {
+                append_tool_summary_stream_event(lane_paths, round, &parsed)?;
+                if parsed.tool_activity.is_empty() && changed_files.is_empty() {
+                    let blocked_reason = "local_provider_no_tool_activity_or_changes: Pi completed without tool calls or changed files";
+                    let attempt = HepaAttemptReport {
+                        schema_version: CONTRACT_SCHEMA_VERSION,
+                        attempt_id: attempt_id.to_string(),
+                        lane_id: config.lane_id.clone(),
+                        task_id: config.task_id.clone(),
+                        round,
+                        role: HepaAgentRole::Worker,
+                        adapter_id: adapter_id.to_string(),
+                        status: hepa_core::contracts::HepaAttemptStatus::Blocked,
+                        commands_run: vec![result.command],
+                        changed_files,
+                        summary: live_attempt_summary(
+                            &allocation.worktree_path,
+                            &result.stdout,
+                            &result.stderr,
+                        ),
+                        blocked_reason: Some(blocked_reason.to_string()),
+                        started_at: started_at.to_string(),
+                        completed_at: Some(completed_at.to_string()),
+                    };
+                    write_attempt(lane_paths, &attempt)?;
+                    return Err(blocked_reason.to_string());
+                }
+            }
             Err(error) => {
                 let attempt = HepaAttemptReport {
                     schema_version: CONTRACT_SCHEMA_VERSION,
@@ -5811,6 +5838,97 @@ JSON
                 .exists()
         );
 
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn live_pi_noop_text_response_blocks_before_validation() {
+        let root = unique_test_dir("live-pi-noop-output");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let config = HepaFakeRunConfig {
+            repo_path: repo.clone(),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-noop".to_string(),
+            task_id: "task-noop".to_string(),
+            lane_id: "lane-noop".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let layout =
+            HepaArtifactLayout::new(&config.control_root, &config.archive_root).expect("layout");
+        let lane_paths = layout
+            .run(&config.run_id, &config.task_id)
+            .expect("run paths")
+            .lane(&config.lane_id)
+            .expect("lane paths");
+        fs::create_dir_all(&lane_paths.lane_dir).expect("lane dir");
+        let allocator = HepaWorktreeAllocator::new(&config.repo_path, &config.worktree_root);
+        let allocation = allocator
+            .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
+            .expect("allocation");
+        let fake_pi = root.join("pi-noop");
+        write_executable(
+            &fake_pi,
+            "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\n' '{\"type\":\"agent_start\"}' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I will update README.md.\"}]}]}'\n",
+        );
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi Coding Agent".to_string(),
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: format!("{} --mode json", fake_pi.display()),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: vec![fake_pi.to_string_lossy().to_string()],
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec!["local-only".to_string()],
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 1,
+            max_concurrency: 1,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        };
+
+        let result = execute_live_worker_attempt(ExecuteLiveAttemptInput {
+            config: &config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            spec,
+            adapter_id: "pi",
+            environment: std::collections::BTreeMap::new(),
+            attempt_id: "attempt-1",
+            round: 1,
+            prompt: "fixture prompt".to_string(),
+            started_at: "2026-06-16T00:00:02Z",
+            completed_at: "2026-06-16T00:00:03Z",
+        });
+        let error = match result {
+            Ok(_) => panic!("no-op Pi response must block"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("local_provider_no_tool_activity_or_changes"));
+        let attempt_json = fs::read_to_string(
+            lane_paths
+                .attempt("attempt-1")
+                .expect("attempt paths")
+                .attempt_dir
+                .join("attempt.json"),
+        )
+        .expect("attempt report");
+        assert!(attempt_json.contains("\"status\": \"blocked\""));
+        assert!(attempt_json.contains("local_provider_no_tool_activity_or_changes"));
+
+        allocator
+            .cleanup_lane(&config.lane_id, "2026-06-16T00:00:09Z")
+            .expect("cleanup");
         remove_test_dir(root);
     }
 

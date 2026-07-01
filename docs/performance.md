@@ -90,6 +90,15 @@ lane IDs:
 | Pi + Devstral worker/reviewer via llama.cpp, ctx16384 | 2 | 2 | 2 succeeded / 0 failed | 207.11 s | 462.1 MiB | 19.6 MiB | ~18.6 GiB stable observed | PRs opened, then closed/cleaned |
 | Pi + Devstral worker via llama.cpp, ctx16384 / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 175.48 s | 461.8 MiB | 19.5 MiB | ~17.4-20.0 GiB stable observed | PRs opened, then closed/cleaned |
 
+Fresh Hermes-present runtime-command rerun after the bundled profile bridges
+were wired into worker brief, review, review-manager arbitration, and manager
+PR intent:
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | External model RSS | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| Pi + Devstral 24B via Apple MLX loopback worker/reviewer | 2 | 2 | 0 succeeded / 2 blocked | 24.93 s | 234.1 MiB | 2.7 MiB | ~6.6 GiB stable observed | no PRs opened; worktrees cleaned |
+| Pi + Devstral 24B via Apple MLX loopback worker / DeepSeek reviewer configured | 2 | 2 | 0 succeeded / 2 blocked | 24.80 s | 234.2 MiB | 2.7 MiB | ~6.6 GiB stable observed | no PRs opened; worktrees cleaned |
+
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
 operator waits while HEPA schedules, executes, validates, reviews, stages, opens
@@ -141,6 +150,16 @@ Interpretation:
   Devstral-worker/DeepSeek-reviewer completed the same lanes in 175.48 s with
   role-scoped credential filtering and unique lane branches. Validation PRs were
   opened only by the manager, then closed and cleaned as validation evidence.
+- The fresh Hermes runtime-command rerun after the profile bridges landed did
+  not clear the release blocker for the Apple MLX local route. HEPA invoked the
+  Hermes worker bridge before Pi, then the local Pi worker completed with a
+  final text message but no tool events and no changed files in both validation
+  lanes. HEPA now terminalizes that case before validation/review/PR creation as
+  `local_provider_no_tool_activity_or_changes: Pi completed without tool calls
+  or changed files`. The same worker-leg blocker appears in the hybrid
+  configuration before the DeepSeek reviewer leg can matter. During this rerun
+  HEPA also fixed an ordering bug where its own `.hepa/` runtime artifacts could
+  make an otherwise clean source repo fail lane allocation.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.
