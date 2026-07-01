@@ -77,7 +77,9 @@ hepa doctor
 hepa adapter install pi
 export HEPA_DEFAULT_ADAPTER=pi
 export HEPA_PI_MODEL=deepseek/deepseek-chat
+export HEPA_PI_REVIEW_MODEL=
 export DEEPSEEK_API_KEY=...
+export HEPA_PI_BASE_URL=
 hepa run /path/to/repo "Fix login redirect" --agent pi
 ```
 
@@ -94,6 +96,10 @@ export HEPA_PI_MODEL=local/mlx-community/<model>
 export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:52415/v1
 ```
+
+When switching a working tree from a local Pi profile back to DeepSeek/cloud,
+clear stale local overrides such as `HEPA_PI_REVIEW_MODEL` and
+`HEPA_PI_BASE_URL`; empty values intentionally override `.env` entries.
 
 llama.cpp, Ollama, and vLLM-style loopback routes are also supported. Local Pi
 routes derive `cost_class=local`, so they satisfy `local-only` routing policy.

@@ -569,6 +569,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_environment_values_clear_stale_local_pi_dotenv_settings() {
+        let dotenv = r#"
+            HEPA_DEFAULT_ADAPTER=pi
+            HEPA_PI_MODEL=local/mlx-community/qwen
+            HEPA_PI_REVIEW_MODEL=local/mlx-community/qwen
+            HEPA_PI_PROVIDER_KEY_ENV=
+            HEPA_PI_BASE_URL=http://127.0.0.1:52415/v1
+        "#;
+        let environment = BTreeMap::from([
+            (
+                "HEPA_PI_MODEL".to_string(),
+                "deepseek/deepseek-chat".to_string(),
+            ),
+            ("HEPA_PI_REVIEW_MODEL".to_string(), String::new()),
+            (
+                "HEPA_PI_PROVIDER_KEY_ENV".to_string(),
+                "DEEPSEEK_API_KEY".to_string(),
+            ),
+            ("HEPA_PI_BASE_URL".to_string(), String::new()),
+        ]);
+
+        let config = HepaConfig::load(Some(dotenv), &environment, HepaConfigOverrides::default())
+            .expect("cloud profile should clear local-only dotenv fields");
+
+        assert_eq!(config.pi.model, "deepseek/deepseek-chat");
+        assert_eq!(config.pi.review_model, None);
+        assert_eq!(
+            config.pi.provider_key_env.as_deref(),
+            Some("DEEPSEEK_API_KEY")
+        );
+        assert_eq!(config.pi.base_url, None);
+    }
+
+    #[test]
     fn invalid_config_values_fail_with_clear_fields() {
         let environment =
             BTreeMap::from([("HEPA_MAX_TOTAL_ROUNDS".to_string(), "none".to_string())]);

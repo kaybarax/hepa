@@ -74,9 +74,15 @@ DeepSeek cloud:
 ```bash
 export HEPA_DEFAULT_ADAPTER=pi
 export HEPA_PI_MODEL=deepseek/deepseek-chat
+export HEPA_PI_REVIEW_MODEL=
 export HEPA_PI_PROVIDER_KEY_ENV=DEEPSEEK_API_KEY
+export HEPA_PI_BASE_URL=
 export DEEPSEEK_API_KEY=...
 ```
+
+Empty Pi environment values deliberately clear optional `.env` settings. Use
+that when switching from a loopback local profile back to a cloud profile so
+`hepa adapter doctor` does not keep requiring the stale local base URL.
 
 exo + Apple MLX local:
 
