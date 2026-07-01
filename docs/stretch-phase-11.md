@@ -4,8 +4,8 @@ Phase 11 features are now required release hardening work that stay behind
 HEPA's existing contracts, safety gates, and CLI/headless fallback. The original
 Phase 11 items below have focused test coverage plus benchmark or runtime
 evidence recorded in their implementation commits. The Hermes-led orchestration
-refinement is newly release-blocking and remains in progress until the runtime
-routes live Hermes-present runs through the bundled profiles.
+refinement is newly release-blocking and is preserved by runtime-command
+validation through the bundled profiles.
 
 | Stretch item | Evidence |
 | --- | --- |
@@ -34,7 +34,7 @@ worker-brief generation, review, arbitration, repair loops, and PR intent:
 | Explicit Hermes-required mode for release validation | `HEPA_HERMES_REQUIRED=true` blocks headless fallback when worker brief, reviewer artifact, review-manager arbitration for findings, or manager PR intent sources are missing; focused CLI tests passed |
 | Three-round task/work/review cap with human-intervention terminal state | Worker brief cap, review-to-worker repair mediation, round-3 allowance, and round-4 human-intervention cap tests passed |
 | Headless/degraded fallback labels PR bodies as fallback evidence, not Hermes-authored project intent | Fallback PR body and Hermes intent separation tests passed |
-| Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Blocked: Apple MLX local worker completed without tool calls or changed files; deterministic `local_provider_no_tool_activity_or_changes` evidence recorded in performance docs |
+| Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Passed with `HEPA_HERMES_REQUIRED=true`: GPT-OSS 20B via llama.cpp completed the pure-local app/docs lanes 2/2 in 74.82 s and the hybrid local-worker / DeepSeek-reviewer lanes 2/2 in 75.69 s; validation PRs were opened, then closed and cleaned |
 
 The Phase 11 privacy scan found only pre-existing placeholder examples and
 redaction fixtures.
@@ -47,9 +47,11 @@ make Hermes-present orchestration release-blocking: when Hermes is available,
 release validation must prove that PR bodies come from manager-authored
 project-specific intent, not from HEPA's generic fallback evidence template.
 
-The final Phase 11 gate run passed `cargo fmt --check`, `cargo test`,
+The original Phase 11 gate run passed `cargo fmt --check`, `cargo test`,
 `cargo clippy --all-targets --all-features -- -D warnings`, runtime checks for
 `hepa timing trends <archive-root>` and
 `hepa fleet dashboard --output <dashboard-html> --control-root <control-root>`,
 and the repository privacy scan for the original Phase 11 items. The
-Hermes-led refinement requires its own fresh verification before v1.0.0 release.
+Hermes-led refinement now has fresh local/hybrid runtime-command evidence; final
+release still requires the normal repository checks and privacy scan after any
+later edits.

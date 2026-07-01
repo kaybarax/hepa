@@ -99,6 +99,14 @@ PR intent:
 | Pi + Devstral 24B via Apple MLX loopback worker/reviewer | 2 | 2 | 0 succeeded / 2 blocked | 24.93 s | 234.1 MiB | 2.7 MiB | ~6.6 GiB stable observed | no PRs opened; worktrees cleaned |
 | Pi + Devstral 24B via Apple MLX loopback worker / DeepSeek reviewer configured | 2 | 2 | 0 succeeded / 2 blocked | 24.80 s | 234.2 MiB | 2.7 MiB | ~6.6 GiB stable observed | no PRs opened; worktrees cleaned |
 
+Final Hermes-required runtime-command reruns with GPT-OSS 20B served by
+llama.cpp (`HEPA_HERMES_REQUIRED=true`, local model id redacted):
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | External model RSS | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| Pi + GPT-OSS 20B worker/reviewer via llama.cpp, ctx8192 | 2 | 2 | 2 succeeded / 0 failed | 74.82 s | 323.9 MiB | 23.5 MiB | ~12.0 GiB peak observed | PRs opened, then closed/cleaned |
+| Pi + GPT-OSS 20B worker via llama.cpp, ctx8192 / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 75.69 s | 321.9 MiB | 49.6 MiB | ~12.0 GiB peak observed | PRs opened, then closed/cleaned |
+
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
 operator waits while HEPA schedules, executes, validates, reviews, stages, opens
@@ -160,6 +168,17 @@ Interpretation:
   configuration before the DeepSeek reviewer leg can matter. During this rerun
   HEPA also fixed an ordering bug where its own `.hepa/` runtime artifacts could
   make an otherwise clean source repo fail lane allocation.
+- The final Hermes-required GPT-OSS 20B llama.cpp reruns cleared the
+  release-blocking local/hybrid validation item for the approved app-starter and
+  docs lanes. Pure-local completed 2/2 jobs in 74.82 s and hybrid local-worker /
+  DeepSeek-reviewer completed 2/2 jobs in 75.69 s. Both runs used Hermes worker
+  briefs, Hermes reviewer artifacts, review-manager arbitration, and
+  manager-authored PR intent before manager-owned staging and PR creation.
+  Per-lane timing recorded one worker adapter loop, one manager pass, one
+  reviewer pass, zero containers, host-worktree posture, and passed validation
+  commands (`yarn install --frozen-lockfile`; `yarn build`; `git diff --check`).
+  Validation PRs were closed, branches deleted, runtime dirs removed, and
+  validation repos returned to clean main worktrees.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.
