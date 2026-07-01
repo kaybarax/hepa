@@ -85,7 +85,11 @@ acceptance criteria, and cap the task at one to three rounds. HEPA persists the
 consumed brief into the lane artifacts before invoking the coding adapter. HEPA
 honors that cap during repair: if the next repair would exceed the brief's total
 round budget, HEPA records a repair-budget artifact and blocks the lane for
-human manager attention before launching another worker attempt.
+human manager attention before launching another worker attempt. Review-blocked
+findings follow the same loop: accepted Hermes reviewer findings are converted
+into worker repair evidence, the worker reruns only while the one-to-three round
+budget allows it, and a fourth task/work/review attempt is terminalized as
+`ready_for_human`.
 
 When review passes, the manager profile writes PR intent: title, body, audit
 summary, and human-review requirement. HEPA validates that the intent came from

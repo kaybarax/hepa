@@ -518,6 +518,8 @@ pub fn run_live_task(
             environment: environment.clone(),
             prior_prompt: prompt.clone(),
             failed_validation: validation.clone(),
+            review_findings: Vec::new(),
+            repair_round: 2,
             first_changed_files: attempt_outcome.changed_files.clone(),
         }) {
             Ok(result) => result,
@@ -630,7 +632,7 @@ pub fn run_live_task(
     )?;
     let review_started = Instant::now();
     let diff_context = collect_live_diff(&allocation.worktree_path)?;
-    let review_outcome = match live_review_fanout(LiveReviewInput {
+    let mut review_outcome = match live_review_fanout(LiveReviewInput {
         config,
         adapter_id,
         spec: &spec,
@@ -675,7 +677,7 @@ pub fn run_live_task(
             });
         }
     };
-    let review_duration_seconds = review_started.elapsed().as_secs_f64();
+    let mut review_duration_seconds = review_started.elapsed().as_secs_f64();
     for signal in &review_outcome.signals {
         write_json(
             &lane_paths
@@ -690,13 +692,167 @@ pub fn run_live_task(
         &review_outcome.arbitration,
     )
     .map_err(|error| error.to_string())?;
+    while !review_outcome.staging_allowed
+        && lane.attempt_count < task_spec.max_total_rounds.clamp(1, 3)
+    {
+        let repair_round = lane.attempt_count + 1;
+        transition_and_record(
+            &lane_paths,
+            &mut lane,
+            7,
+            HepaLaneState::Repairing,
+            "live review findings routed to worker repair",
+            "2026-06-16T00:00:07Z",
+        )?;
+        let repair_started = Instant::now();
+        let repair_result = match run_live_repair_round(RunLiveRepairInput {
+            config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            task_spec: &task_spec,
+            spec: spec.clone(),
+            adapter_id,
+            environment: environment.clone(),
+            prior_prompt: prompt.clone(),
+            failed_validation: validation.clone(),
+            review_findings: repair_findings_from_review_signals(&review_outcome.signals),
+            repair_round,
+            first_changed_files: attempt_outcome.changed_files.clone(),
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                transition_and_record(
+                    &lane_paths,
+                    &mut lane,
+                    8,
+                    HepaLaneState::ReadyForHuman,
+                    "live repair budget exhausted",
+                    "2026-06-16T00:00:08Z",
+                )?;
+                return finish_blocked_live_run(FinishBlockedInput {
+                    config,
+                    task,
+                    run_paths: &run_paths,
+                    lane_paths: &lane_paths,
+                    allocator: &allocator,
+                    lane: &mut lane,
+                    validation,
+                    review_signals: review_outcome.signals,
+                    arbitration: Some(review_outcome.arbitration),
+                    timing: live_timing_record(LiveTimingInput {
+                        config,
+                        adapter_id,
+                        worker_duration_seconds: attempt_outcome.duration_seconds,
+                        validation_duration_seconds,
+                        review_duration_seconds,
+                        reviewer_passes: review_outcome.reviewer_passes,
+                        terminal_phase: LivePipelinePhase::ReviewFailed,
+                        repair_timing,
+                    }),
+                    reason: format!(
+                        "Live review repair cannot continue without human manager intervention: {error}"
+                    ),
+                });
+            }
+        };
+        let repair_duration_seconds = repair_started.elapsed().as_secs_f64();
+        repair_timing = Some(LiveRepairTiming {
+            brief_duration_seconds: repair_duration_seconds,
+            worker_duration_seconds: repair_result.worker_duration_seconds,
+            validation_duration_seconds: repair_result.validation_duration_seconds,
+            completed: repair_result.validation.status == HepaValidationStatus::Passed,
+        });
+        validation = repair_result.validation;
+        attempt_outcome.duration_seconds += repair_result.worker_duration_seconds;
+        attempt_outcome.changed_files = repair_result.changed_files;
+        usage_entries.extend(repair_result.usage_entries.clone());
+        write_lane_cost_report_if_present(config, &lane_paths, &usage_entries)?;
+        lane.attempt_count = repair_round;
+        write_json(&lane_paths.validation_summary, &validation)
+            .map_err(|error| error.to_string())?;
+        if validation.status != HepaValidationStatus::Passed {
+            continue;
+        }
+        transition_and_record(
+            &lane_paths,
+            &mut lane,
+            8,
+            HepaLaneState::Reviewing,
+            "live review repair validation passed",
+            "2026-06-16T00:00:08Z",
+        )?;
+        let retry_review_started = Instant::now();
+        let retry_diff_context = collect_live_diff(&allocation.worktree_path)?;
+        review_outcome = match live_review_fanout(LiveReviewInput {
+            config,
+            adapter_id,
+            spec: &spec,
+            environment: &environment,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            changed_files: &attempt_outcome.changed_files,
+            validation: &validation,
+            diff_context: &retry_diff_context,
+        }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                transition_and_record(
+                    &lane_paths,
+                    &mut lane,
+                    9,
+                    HepaLaneState::ReadyForHuman,
+                    "live review retry failed",
+                    "2026-06-16T00:00:09Z",
+                )?;
+                return finish_blocked_live_run(FinishBlockedInput {
+                    config,
+                    task,
+                    run_paths: &run_paths,
+                    lane_paths: &lane_paths,
+                    allocator: &allocator,
+                    lane: &mut lane,
+                    validation,
+                    review_signals: Vec::new(),
+                    arbitration: None,
+                    timing: live_timing_record(LiveTimingInput {
+                        config,
+                        adapter_id,
+                        worker_duration_seconds: attempt_outcome.duration_seconds,
+                        validation_duration_seconds,
+                        review_duration_seconds,
+                        reviewer_passes: 0,
+                        terminal_phase: LivePipelinePhase::ReviewFailed,
+                        repair_timing,
+                    }),
+                    reason: format!(
+                        "Live review retry failed after worker repair; human manager intervention required: {error}"
+                    ),
+                });
+            }
+        };
+        review_duration_seconds += retry_review_started.elapsed().as_secs_f64();
+        for signal in &review_outcome.signals {
+            write_json(
+                &lane_paths
+                    .review_signal(&signal.review_id)
+                    .map_err(|error| error.to_string())?,
+                signal,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        write_json(
+            &lane_paths.lane_dir.join("review/arbitration.json"),
+            &review_outcome.arbitration,
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if !review_outcome.staging_allowed {
         transition_and_record(
             &lane_paths,
             &mut lane,
             7,
-            HepaLaneState::Blocked,
-            "live review fanout blocked",
+            HepaLaneState::ReadyForHuman,
+            "live review repair budget exhausted",
             "2026-06-16T00:00:07Z",
         )?;
         return finish_blocked_live_run(FinishBlockedInput {
@@ -720,7 +876,7 @@ pub fn run_live_task(
                 repair_timing,
             }),
             reason: format!(
-                "Live review fanout blocked the lane; staging and PR were not attempted: {}",
+                "Live review fanout exhausted the bounded task/work/review rounds; human manager intervention is required before staging/PR: {}",
                 review_outcome.blockers.join("; ")
             ),
         });
@@ -1349,6 +1505,8 @@ struct RunLiveRepairInput<'a> {
     environment: std::collections::BTreeMap<String, String>,
     prior_prompt: String,
     failed_validation: HepaValidationSummary,
+    review_findings: Vec<HepaReviewFinding>,
+    repair_round: u32,
     first_changed_files: Vec<String>,
 }
 
@@ -1400,6 +1558,8 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         environment,
         prior_prompt,
         failed_validation,
+        review_findings,
+        repair_round,
         first_changed_files,
     } = input;
     let max_total_attempts = task_spec.max_total_rounds.clamp(1, 3);
@@ -1407,19 +1567,19 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         max_repair_rounds: max_total_attempts.saturating_sub(1).max(1),
         max_total_attempts,
     };
-    let repair_round = 2;
+    let repair_index = repair_round.saturating_sub(1).max(1);
     let decision = enforce_repair_round_budget(
         policy.clone(),
         HepaRepairRoundState {
-            next_repair_round: repair_round,
-            total_attempts_after_next: 2,
+            next_repair_round: repair_index,
+            total_attempts_after_next: repair_round,
         },
     )
     .map_err(|error| format!("repair budget invalid: {}: {}", error.field, error.message))?;
     let repair_dir = lane_paths.lane_dir.join("repair");
     fs::create_dir_all(&repair_dir).map_err(|error| error.to_string())?;
     write_json(
-        &repair_dir.join("round-2-budget.json"),
+        &repair_dir.join(format!("round-{repair_round}-budget.json")),
         &LiveRepairBudgetArtifact {
             schema_version: CONTRACT_SCHEMA_VERSION,
             lane_id: config.lane_id.clone(),
@@ -1433,7 +1593,7 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
     .map_err(|error| error.to_string())?;
     if !decision.allowed {
         return Err(format!(
-            "repair budget blocked round 2: {}",
+            "repair budget blocked round {repair_round}: {}",
             decision.reason
         ));
     }
@@ -1445,24 +1605,27 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         .cloned()
         .collect::<Vec<_>>();
     let diff_state = collect_live_diff(&allocation.worktree_path)?;
-    let review_findings = memory_failure_context(&config.control_root, &task_spec.project_id)
-        .into_iter()
-        .enumerate()
-        .map(|(index, evidence)| HepaReviewFinding {
-            finding_id: format!("memory-failure-pattern-{}", index + 1),
-            severity: HepaFindingSeverity::Low,
-            category: "memory-failure-context".to_string(),
-            evidence,
-            in_scope: true,
-            release_risk: false,
-            recommended_action: "Consult this prior failure pattern while preparing the repair."
-                .to_string(),
-            file_ref: None,
-            line: None,
-            message: "Prior HEPA memory failure pattern for this project.".to_string(),
-            accepted: true,
-        })
-        .collect::<Vec<_>>();
+    let mut review_findings = review_findings;
+    review_findings.extend(
+        memory_failure_context(&config.control_root, &task_spec.project_id)
+            .into_iter()
+            .enumerate()
+            .map(|(index, evidence)| HepaReviewFinding {
+                finding_id: format!("memory-failure-pattern-{}", index + 1),
+                severity: HepaFindingSeverity::Low,
+                category: "memory-failure-context".to_string(),
+                evidence,
+                in_scope: true,
+                release_risk: false,
+                recommended_action:
+                    "Consult this prior failure pattern while preparing the repair.".to_string(),
+                file_ref: None,
+                line: None,
+                message: "Prior HEPA memory failure pattern for this project.".to_string(),
+                accepted: true,
+            })
+            .collect::<Vec<_>>(),
+    );
     let brief = rewrite_repair_prompt_from_evidence(HepaRepairBriefInput {
         lane_id: config.lane_id.clone(),
         repair_round,
@@ -1474,7 +1637,7 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
     })
     .map_err(|error| format!("repair brief invalid: {}: {}", error.field, error.message))?;
     write_json(
-        &repair_dir.join("round-2-brief.json"),
+        &repair_dir.join(format!("round-{repair_round}-brief.json")),
         &LiveRepairBriefArtifact {
             schema_version: CONTRACT_SCHEMA_VERSION,
             lane_id: brief.lane_id.clone(),
@@ -1498,8 +1661,12 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         )
         .map_err(|error| error.to_string())?,
     );
-    fs::write(repair_dir.join("round-2-prompt.md"), &repair_prompt)
-        .map_err(|error| error.to_string())?;
+    fs::write(
+        repair_dir.join(format!("round-{repair_round}-prompt.md")),
+        &repair_prompt,
+    )
+    .map_err(|error| error.to_string())?;
+    let attempt_id = format!("attempt-{repair_round}");
     let attempt = execute_live_worker_attempt(ExecuteLiveAttemptInput {
         config,
         lane_paths,
@@ -1507,7 +1674,7 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
         spec,
         adapter_id,
         environment,
-        attempt_id: "attempt-2",
+        attempt_id: &attempt_id,
         round: repair_round,
         prompt: repair_prompt,
         started_at: "2026-06-16T00:00:04Z",
@@ -1516,8 +1683,11 @@ fn run_live_repair_round(input: RunLiveRepairInput<'_>) -> Result<LiveRepairOutc
     let validation_started = Instant::now();
     let validation = run_live_validation(&allocation.worktree_path, task_spec);
     let validation_duration_seconds = validation_started.elapsed().as_secs_f64();
-    write_json(&repair_dir.join("round-2-validation.json"), &validation)
-        .map_err(|error| error.to_string())?;
+    write_json(
+        &repair_dir.join(format!("round-{repair_round}-validation.json")),
+        &validation,
+    )
+    .map_err(|error| error.to_string())?;
     append_validation_stream_event(lane_paths, repair_round, &validation)?;
     Ok(LiveRepairOutcome {
         worker_duration_seconds: attempt.duration_seconds,
@@ -3101,6 +3271,15 @@ fn validation_summary_name(validation: &HepaValidationSummary) -> String {
         HepaValidationStatus::NoTestsDetected => "no_tests_detected",
     }
     .to_string()
+}
+
+fn repair_findings_from_review_signals(signals: &[HepaReviewSignal]) -> Vec<HepaReviewFinding> {
+    signals
+        .iter()
+        .flat_map(|signal| signal.findings.iter())
+        .filter(|finding| finding.accepted)
+        .cloned()
+        .collect()
 }
 
 fn format_arbitration_error(error: hepa_review::arbitration::HepaArbitrationError) -> String {
@@ -5425,6 +5604,8 @@ JSON
             environment: std::collections::BTreeMap::new(),
             prior_prompt: "Update README.md".to_string(),
             failed_validation,
+            review_findings: Vec::new(),
+            repair_round: 2,
             first_changed_files: vec!["README.md".to_string()],
         })
         .expect_err("one-round budget should block repair before worker launch");
@@ -5438,6 +5619,159 @@ JSON
             !lane_paths
                 .lane_dir
                 .join("repair/round-2-prompt.md")
+                .exists()
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn live_repair_allows_third_total_round_before_human_cap() {
+        let root = unique_test_dir("repair-budget-third-round");
+        let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
+            .expect("artifact layout");
+        let run_paths = layout
+            .run("run-live", "task-live")
+            .expect("run artifact paths");
+        let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
+        let config = HepaFakeRunConfig {
+            repo_path: root.join("repo"),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-live".to_string(),
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let mut task_spec = live_task_spec(&config);
+        task_spec.max_total_rounds = 3;
+        let allocation = HepaWorktreeAllocation {
+            lane_id: "lane-live".to_string(),
+            branch: "hepa/lane-live".to_string(),
+            worktree_path: root.join("worktree"),
+            base_commit: "base".to_string(),
+            metadata_path: root.join("worktree/.hepa-worktree.json"),
+        };
+        init_repo(&allocation.worktree_path);
+        let spec = dummy_pi_spec();
+        let failed_validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Failed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 1,
+                duration_ms: 10,
+            }],
+            no_tests_detected: false,
+            failure_type: Some("validation_failed".to_string()),
+            summary: vec!["`git diff --check` exited 1.".to_string()],
+        };
+
+        let error = run_live_repair_round(RunLiveRepairInput {
+            config: &config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            task_spec: &task_spec,
+            spec,
+            adapter_id: "pi",
+            environment: std::collections::BTreeMap::new(),
+            prior_prompt: "Update README.md".to_string(),
+            failed_validation,
+            review_findings: vec![HepaReviewFinding {
+                finding_id: "finding-review-1".to_string(),
+                severity: HepaFindingSeverity::High,
+                category: "correctness".to_string(),
+                evidence: "Reviewer found the acceptance criterion still unmet.".to_string(),
+                in_scope: true,
+                release_risk: true,
+                recommended_action: "Repair the implementation and rerun validation.".to_string(),
+                file_ref: Some("README.md".to_string()),
+                line: None,
+                message: "Review requires a worker repair.".to_string(),
+                accepted: true,
+            }],
+            repair_round: 3,
+            first_changed_files: vec!["README.md".to_string()],
+        })
+        .expect_err("dummy adapter should fail after budget allows round 3");
+
+        assert!(!error.contains("repair budget blocked"));
+        let budget = fs::read_to_string(lane_paths.lane_dir.join("repair/round-3-budget.json"))
+            .expect("round 3 budget artifact");
+        assert!(budget.contains("\"max_total_attempts\": 3"));
+        assert!(budget.contains("\"allowed\": true"));
+        let brief = fs::read_to_string(lane_paths.lane_dir.join("repair/round-3-brief.json"))
+            .expect("round 3 brief artifact");
+        assert!(brief.contains("finding-review-1"));
+        assert!(
+            lane_paths
+                .lane_dir
+                .join("repair/round-3-prompt.md")
+                .exists()
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn live_repair_blocks_fourth_round_for_human_intervention() {
+        let root = unique_test_dir("repair-budget-fourth-round");
+        let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
+            .expect("artifact layout");
+        let run_paths = layout
+            .run("run-live", "task-live")
+            .expect("run artifact paths");
+        let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
+        let config = runtime_review_config(&root);
+        let mut task_spec = live_task_spec(&config);
+        task_spec.max_total_rounds = 3;
+        let allocation = HepaWorktreeAllocation {
+            lane_id: "lane-live".to_string(),
+            branch: "hepa/lane-live".to_string(),
+            worktree_path: root.join("worktree"),
+            base_commit: "base".to_string(),
+            metadata_path: root.join("worktree/.hepa-worktree.json"),
+        };
+        let failed_validation = HepaValidationSummary {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            status: HepaValidationStatus::Failed,
+            commands: vec![HepaValidationCommandResult {
+                command: "git diff --check".to_string(),
+                exit_code: 1,
+                duration_ms: 10,
+            }],
+            no_tests_detected: false,
+            failure_type: Some("validation_failed".to_string()),
+            summary: vec!["`git diff --check` exited 1.".to_string()],
+        };
+
+        let error = run_live_repair_round(RunLiveRepairInput {
+            config: &config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            task_spec: &task_spec,
+            spec: dummy_pi_spec(),
+            adapter_id: "pi",
+            environment: std::collections::BTreeMap::new(),
+            prior_prompt: "Update README.md".to_string(),
+            failed_validation,
+            review_findings: Vec::new(),
+            repair_round: 4,
+            first_changed_files: vec!["README.md".to_string()],
+        })
+        .expect_err("fourth total round should block before worker launch");
+
+        assert!(error.contains("repair budget blocked round 4"));
+        let budget = fs::read_to_string(lane_paths.lane_dir.join("repair/round-4-budget.json"))
+            .expect("round 4 budget artifact");
+        assert!(budget.contains("\"max_total_attempts\": 3"));
+        assert!(budget.contains("\"allowed\": false"));
+        assert!(
+            !lane_paths
+                .lane_dir
+                .join("repair/round-4-prompt.md")
                 .exists()
         );
 
