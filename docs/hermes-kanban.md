@@ -120,7 +120,10 @@ During the runtime transition, a Hermes manager can hand HEPA an intent artifact
 by setting `HEPA_HERMES_PR_INTENT_FILE` to a JSON `HepaHermesPrIntent` file.
 When this variable is present, live PR creation uses that validated intent; when
 it is absent, HEPA keeps the headless fallback body so degraded CLI runs still
-work.
+work. In Hermes-present runs, `HEPA_HERMES_PR_INTENT_COMMAND` can point to the
+manager profile runtime; HEPA writes a PR-intent context JSON file, captures
+runtime stdout/stderr, requires a manager-authored intent artifact, and only
+then performs the manager-owned staging/push/PR operation.
 
 ## Card transitions
 

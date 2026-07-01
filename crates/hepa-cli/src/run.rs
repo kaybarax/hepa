@@ -1622,6 +1622,17 @@ fn live_pr_request(
     base_branch: &str,
     head_branch: &str,
 ) -> Result<HepaPrRequest, String> {
+    if let Ok(command) = std::env::var("HEPA_HERMES_PR_INTENT_COMMAND") {
+        return pr_request_from_hermes_intent_runtime_command(
+            &command,
+            config,
+            task_spec,
+            terminal_report,
+            lane,
+            base_branch.to_string(),
+            head_branch.to_string(),
+        );
+    }
     if let Ok(intent_path) = std::env::var("HEPA_HERMES_PR_INTENT_FILE") {
         return pr_request_from_hermes_intent_file(
             Path::new(&intent_path),
@@ -1645,6 +1656,49 @@ fn live_pr_request(
         base_branch: base_branch.to_string(),
         head_branch: head_branch.to_string(),
     })
+}
+
+fn pr_request_from_hermes_intent_runtime_command(
+    command: &str,
+    config: &HepaFakeRunConfig,
+    task_spec: &HepaTaskSpec,
+    terminal_report: &HepaTerminalTaskReport,
+    lane: &HepaLane,
+    base_branch: String,
+    head_branch: String,
+) -> Result<HepaPrRequest, String> {
+    let intent_dir = config
+        .control_root
+        .join("hermes-pr-intent")
+        .join(&config.run_id)
+        .join(&config.lane_id);
+    fs::create_dir_all(&intent_dir).map_err(|error| error.to_string())?;
+    let context_path = intent_dir.join("hermes-pr-intent-context.json");
+    let output_path = intent_dir.join("hermes-pr-intent.runtime.json");
+    let stdout_path = intent_dir.join("hermes-pr-intent-runtime.stdout.log");
+    let stderr_path = intent_dir.join("hermes-pr-intent-runtime.stderr.log");
+    let context = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "profile_id": "hepa-manager",
+        "task_id": config.task_id,
+        "lane_id": config.lane_id,
+        "task_spec": task_spec,
+        "terminal_report": terminal_report,
+        "lane": lane,
+        "base_branch": &base_branch,
+        "head_branch": &head_branch,
+        "artifact_output": output_path,
+    });
+    write_json(&context_path, &context).map_err(|error| error.to_string())?;
+    run_hermes_profile_runtime_command(HermesProfileRuntimeCommand {
+        command,
+        profile_id: "hepa-manager",
+        context_path: &context_path,
+        output_path: &output_path,
+        stdout_path: &stdout_path,
+        stderr_path: &stderr_path,
+    })?;
+    pr_request_from_hermes_intent_file(&output_path, base_branch, head_branch)
 }
 
 fn pr_request_from_hermes_intent_file(
@@ -4351,6 +4405,91 @@ mod tests {
         );
         assert!(request.body.contains("## HEPA audit"));
         assert!(request.body.contains("PR intent author: hepa-manager"));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_pr_intent_runtime_command_builds_live_pr_request() {
+        let root = unique_test_dir("hermes-pr-intent-runtime");
+        let script = root.join("fake-hermes-manager-pr");
+        write_executable(
+            &script,
+            r###"#!/usr/bin/env sh
+printf '%s\n' "manager pr-intent runtime invoked"
+cat > "$HEPA_HERMES_ARTIFACT_OUT" <<'JSON'
+{
+  "schema_version": 1,
+  "task_id": "task-live",
+  "lane_id": "lane-live",
+  "author_profile_id": "hepa-manager",
+  "title": "Update README with project-specific guidance",
+  "body": "## Summary\nAdds the requested project-specific README guidance.\n\n## Validation\n- git diff --check passed\n",
+  "audit_summary": [
+    "Hermes manager authored this PR intent.",
+    "HEPA validated staging before publishing."
+  ],
+  "human_review_required": true
+}
+JSON
+"###,
+        );
+        let config = runtime_review_config(&root);
+        let task_spec = live_task_spec(&config);
+        let validation = passed_validation();
+        let review = HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: "review-1".to_string(),
+            lane_id: config.lane_id.clone(),
+            adapter_id: "hepa-reviewer:primary".to_string(),
+            status: HepaReviewStatus::Approved,
+            findings: Vec::new(),
+            summary: vec!["No blocking findings.".to_string()],
+            completed_at: "2026-06-16T00:00:06Z".to_string(),
+        };
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 1.0,
+            validation_duration_seconds: 0.1,
+            review_duration_seconds: 0.1,
+            reviewer_passes: 1,
+            terminal_phase: LivePipelinePhase::Completed,
+            repair_timing: None,
+        });
+        let terminal_report = terminal_report(&config, validation, review, timing);
+        let lane = completed_lane(&config);
+
+        let request = pr_request_from_hermes_intent_runtime_command(
+            &script.display().to_string(),
+            &config,
+            &task_spec,
+            &terminal_report,
+            &lane,
+            "main".to_string(),
+            "hepa/manager/lane-live".to_string(),
+        )
+        .expect("Hermes manager runtime should build PR request");
+
+        assert_eq!(
+            request.title,
+            "Update README with project-specific guidance"
+        );
+        assert!(
+            request
+                .body
+                .contains("Hermes manager authored this PR intent")
+        );
+        assert!(request.body.contains("## HEPA audit"));
+        assert!(
+            fs::read_to_string(
+                config.control_root.join(
+                    "hermes-pr-intent/run-live/lane-live/hermes-pr-intent-runtime.stdout.log"
+                )
+            )
+            .expect("PR intent runtime stdout")
+            .contains("manager pr-intent runtime invoked")
+        );
 
         remove_test_dir(root);
     }
