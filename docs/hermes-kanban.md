@@ -94,6 +94,10 @@ findings follow the same loop: accepted Hermes reviewer findings are converted
 into worker repair evidence, the worker reruns only while the one-to-three round
 budget allows it, and a fourth task/work/review attempt is terminalized as
 `ready_for_human`.
+For Hermes-present worker routing, `HEPA_HERMES_RUN_BRIEF_COMMAND` invokes the
+worker profile runtime, captures stdout/stderr, validates the produced
+`HepaHermesRunBrief`, and derives the coding adapter task spec from that finite
+brief instead of the broad fallback task text.
 
 When review passes, the manager profile writes PR intent: title, body, audit
 summary, and human-review requirement. HEPA validates that the intent came from

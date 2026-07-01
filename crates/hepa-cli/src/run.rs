@@ -1754,6 +1754,9 @@ fn optional_env(key: &str) -> Option<Option<String>> {
 }
 
 fn live_run_brief(config: &HepaFakeRunConfig) -> Result<Option<HepaHermesRunBrief>, String> {
+    if let Ok(command) = std::env::var("HEPA_HERMES_RUN_BRIEF_COMMAND") {
+        return live_run_brief_from_runtime_command(&command, config).map(Some);
+    }
     let Ok(brief_path) = std::env::var("HEPA_HERMES_RUN_BRIEF_FILE") else {
         return Ok(None);
     };
@@ -1771,6 +1774,54 @@ fn live_run_brief(config: &HepaFakeRunConfig) -> Result<Option<HepaHermesRunBrie
         ));
     }
     Ok(Some(brief))
+}
+
+fn live_run_brief_from_runtime_command(
+    command: &str,
+    config: &HepaFakeRunConfig,
+) -> Result<HepaHermesRunBrief, String> {
+    let brief_dir = config
+        .control_root
+        .join("hermes-run-brief")
+        .join(&config.run_id)
+        .join(&config.lane_id);
+    fs::create_dir_all(&brief_dir).map_err(|error| error.to_string())?;
+    let context_path = brief_dir.join("hermes-run-brief-context.json");
+    let output_path = brief_dir.join("hermes-run-brief.runtime.json");
+    let stdout_path = brief_dir.join("hermes-run-brief-runtime.stdout.log");
+    let stderr_path = brief_dir.join("hermes-run-brief-runtime.stderr.log");
+    let context = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "profile_id": "hepa-worker",
+        "run_id": config.run_id,
+        "task_id": config.task_id,
+        "lane_id": config.lane_id,
+        "task_text": sanitized_task_text(config),
+        "artifact_output": output_path,
+    });
+    write_json(&context_path, &context).map_err(|error| error.to_string())?;
+    run_hermes_profile_runtime_command(HermesProfileRuntimeCommand {
+        command,
+        profile_id: "hepa-worker",
+        context_path: &context_path,
+        output_path: &output_path,
+        stdout_path: &stdout_path,
+        stderr_path: &stderr_path,
+    })?;
+    let brief = hermes_run_brief_from_file(&output_path)?;
+    if brief.task_id != config.task_id {
+        return Err(format!(
+            "Hermes worker runtime brief task_id mismatch: expected {} got {}",
+            config.task_id, brief.task_id
+        ));
+    }
+    if brief.lane_id != config.lane_id {
+        return Err(format!(
+            "Hermes worker runtime brief lane_id mismatch: expected {} got {}",
+            config.lane_id, brief.lane_id
+        ));
+    }
+    Ok(brief)
 }
 
 fn hermes_run_brief_from_file(brief_path: &Path) -> Result<HepaHermesRunBrief, String> {
@@ -4755,6 +4806,54 @@ JSON
                 .non_goals
                 .iter()
                 .any(|line| line.contains("Hermes worker brief scope"))
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_run_brief_runtime_command_builds_live_task_spec() {
+        let root = unique_test_dir("hermes-run-brief-runtime");
+        let script = root.join("fake-hermes-worker");
+        write_executable(
+            &script,
+            r#"#!/usr/bin/env sh
+printf '%s\n' "worker runtime invoked"
+cat > "$HEPA_HERMES_ARTIFACT_OUT" <<'JSON'
+{
+  "schema_version": 1,
+  "task_id": "task-live",
+  "lane_id": "lane-live",
+  "author_profile_id": "hepa-worker",
+  "task_prompt": "Update src/app/login.tsx to show the requested copy.",
+  "expected_areas": ["src/app/login.tsx"],
+  "acceptance_criteria": ["Login copy matches the task request."],
+  "validation_commands": ["yarn test:e2e"],
+  "max_total_rounds": 3
+}
+JSON
+"#,
+        );
+        let config = runtime_review_config(&root);
+
+        let brief = live_run_brief_from_runtime_command(&script.display().to_string(), &config)
+            .expect("Hermes worker runtime should produce run brief");
+        let task_spec = live_task_spec_from_hermes_brief(&config, &brief);
+
+        assert_eq!(
+            task_spec.goal,
+            "Update src/app/login.tsx to show the requested copy."
+        );
+        assert_eq!(task_spec.expected_areas, vec!["src/app/login.tsx"]);
+        assert_eq!(task_spec.validation_commands, vec!["yarn test:e2e"]);
+        assert!(
+            fs::read_to_string(
+                config.control_root.join(
+                    "hermes-run-brief/run-live/lane-live/hermes-run-brief-runtime.stdout.log"
+                )
+            )
+            .expect("worker runtime stdout")
+            .contains("worker runtime invoked")
         );
 
         remove_test_dir(root);
