@@ -8,6 +8,7 @@ pub mod env_allowlist;
 pub mod fleet_monitor;
 pub mod fleet_registry;
 pub mod hard_blockers;
+pub mod hermes_profiles;
 pub mod lane_state;
 pub mod monitor;
 pub mod notifications;

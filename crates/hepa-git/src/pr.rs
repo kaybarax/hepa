@@ -1,6 +1,7 @@
 use hepa_core::contracts::{
-    HepaAgentRole, HepaFindingSeverity, HepaLane, HepaReviewStatus, HepaRiskLevel, HepaTaskSpec,
-    HepaTerminalStatus, HepaTerminalTaskReport, HepaValidationStatus,
+    HepaAgentRole, HepaFindingSeverity, HepaHermesPrIntent, HepaLane, HepaReviewStatus,
+    HepaRiskLevel, HepaTaskSpec, HepaTerminalStatus, HepaTerminalTaskReport, HepaValidate,
+    HepaValidationStatus,
 };
 use std::{
     error::Error,
@@ -115,6 +116,33 @@ pub struct HepaCommitOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaPrHandle {
     pub url: String,
+}
+
+pub fn pr_request_from_hermes_intent(
+    intent: &HepaHermesPrIntent,
+    base_branch: impl Into<String>,
+    head_branch: impl Into<String>,
+) -> Result<HepaPrRequest, HepaPrError> {
+    intent
+        .validate()
+        .map_err(|error| HepaPrError::new(error.field, error.message))?;
+    let mut body = intent.body.trim_end().to_string();
+    body.push_str("\n\n## HEPA audit\n");
+    for line in &intent.audit_summary {
+        body.push_str("- ");
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push_str("- PR intent author: ");
+    body.push_str(&intent.author_profile_id);
+    body.push('\n');
+
+    Ok(HepaPrRequest {
+        title: intent.title.clone(),
+        body,
+        base_branch: base_branch.into(),
+        head_branch: head_branch.into(),
+    })
 }
 
 /// Manager-owned git lifecycle. The only type exposing commit/push/PR creation.
@@ -742,6 +770,77 @@ mod tests {
         assert!(runner.calls.borrow().is_empty());
 
         remove_test_dir(repo);
+    }
+
+    #[test]
+    fn hermes_pr_intent_builds_manager_owned_pr_request() {
+        let intent = HepaHermesPrIntent {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            title: "Add starter template readiness badge".to_string(),
+            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Validation\n- yarn test:e2e passed\n".to_string(),
+            audit_summary: vec![
+                "HEPA checked safe staging before PR creation.".to_string(),
+                "Human review remains required before merge.".to_string(),
+            ],
+            human_review_required: true,
+        };
+
+        let request = pr_request_from_hermes_intent(&intent, "main", "hepa/manager/lane-1")
+            .expect("valid Hermes intent should build a PR request");
+
+        assert_eq!(request.title, intent.title);
+        assert_eq!(request.base_branch, "main");
+        assert_eq!(request.head_branch, "hepa/manager/lane-1");
+        assert!(request.body.contains("Adds the readiness badge"));
+        assert!(request.body.contains("## HEPA audit"));
+        assert!(
+            request
+                .body
+                .contains("HEPA checked safe staging before PR creation.")
+        );
+        assert!(request.body.contains("PR intent author: hepa-manager"));
+    }
+
+    #[test]
+    fn hermes_pr_intent_rejects_non_manager_author_before_pr_request() {
+        let intent = HepaHermesPrIntent {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-reviewer".to_string(),
+            title: "Add starter template readiness badge".to_string(),
+            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Validation\n- yarn test:e2e passed\n".to_string(),
+            audit_summary: vec!["HEPA checked safe staging before PR creation.".to_string()],
+            human_review_required: true,
+        };
+
+        let error = pr_request_from_hermes_intent(&intent, "main", "hepa/manager/lane-1")
+            .expect_err("non-manager PR intent must be rejected");
+
+        assert_eq!(error.field, "author_profile_id");
+    }
+
+    #[test]
+    fn hermes_pr_intent_rejects_generic_hepa_template_before_pr_request() {
+        let intent = HepaHermesPrIntent {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            title: "HEPA validation: Update app".to_string(),
+            body: "## Summary\n- Task: HEPA validation: update app\n\n## Validation\n- passed\n"
+                .to_string(),
+            audit_summary: vec!["validation passed".to_string()],
+            human_review_required: true,
+        };
+
+        let error = pr_request_from_hermes_intent(&intent, "main", "hepa/manager/lane-1")
+            .expect_err("generic HEPA PR template must be rejected");
+
+        assert_eq!(error.field, "body");
     }
 
     #[test]

@@ -718,6 +718,68 @@ pub enum HepaTerminalStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaHermesPrIntent {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub lane_id: String,
+    pub author_profile_id: String,
+    pub title: String,
+    pub body: String,
+    pub audit_summary: Vec<String>,
+    pub human_review_required: bool,
+}
+
+impl HepaValidate for HepaHermesPrIntent {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("author_profile_id", &self.author_profile_id)?;
+        if self.author_profile_id != "hepa-manager" {
+            return Err(HepaContractError::new(
+                "author_profile_id",
+                "PR intent must be authored by the hepa-manager Hermes profile",
+            ));
+        }
+        require_single_line("title", &self.title)?;
+        require_non_empty("body", &self.body)?;
+        reject_secret_like_ref("body", &self.body)?;
+        if !self.body.contains("## Summary") {
+            return Err(HepaContractError::new(
+                "body",
+                "Hermes PR body must include a project-specific Summary section",
+            ));
+        }
+        if !self.body.contains("## Validation") {
+            return Err(HepaContractError::new(
+                "body",
+                "Hermes PR body must include a Validation section",
+            ));
+        }
+        if self.body.contains("HEPA validation:") {
+            return Err(HepaContractError::new(
+                "body",
+                "Hermes-authored PR body must not reuse the generic HEPA validation template",
+            ));
+        }
+        require_string_list("audit_summary", &self.audit_summary)?;
+        if self.audit_summary.is_empty() {
+            return Err(HepaContractError::new(
+                "audit_summary",
+                "must include HEPA safety/validation audit lines",
+            ));
+        }
+        if !self.human_review_required {
+            return Err(HepaContractError::new(
+                "human_review_required",
+                "HEPA PRs are for human review and must not auto-merge",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn require_schema(schema_version: u32) -> HepaContractResult {
     if schema_version == CONTRACT_SCHEMA_VERSION {
         Ok(())
@@ -1123,5 +1185,47 @@ mod tests {
         assert!(json.contains("\"worker_profile_llm_calls\": 0"));
         assert!(json.contains("\"install_events\": 1"));
         assert!(json.contains("\"container_count\": 0"));
+    }
+
+    #[test]
+    fn hermes_pr_intent_requires_manager_authored_project_specific_body() {
+        let intent = HepaHermesPrIntent {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            title: "Add starter template readiness badge".to_string(),
+            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Validation\n- yarn test:e2e passed\n".to_string(),
+            audit_summary: vec![
+                "HEPA validated the manager-authored PR intent before publishing.".to_string(),
+            ],
+            human_review_required: true,
+        };
+
+        intent
+            .validate()
+            .expect("manager PR intent should validate");
+    }
+
+    #[test]
+    fn hermes_pr_intent_rejects_generic_hepa_validation_body() {
+        let intent = HepaHermesPrIntent {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            title: "HEPA validation: Update app".to_string(),
+            body: "## Summary\n- Task: HEPA validation: update app\n\n## Validation\n- passed\n"
+                .to_string(),
+            audit_summary: vec!["validation passed".to_string()],
+            human_review_required: true,
+        };
+
+        let error = intent
+            .validate()
+            .expect_err("generic validation PR body should fail");
+
+        assert_eq!(error.field, "body");
+        assert!(error.message.contains("generic HEPA validation"));
     }
 }

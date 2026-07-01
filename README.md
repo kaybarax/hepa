@@ -108,6 +108,12 @@ lanes, and watch board state stay reconciled with HEPA's authoritative lane
 state. Board actions are transition *requests*; HEPA validates each before
 changing authoritative state. See [docs/hermes-kanban.md](docs/hermes-kanban.md).
 
+Hermes-led runs use bundled manager, worker, reviewer, and review-manager
+profiles. The manager profile owns task intake, assignment, bounded
+worker/reviewer cycles, and project-specific PR intent; HEPA validates that
+intent and performs the safe GitHub operation. Pi is the default coding adapter
+in that flow, but review is performed by Hermes reviewer profiles.
+
 ## Adapter Setup and Routing
 
 The **Pi adapter** is the batteries-included default harness: `hepa adapter

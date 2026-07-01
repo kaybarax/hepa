@@ -51,6 +51,28 @@ request mirror payloads and non-task issue actions are ignored. GitHub labels
 can set HEPA metadata such as `hepa:priority=7`, `hepa:risk=medium`, and
 `hepa:area=crates/hepa-kanban`, but labels never bypass definition-of-ready.
 
+## Hermes profile orchestration
+
+Hermes-led runs use bundled profiles as the engineering brain:
+
+| Profile | Owns |
+| --- | --- |
+| `hepa-manager` | project/task intake, Kanban population, assignment, review mediation, bounded retries, and project-specific PR intent |
+| `hepa-worker` | task breakdown, finite HEPA run briefs, and repair briefs |
+| `hepa-reviewer` | QA/review artifacts from task brief, validation output, and git diff |
+| `hepa-review-manager` | arbitration when multiple reviewers disagree or findings need manager judgment |
+
+The default coding path is Hermes manager/worker orchestration plus the Pi
+coding adapter. Pi performs code implementation only in this path; review is
+owned by Hermes reviewer profiles. HEPA validates each profile output before it
+changes authoritative state.
+
+When review passes, the manager profile writes PR intent: title, body, audit
+summary, and human-review requirement. HEPA validates that the intent came from
+`hepa-manager`, rejects generic validation-template bodies, appends the HEPA
+audit section, and performs the manager-owned GitHub operation. The PR remains
+for human review; HEPA does not auto-merge.
+
 ## Card transitions
 
 As a task progresses, its lane state advances and the card status is projected
@@ -76,8 +98,10 @@ hepa fleet reconcile
 ## Headless fallback
 
 If Hermes is unavailable, board sync degrades and catches up later rather than
-blocking local operation. All board payloads, comments, and diagnostics pass the
-same redaction and privacy rules as run artifacts and PR bodies.
+blocking local operation. Headless PR bodies are fallback evidence artifacts; a
+Hermes-present release run must use manager-authored PR intent for
+project-specific PR content. All board payloads, comments, and diagnostics pass
+the same redaction and privacy rules as run artifacts and PR bodies.
 
 For desktop review during degraded Hermes access, package the local fleet state
 as a static dashboard snapshot:
