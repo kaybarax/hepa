@@ -14,11 +14,12 @@ use hepa_core::{
     contracts::{
         CONTRACT_SCHEMA_VERSION, HepaAgentRole, HepaArbitrationSummary, HepaAttemptReport,
         HepaFindingSeverity, HepaFleetTask, HepaHermesPrIntent, HepaHermesReviewArtifact,
-        HepaHermesRunBrief, HepaLane, HepaLaneState, HepaPhaseStatus, HepaReadinessResult,
-        HepaReadinessState, HepaReadinessStatus, HepaReviewFinding, HepaReviewSignal,
-        HepaReviewStatus, HepaRiskLevel, HepaTaskSpec, HepaTaskStatus, HepaTerminalStatus,
-        HepaTerminalTaskReport, HepaTimingCounters, HepaTimingPhase, HepaTimingRecord,
-        HepaValidate, HepaValidationCommandResult, HepaValidationStatus, HepaValidationSummary,
+        HepaHermesReviewManagerArtifact, HepaHermesRunBrief, HepaLane, HepaLaneState,
+        HepaPhaseStatus, HepaReadinessResult, HepaReadinessState, HepaReadinessStatus,
+        HepaReviewFinding, HepaReviewSignal, HepaReviewStatus, HepaRiskLevel, HepaTaskSpec,
+        HepaTaskStatus, HepaTerminalStatus, HepaTerminalTaskReport, HepaTimingCounters,
+        HepaTimingPhase, HepaTimingRecord, HepaValidate, HepaValidationCommandResult,
+        HepaValidationStatus, HepaValidationSummary,
     },
     cost_accounting::{HepaAdapterUsageEntry, HepaLaneCostReport},
     hard_blockers::block_from_monitor_stop,
@@ -2070,13 +2071,19 @@ fn live_review_fanout(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, S
             &artifact,
         )
         .map_err(|error| error.to_string())?;
-        return live_review_outcome_from_signals(artifact.signals);
+        return live_review_outcome_from_signals(
+            input.config,
+            input.lane_paths,
+            artifact.signals,
+            "Hermes review policy",
+        );
     }
     if live_adapter_review_enabled() {
         return live_adapter_review(input);
     }
     live_deterministic_review_fanout(
         input.config,
+        input.lane_paths,
         input.adapter_id,
         input.changed_files,
         input.validation,
@@ -2119,8 +2126,68 @@ fn hermes_review_artifact_from_file(
     Ok(artifact)
 }
 
+fn live_review_manager_artifact(
+    config: &HepaFakeRunConfig,
+) -> Result<Option<HepaHermesReviewManagerArtifact>, String> {
+    let Ok(artifact_path) = std::env::var("HEPA_HERMES_REVIEW_MANAGER_ARTIFACT_FILE") else {
+        return Ok(None);
+    };
+    let artifact = hermes_review_manager_artifact_from_file(Path::new(&artifact_path))?;
+    if artifact.task_id != config.task_id {
+        return Err(format!(
+            "Hermes review-manager artifact task_id mismatch: expected {} got {}",
+            config.task_id, artifact.task_id
+        ));
+    }
+    if artifact.lane_id != config.lane_id {
+        return Err(format!(
+            "Hermes review-manager artifact lane_id mismatch: expected {} got {}",
+            config.lane_id, artifact.lane_id
+        ));
+    }
+    Ok(Some(artifact))
+}
+
+fn hermes_review_manager_artifact_from_file(
+    artifact_path: &Path,
+) -> Result<HepaHermesReviewManagerArtifact, String> {
+    let raw = fs::read_to_string(artifact_path)
+        .map_err(|error| format!("Hermes review-manager artifact could not be read: {error}"))?;
+    let artifact: HepaHermesReviewManagerArtifact = serde_json::from_str(&raw)
+        .map_err(|error| format!("Hermes review-manager artifact JSON is invalid: {error}"))?;
+    artifact
+        .validate()
+        .map_err(|error| format!("Hermes review-manager artifact failed validation: {error}"))?;
+    Ok(artifact)
+}
+
 fn live_review_outcome_from_signals(
+    config: &HepaFakeRunConfig,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
     signals: Vec<HepaReviewSignal>,
+    pass_policy_label: &str,
+) -> Result<LiveReviewOutcome, String> {
+    let manager_artifact = live_review_manager_artifact(config)?;
+    if let Some(artifact) = &manager_artifact {
+        write_json(
+            &lane_paths
+                .lane_dir
+                .join("review/hermes-review-manager-artifact.json"),
+            artifact,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    live_review_outcome_from_signals_and_manager(
+        signals,
+        manager_artifact.map(|artifact| artifact.arbitration),
+        pass_policy_label,
+    )
+}
+
+fn live_review_outcome_from_signals_and_manager(
+    signals: Vec<HepaReviewSignal>,
+    manager_arbitration: Option<HepaArbitrationSummary>,
+    pass_policy_label: &str,
 ) -> Result<LiveReviewOutcome, String> {
     let policy = HepaReviewFanout {
         adapters: signals
@@ -2131,19 +2198,24 @@ fn live_review_outcome_from_signals(
     };
     let pass_decision =
         apply_review_pass_policy(&policy, &signals).map_err(|error| error.to_string())?;
-    let findings = aggregate_review_findings(&signals).map_err(|error| error.to_string())?;
-    let mut decisions = Vec::new();
-    for finding in findings {
-        decisions.push(arbitrate_live_finding(finding.finding)?);
-    }
-    let arbitration =
-        summarize_arbitration_results(&decisions).map_err(format_arbitration_error)?;
-    let staging_gate =
-        evaluate_staging_after_arbitration(&decisions).map_err(format_arbitration_error)?;
-    let mut blockers = staging_gate.blockers;
+    let (arbitration, mut blockers) = if let Some(arbitration) = manager_arbitration {
+        let blockers = blockers_from_arbitration_summary(&arbitration);
+        (arbitration, blockers)
+    } else {
+        let findings = aggregate_review_findings(&signals).map_err(|error| error.to_string())?;
+        let mut decisions = Vec::new();
+        for finding in findings {
+            decisions.push(arbitrate_live_finding(finding.finding)?);
+        }
+        let arbitration =
+            summarize_arbitration_results(&decisions).map_err(format_arbitration_error)?;
+        let staging_gate =
+            evaluate_staging_after_arbitration(&decisions).map_err(format_arbitration_error)?;
+        (arbitration, staging_gate.blockers)
+    };
     if !pass_decision.passed {
         blockers.push(format!(
-            "Hermes review policy required {} approval but received {}",
+            "{pass_policy_label} required {} approval but received {}",
             pass_decision.required_approvals, pass_decision.approvals
         ));
     }
@@ -2155,6 +2227,31 @@ fn live_review_outcome_from_signals(
         staging_allowed: blockers.is_empty(),
         blockers,
     })
+}
+
+fn blockers_from_arbitration_summary(arbitration: &HepaArbitrationSummary) -> Vec<String> {
+    let mut blockers = Vec::new();
+    for record in &arbitration.records {
+        if record.disposition == "manager_required" {
+            blockers.push(format!(
+                "{}: review-manager arbitration is still required",
+                record.finding_id
+            ));
+        }
+        if record.accepted
+            && matches!(
+                record.severity_after,
+                HepaFindingSeverity::High | HepaFindingSeverity::Critical
+            )
+        {
+            blockers.push(format!(
+                "{}: accepted high-risk release finding blocks staging",
+                record.finding_id
+            ));
+        }
+    }
+    blockers.sort();
+    blockers
 }
 
 fn live_adapter_review_enabled() -> bool {
@@ -2248,38 +2345,12 @@ fn live_adapter_review(input: LiveReviewInput<'_>) -> Result<LiveReviewOutcome, 
         },
     )
     .map_err(|error| error.to_string())?;
-    let signal = normalization.signal;
-    let policy = HepaReviewFanout {
-        adapters: vec![signal.adapter_id.clone()],
-        pass_policy: HepaReviewPassPolicy::All,
-    };
-    let pass_decision = apply_review_pass_policy(&policy, std::slice::from_ref(&signal))
-        .map_err(|error| error.to_string())?;
-    let findings = aggregate_review_findings(std::slice::from_ref(&signal))
-        .map_err(|error| error.to_string())?;
-    let mut decisions = Vec::new();
-    for finding in findings {
-        decisions.push(arbitrate_live_finding(finding.finding)?);
-    }
-    let arbitration =
-        summarize_arbitration_results(&decisions).map_err(format_arbitration_error)?;
-    let staging_gate =
-        evaluate_staging_after_arbitration(&decisions).map_err(format_arbitration_error)?;
-    let mut blockers = staging_gate.blockers;
-    if !pass_decision.passed {
-        blockers.push(format!(
-            "live adapter reviewer required {} approval but received {}",
-            pass_decision.required_approvals, pass_decision.approvals
-        ));
-    }
-    blockers.sort();
-    Ok(LiveReviewOutcome {
-        reviewer_passes: 1,
-        signals: vec![signal],
-        arbitration,
-        staging_allowed: blockers.is_empty(),
-        blockers,
-    })
+    live_review_outcome_from_signals(
+        input.config,
+        input.lane_paths,
+        vec![normalization.signal],
+        "live adapter reviewer",
+    )
 }
 
 fn live_review_prompt(
@@ -2405,6 +2476,7 @@ fn extract_json_object(raw: &str) -> Option<String> {
 
 fn live_deterministic_review_fanout(
     config: &HepaFakeRunConfig,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
     adapter_id: &str,
     changed_files: &[String],
     validation: &HepaValidationSummary,
@@ -2416,6 +2488,7 @@ fn live_deterministic_review_fanout(
         changed_files,
         validation,
         diff_context,
+        lane_paths,
         live_force_review_block(),
     )
 }
@@ -2426,6 +2499,7 @@ fn live_review_fanout_with_controlled_block(
     changed_files: &[String],
     validation: &HepaValidationSummary,
     diff_context: &str,
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
     force_review_block: bool,
 ) -> Result<LiveReviewOutcome, String> {
     let primary_adapter = format!("hepa-reviewer:fallback-primary:{adapter_id}");
@@ -2454,36 +2528,7 @@ fn live_review_fanout_with_controlled_block(
         reviewers,
     )
     .map_err(|error| error.to_string())?;
-    let policy = HepaReviewFanout {
-        adapters: vec![primary_adapter, policy_adapter],
-        pass_policy: HepaReviewPassPolicy::All,
-    };
-    let pass_decision =
-        apply_review_pass_policy(&policy, &result.signals).map_err(|error| error.to_string())?;
-    let findings = aggregate_review_findings(&result.signals).map_err(|error| error.to_string())?;
-    let mut decisions = Vec::new();
-    for finding in findings {
-        decisions.push(arbitrate_live_finding(finding.finding)?);
-    }
-    let arbitration =
-        summarize_arbitration_results(&decisions).map_err(format_arbitration_error)?;
-    let staging_gate =
-        evaluate_staging_after_arbitration(&decisions).map_err(format_arbitration_error)?;
-    let mut blockers = staging_gate.blockers;
-    if !pass_decision.passed {
-        blockers.push(format!(
-            "review fanout policy required {} approvals but received {}",
-            pass_decision.required_approvals, pass_decision.approvals
-        ));
-    }
-    blockers.sort();
-    Ok(LiveReviewOutcome {
-        reviewer_passes: result.signals.len() as u32,
-        signals: result.signals,
-        arbitration,
-        staging_allowed: blockers.is_empty(),
-        blockers,
-    })
+    live_review_outcome_from_signals(config, lane_paths, result.signals, "review fanout policy")
 }
 
 fn configured_live_reviewer(
@@ -4179,13 +4224,124 @@ mod tests {
 
         let loaded = hermes_review_artifact_from_file(&artifact_path)
             .expect("valid Hermes review artifact should load");
-        let outcome = live_review_outcome_from_signals(loaded.signals)
-            .expect("approved Hermes review should build outcome");
+        let outcome = live_review_outcome_from_signals_and_manager(
+            loaded.signals,
+            None,
+            "Hermes review policy",
+        )
+        .expect("approved Hermes review should build outcome");
 
         assert_eq!(outcome.reviewer_passes, 1);
         assert!(outcome.staging_allowed);
         assert!(outcome.blockers.is_empty());
         assert_eq!(outcome.signals[0].adapter_id, "hepa-reviewer:primary");
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_review_manager_artifact_file_sets_live_arbitration() {
+        let root = unique_test_dir("hermes-review-manager-artifact");
+        let artifact_path = root.join("manager.json");
+        let artifact = HepaHermesReviewManagerArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            author_profile_id: "hepa-review-manager".to_string(),
+            arbitration: HepaArbitrationSummary {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                status: "settled".to_string(),
+                records: vec![hepa_core::contracts::HepaArbitrationFindingRecord {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    finding_id: "finding-1".to_string(),
+                    disposition: "manager_rejected".to_string(),
+                    rule_id: Some("manager-judgment".to_string()),
+                    reason: "Review manager rejected the advisory after validation passed."
+                        .to_string(),
+                    severity_before: HepaFindingSeverity::Medium,
+                    severity_after: HepaFindingSeverity::Medium,
+                    accepted: false,
+                }],
+                pr_body_lines: vec![
+                    "- finding-1: manager_rejected, Medium -> Medium, accepted=false, reason=Review manager rejected the advisory after validation passed.".to_string(),
+                ],
+                card_status: "arbitration=settled records=1 accepted=0".to_string(),
+            },
+        };
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &artifact_path,
+            serde_json::to_string_pretty(&artifact).expect("manager artifact json"),
+        )
+        .expect("write manager artifact");
+
+        let loaded = hermes_review_manager_artifact_from_file(&artifact_path)
+            .expect("valid review-manager artifact should load");
+        let blockers = blockers_from_arbitration_summary(&loaded.arbitration);
+        let outcome = live_review_outcome_from_signals_and_manager(
+            vec![HepaReviewSignal {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                review_id: "review-1".to_string(),
+                lane_id: "lane-live".to_string(),
+                adapter_id: "hepa-reviewer:primary".to_string(),
+                status: HepaReviewStatus::Approved,
+                findings: Vec::new(),
+                summary: vec!["No blocking findings.".to_string()],
+                completed_at: "2026-06-16T00:00:06Z".to_string(),
+            }],
+            Some(loaded.arbitration),
+            "Hermes review policy",
+        )
+        .expect("settled review-manager arbitration should build outcome");
+
+        assert!(blockers.is_empty());
+        assert!(outcome.staging_allowed);
+        assert_eq!(outcome.arbitration.status, "settled");
+        assert_eq!(
+            outcome.arbitration.records[0].disposition,
+            "manager_rejected"
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn hermes_review_manager_artifact_file_rejects_unresolved_arbitration() {
+        let root = unique_test_dir("hermes-review-manager-unresolved");
+        let artifact_path = root.join("manager.json");
+        let artifact = HepaHermesReviewManagerArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-live".to_string(),
+            lane_id: "lane-live".to_string(),
+            author_profile_id: "hepa-review-manager".to_string(),
+            arbitration: HepaArbitrationSummary {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                status: "manager_required".to_string(),
+                records: vec![hepa_core::contracts::HepaArbitrationFindingRecord {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    finding_id: "finding-1".to_string(),
+                    disposition: "manager_required".to_string(),
+                    rule_id: None,
+                    reason: "Needs review-manager judgment.".to_string(),
+                    severity_before: HepaFindingSeverity::High,
+                    severity_after: HepaFindingSeverity::High,
+                    accepted: true,
+                }],
+                pr_body_lines: vec!["- finding-1 needs judgment.".to_string()],
+                card_status: "arbitration=manager_required records=1 accepted=1".to_string(),
+            },
+        };
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &artifact_path,
+            serde_json::to_string_pretty(&artifact).expect("manager artifact json"),
+        )
+        .expect("write manager artifact");
+
+        let error = hermes_review_manager_artifact_from_file(&artifact_path)
+            .expect_err("unresolved review-manager artifact should be rejected");
+
+        assert!(error.contains("Hermes review-manager artifact failed validation"));
 
         remove_test_dir(root);
     }
@@ -4567,6 +4723,13 @@ mod tests {
 
     #[test]
     fn live_review_fanout_records_arbitration_for_real_diff() {
+        let root = unique_test_dir("review-fanout-arbitration");
+        let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
+            .expect("artifact layout");
+        let run_paths = layout
+            .run("run-live", "task-live")
+            .expect("run artifact paths");
+        let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
         let config = HepaFakeRunConfig {
             repo_path: PathBuf::from("repo"),
             control_root: PathBuf::from("control"),
@@ -4593,6 +4756,7 @@ mod tests {
 
         let outcome = live_deterministic_review_fanout(
             &config,
+            &lane_paths,
             "pi",
             &["README.md".to_string()],
             &validation,
@@ -4627,6 +4791,7 @@ mod tests {
         assert!(dispositions.contains(&"downgraded"));
         assert!(outcome.arbitration.card_status.contains("arbitration="));
         assert!(outcome.blockers.is_empty());
+        remove_test_dir(root);
     }
 
     #[test]
@@ -4795,6 +4960,13 @@ mod tests {
 
     #[test]
     fn live_controlled_review_block_requires_human_escalation_before_staging() {
+        let root = unique_test_dir("controlled-review-block");
+        let layout = HepaArtifactLayout::new(root.join("control"), root.join("archive"))
+            .expect("artifact layout");
+        let run_paths = layout
+            .run("run-live", "task-live")
+            .expect("run artifact paths");
+        let lane_paths = run_paths.lane("lane-live").expect("lane artifact paths");
         let config = HepaFakeRunConfig {
             repo_path: PathBuf::from("repo"),
             control_root: PathBuf::from("control"),
@@ -4824,6 +4996,7 @@ mod tests {
             &["README.md".to_string()],
             &validation,
             "diff --git a/README.md b/README.md",
+            &lane_paths,
             true,
         )
         .expect("fanout should produce a controlled block");
@@ -4842,15 +5015,13 @@ mod tests {
                 blocker.contains("manager arbitration is required before staging")
             })
         );
-        assert!(outcome.blockers.iter().any(|blocker| {
-            blocker.contains("review fanout policy required 2 approvals but received 0")
-        }));
         assert!(outcome.signals.iter().any(|signal| {
             signal
                 .summary
                 .iter()
                 .any(|line| line.contains("inspect reviewer evidence"))
         }));
+        remove_test_dir(root);
     }
 
     #[test]

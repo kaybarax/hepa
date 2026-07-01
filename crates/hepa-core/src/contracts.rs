@@ -504,6 +504,43 @@ impl HepaValidate for HepaHermesReviewArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaHermesReviewManagerArtifact {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub lane_id: String,
+    pub author_profile_id: String,
+    pub arbitration: HepaArbitrationSummary,
+}
+
+impl HepaValidate for HepaHermesReviewManagerArtifact {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("author_profile_id", &self.author_profile_id)?;
+        if self.author_profile_id != "hepa-review-manager" {
+            return Err(HepaContractError::new(
+                "author_profile_id",
+                "review-manager artifact must be authored by the hepa-review-manager Hermes profile",
+            ));
+        }
+        self.arbitration.validate()?;
+        if self
+            .arbitration
+            .records
+            .iter()
+            .any(|record| record.disposition == "manager_required")
+        {
+            return Err(HepaContractError::new(
+                "arbitration",
+                "review-manager artifact must settle or explicitly block findings; manager_required is unresolved",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaReviewStatus {
     Approved,
@@ -1423,5 +1460,75 @@ mod tests {
             .validate()
             .expect_err("non-Hermes reviewer signal should fail");
         assert_eq!(signal_error.field, "signals[0].adapter_id");
+    }
+
+    #[test]
+    fn hermes_review_manager_artifact_requires_settled_review_manager_arbitration() {
+        let artifact = HepaHermesReviewManagerArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-review-manager".to_string(),
+            arbitration: HepaArbitrationSummary {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                status: "settled".to_string(),
+                records: vec![HepaArbitrationFindingRecord {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    finding_id: "finding-1".to_string(),
+                    disposition: "manager_rejected".to_string(),
+                    rule_id: Some("manager-judgment".to_string()),
+                    reason: "Review manager rejected the advisory after validation passed."
+                        .to_string(),
+                    severity_before: HepaFindingSeverity::Medium,
+                    severity_after: HepaFindingSeverity::Medium,
+                    accepted: false,
+                }],
+                pr_body_lines: vec![
+                    "- finding-1: manager_rejected, Medium -> Medium, accepted=false, reason=Review manager rejected the advisory after validation passed.".to_string(),
+                ],
+                card_status: "arbitration=settled records=1 accepted=0".to_string(),
+            },
+        };
+
+        artifact
+            .validate()
+            .expect("settled review-manager artifact should validate");
+    }
+
+    #[test]
+    fn hermes_review_manager_artifact_rejects_unresolved_or_wrong_author() {
+        let mut artifact = HepaHermesReviewManagerArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-reviewer".to_string(),
+            arbitration: HepaArbitrationSummary {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                status: "manager_required".to_string(),
+                records: vec![HepaArbitrationFindingRecord {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    finding_id: "finding-1".to_string(),
+                    disposition: "manager_required".to_string(),
+                    rule_id: None,
+                    reason: "Needs review-manager judgment.".to_string(),
+                    severity_before: HepaFindingSeverity::High,
+                    severity_after: HepaFindingSeverity::High,
+                    accepted: true,
+                }],
+                pr_body_lines: vec!["- finding-1 needs judgment.".to_string()],
+                card_status: "arbitration=manager_required records=1 accepted=1".to_string(),
+            },
+        };
+
+        let author_error = artifact
+            .validate()
+            .expect_err("reviewer-authored review-manager artifact should fail");
+        assert_eq!(author_error.field, "author_profile_id");
+
+        artifact.author_profile_id = "hepa-review-manager".to_string();
+        let unresolved_error = artifact
+            .validate()
+            .expect_err("unresolved review-manager artifact should fail");
+        assert_eq!(unresolved_error.field, "arbitration");
     }
 }
