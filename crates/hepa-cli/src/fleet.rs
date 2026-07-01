@@ -28,7 +28,7 @@ use serde::Serialize;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -1192,15 +1192,40 @@ pub fn lane_command(args: &[String]) -> Result<String, String> {
         }
         "logs" => {
             let lane_id = positional(&flags, 0, "lane id")?;
+            let mut flags = flags;
+            let tail = take_option(&mut flags, "--tail")?
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "--tail must be a non-negative integer".to_string())
+                })
+                .transpose()?;
+            if flags.len() > 1 {
+                return Err(format!("unknown lane logs flags: {}", flags[1..].join(" ")));
+            }
             let log_path = control_root
                 .join("fleet")
                 .join("lanes")
                 .join(&lane_id)
                 .join("lane.log");
-            Ok(format!(
+            let streams = find_lane_stream_logs(&control_root, &lane_id)
+                .map_err(|error| error.to_string())?;
+            let mut lines = vec![format!(
                 "HEPA lane logs: {lane_id} log={}",
                 log_path.display()
-            ))
+            )];
+            for stream in &streams {
+                lines.push(format!("stream={}", stream.display()));
+                if let Some(tail) = tail {
+                    for line in tail_file_lines(stream, tail)? {
+                        lines.push(format!("  {line}"));
+                    }
+                }
+            }
+            if streams.is_empty() {
+                lines.push("streams=none".to_string());
+            }
+            Ok(lines.join("\n"))
         }
         "stop" => {
             let lane_id = positional(&flags, 0, "lane id")?;
@@ -1218,6 +1243,53 @@ pub fn lane_command(args: &[String]) -> Result<String, String> {
         }
         other => Err(format!("unknown lane command: {other}")),
     }
+}
+
+fn find_lane_stream_logs(control_root: &Path, lane_id: &str) -> io::Result<Vec<PathBuf>> {
+    let mut matches = Vec::new();
+    collect_lane_stream_logs(control_root, lane_id, &mut matches)?;
+    matches.sort();
+    Ok(matches)
+}
+
+fn collect_lane_stream_logs(
+    directory: &Path,
+    lane_id: &str,
+    matches: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_lane_stream_logs(&path, lane_id, matches)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|value| value.to_str())
+                == Some("streams")
+            && path
+                .components()
+                .any(|component| component.as_os_str() == lane_id)
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn tail_file_lines(path: &Path, tail: usize) -> Result<Vec<String>, String> {
+    if tail == 0 {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read stream {}: {error}", path.display()))?;
+    let lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(tail);
+    Ok(lines[start..].to_vec())
 }
 
 fn scheduler_state_path(control_root: &Path) -> PathBuf {
@@ -1633,6 +1705,13 @@ mod tests {
             .claim_task_into_lane("task-1", "lane-1", "t1")
             .expect("claim");
         assert_eq!(task.lane_ids, vec!["lane-1".to_string()]);
+        let stream_dir = root.join("runs/run-1/tasks/task-1/lanes/lane-1/streams");
+        std::fs::create_dir_all(&stream_dir).expect("stream dir");
+        std::fs::write(
+            stream_dir.join("worker-adapter-stream.jsonl"),
+            "{\"stream\":\"stdout\",\"text\":\"first\"}\n{\"stream\":\"stderr\",\"text\":\"second\"}\n",
+        )
+        .expect("stream fixture");
 
         assert!(
             lane_command(&s(&["list", "--control-root", &control]))
@@ -1649,6 +1728,18 @@ mod tests {
                 .expect("logs")
                 .contains("lane.log")
         );
+        let logs = lane_command(&s(&[
+            "logs",
+            "lane-1",
+            "--tail",
+            "1",
+            "--control-root",
+            &control,
+        ]))
+        .expect("logs tail");
+        assert!(logs.contains("worker-adapter-stream.jsonl"));
+        assert!(logs.contains("\"text\":\"second\""));
+        assert!(!logs.contains("\"text\":\"first\""));
         let stop = lane_command(&s(&["stop", "lane-1", "--control-root", &control])).expect("stop");
         assert!(stop.contains("Blocked"));
 

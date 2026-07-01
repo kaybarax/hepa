@@ -32,6 +32,21 @@ The scheduler selects the highest-priority ready task whose dependencies are met
 and admits it only when resource and conflict rules allow, then atomically claims
 exactly one ready task into one lane. A task can never be double-claimed.
 
+## Lane operations
+
+```bash
+hepa lane list
+hepa lane show <lane-id>
+hepa lane logs <lane-id>
+hepa lane logs <lane-id> --tail 20
+hepa lane stop <lane-id>
+```
+
+`lane logs` reports the legacy lane log path plus any lane-local adapter stream
+artifacts. `--tail <n>` prints the last `n` JSONL events from each stream so
+operators can inspect parallel live lanes without opening the artifact tree by
+hand. `lane stop` records a manager-owned blocked terminal state for the task.
+
 ## Resource and conflict rules
 
 Admission enforces, with a recorded wait reason for every block:
