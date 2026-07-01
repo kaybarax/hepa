@@ -38,6 +38,10 @@ tasks into draft fleet records, and renders draft Hermes card payloads through
 the same card mapping used by markdown imports. Ambiguous manager-intake tasks
 must include blocked clarification questions and remain blocked until the done
 gate can be proven.
+For Hermes-present intake, `--hermes-manager-intake-command <cmd>` invokes the
+manager profile runtime with `HEPA_HERMES_CONTEXT_FILE` and
+`HEPA_HERMES_ARTIFACT_OUT`; HEPA captures stdout/stderr, validates the produced
+artifact, and creates the same draft card payloads.
 
 ## GitHub issue webhooks
 

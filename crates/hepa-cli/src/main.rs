@@ -12,6 +12,7 @@ use hepa_adapters::{
 };
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::{HepaHermesManagerIntakeArtifact, HepaLaneState, HepaTimingRecord};
+use hepa_core::redaction::redact_secrets;
 use hepa_core::timing_trends::{HepaTimingTrendReport, timing_trend_report};
 use hepa_git::worktree::HepaWorktreeAllocator;
 use hepa_kanban::doctor::system_kanban_doctor_report;
@@ -136,14 +137,16 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
         [command, subcommand, path, flags @ ..] if command == "spec" && subcommand == "import" => {
             let options = parse_spec_import_options(flags)?;
             let (imported, source, cards) =
-                if let Some(artifact_path) = options.hermes_manager_intake {
-                    let raw = std::fs::read_to_string(&artifact_path).map_err(|error| {
-                        format!("failed to read Hermes manager intake artifact: {error}")
-                    })?;
-                    let artifact: HepaHermesManagerIntakeArtifact = serde_json::from_str(&raw)
-                        .map_err(|error| {
-                            format!("Hermes manager intake artifact JSON is invalid: {error}")
-                        })?;
+                if let Some(command) = options.hermes_manager_intake_command {
+                    let artifact = hermes_manager_intake_from_runtime_command(path, &command)?;
+                    let project = artifact.project.clone();
+                    let imported = import_hermes_manager_intake(artifact)
+                        .map_err(|error| error.to_string())?;
+                    let cards = imported_spec_to_draft_cards(project, &imported)
+                        .map_err(|error| error.to_string())?;
+                    (imported, "hermes-manager-runtime", cards.len())
+                } else if let Some(artifact_path) = options.hermes_manager_intake {
+                    let artifact = hermes_manager_intake_from_file(&artifact_path)?;
                     let project = artifact.project.clone();
                     let imported = import_hermes_manager_intake(artifact)
                         .map_err(|error| error.to_string())?;
@@ -159,7 +162,7 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
                         0,
                     )
                 };
-            if source == "hermes-manager" {
+            if source.starts_with("hermes-manager") {
                 Ok(format!(
                     "HEPA spec import completed: source={source} tasks={} cards={cards}",
                     imported.tasks.len()
@@ -367,6 +370,7 @@ fn format_run_result(
 #[derive(Debug, Clone, Default)]
 struct SpecImportOptions {
     hermes_manager_intake: Option<String>,
+    hermes_manager_intake_command: Option<String>,
 }
 
 fn parse_spec_import_options(flags: &[String]) -> Result<SpecImportOptions, String> {
@@ -381,10 +385,82 @@ fn parse_spec_import_options(flags: &[String]) -> Result<SpecImportOptions, Stri
                 options.hermes_manager_intake = Some(value.clone());
                 index += 2;
             }
+            "--hermes-manager-intake-command" => {
+                let value = flags.get(index + 1).ok_or_else(|| {
+                    "--hermes-manager-intake-command requires a value".to_string()
+                })?;
+                options.hermes_manager_intake_command = Some(value.clone());
+                index += 2;
+            }
             flag => return Err(format!("unknown spec import option: {flag}")),
         }
     }
     Ok(options)
+}
+
+fn hermes_manager_intake_from_file(
+    artifact_path: &str,
+) -> Result<HepaHermesManagerIntakeArtifact, String> {
+    let raw = std::fs::read_to_string(artifact_path)
+        .map_err(|error| format!("failed to read Hermes manager intake artifact: {error}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("Hermes manager intake artifact JSON is invalid: {error}"))
+}
+
+fn hermes_manager_intake_from_runtime_command(
+    spec_path: &str,
+    command: &str,
+) -> Result<HepaHermesManagerIntakeArtifact, String> {
+    let spec_path = std::path::Path::new(spec_path);
+    let artifact_dir = spec_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".hepa-hermes-manager-intake");
+    std::fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
+    let context_path = artifact_dir.join("context.json");
+    let output_path = artifact_dir.join("manager-intake.runtime.json");
+    let stdout_path = artifact_dir.join("runtime.stdout.log");
+    let stderr_path = artifact_dir.join("runtime.stderr.log");
+    let context = serde_json::json!({
+        "schema_version": hepa_core::contracts::CONTRACT_SCHEMA_VERSION,
+        "profile_id": "hepa-manager",
+        "spec_path": spec_path.display().to_string(),
+        "artifact_output": output_path.display().to_string(),
+    });
+    std::fs::write(
+        &context_path,
+        serde_json::to_string_pretty(&context).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("HEPA_HERMES_PROFILE_ID", "hepa-manager")
+        .env("HEPA_HERMES_CONTEXT_FILE", &context_path)
+        .env("HEPA_HERMES_ARTIFACT_OUT", &output_path)
+        .output()
+        .map_err(|error| format!("Hermes manager intake runtime could not start: {error}"))?;
+    std::fs::write(
+        &stdout_path,
+        redact_secrets(&String::from_utf8_lossy(&output.stdout)),
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(
+        &stderr_path,
+        redact_secrets(&String::from_utf8_lossy(&output.stderr)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Hermes manager intake runtime exited {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    hermes_manager_intake_from_file(
+        output_path
+            .to_str()
+            .ok_or_else(|| "Hermes manager intake runtime output path is not UTF-8".to_string())?,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -726,6 +802,7 @@ mod tests {
     };
     use std::{
         fs,
+        os::unix::fs::PermissionsExt,
         path::Path,
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
@@ -1048,6 +1125,84 @@ mod tests {
         assert_eq!(
             output,
             "HEPA spec import completed: source=hermes-manager tasks=1 cards=1"
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn spec_import_command_runs_hermes_manager_intake_runtime() {
+        let root = unique_test_dir("spec-import-hermes-manager-runtime");
+        std::fs::create_dir_all(&root).expect("spec dir");
+        let spec_path = root.join("project-spec.md");
+        let runtime = root.join("fake-hepa-manager");
+        std::fs::write(&spec_path, "# Project spec\n").expect("write spec");
+        write_executable(
+            &runtime,
+            r#"#!/usr/bin/env sh
+printf '%s\n' "manager intake runtime invoked"
+cat > "$HEPA_HERMES_ARTIFACT_OUT" <<'JSON'
+{
+  "schema_version": 1,
+  "author_profile_id": "hepa-manager",
+  "project": {
+    "schema_version": 1,
+    "project_id": "project-1",
+    "display_name": "Project One",
+    "repo_ref": "<PROJECT_REPO>",
+    "default_branch": "main",
+    "routing_policy_ref": null,
+    "is_active": true,
+    "created_at": "2026-06-16T00:00:00Z",
+    "updated_at": "2026-06-16T00:00:00Z"
+  },
+  "tasks": [
+    {
+      "task_spec": {
+        "schema_version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "goal": "Update README.md with the requested workflow.",
+        "non_goals": [],
+        "expected_areas": ["README.md"],
+        "acceptance_criteria": ["Workflow docs are present."],
+        "validation_commands": ["cargo test"],
+        "dependencies": [],
+        "target_branch": "main",
+        "risk_level": "low",
+        "max_total_rounds": 3,
+        "created_at": "2026-06-16T00:00:00Z"
+      },
+      "title": "Write workflow docs",
+      "blocked_questions": [],
+      "priority": 7
+    }
+  ]
+}
+JSON
+"#,
+        );
+
+        let output = run_cli(&args(&[
+            "spec",
+            "import",
+            spec_path.to_str().expect("path is UTF-8"),
+            "--hermes-manager-intake-command",
+            runtime.to_str().expect("path is UTF-8"),
+        ]))
+        .expect("Hermes manager runtime spec import should run");
+
+        assert_eq!(
+            output,
+            "HEPA spec import completed: source=hermes-manager-runtime tasks=1 cards=1"
+        );
+        let stdout =
+            std::fs::read_to_string(root.join(".hepa-hermes-manager-intake/runtime.stdout.log"))
+                .expect("runtime stdout captured");
+        assert!(stdout.contains("manager intake runtime invoked"));
+        assert!(
+            root.join(".hepa-hermes-manager-intake/manager-intake.runtime.json")
+                .exists()
         );
 
         remove_test_dir(root);
@@ -1397,6 +1552,13 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("script write");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
     }
 
     fn unique_test_file(label: &str) -> std::path::PathBuf {
