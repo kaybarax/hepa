@@ -1,6 +1,6 @@
 use hepa_core::contracts::{
-    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaProject, HepaReadinessState, HepaRiskLevel,
-    HepaTaskSpec, HepaTaskStatus,
+    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaHermesManagerIntakeArtifact, HepaProject,
+    HepaReadinessState, HepaRiskLevel, HepaTaskSpec, HepaTaskStatus, HepaValidate,
 };
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
@@ -152,6 +152,50 @@ pub fn imported_spec_to_draft_cards(
                 .map_err(|error| HepaSpecImportError::new("card_mapping", error.to_string()))
         })
         .collect()
+}
+
+pub fn import_hermes_manager_intake(
+    artifact: HepaHermesManagerIntakeArtifact,
+) -> Result<HepaImportedSpec, HepaSpecImportError> {
+    artifact
+        .validate()
+        .map_err(|error| HepaSpecImportError::new(error.field, error.message))?;
+    let project_id = artifact.project.project_id;
+    let tasks = artifact
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let created_at = task.task_spec.created_at.clone();
+            let blocked_questions = task.blocked_questions;
+            let readiness = if blocked_questions.is_empty() {
+                HepaReadinessState::NotReady
+            } else {
+                HepaReadinessState::Blocked
+            };
+            let fleet_task = HepaFleetTask {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: task.task_spec.task_id.clone(),
+                project_id: task.task_spec.project_id.clone(),
+                title: task.title,
+                description: task.task_spec.goal.clone(),
+                status: HepaTaskStatus::Draft,
+                readiness,
+                dependencies: task.task_spec.dependencies.clone(),
+                lane_ids: Vec::new(),
+                external_card_id: None,
+                priority: task.priority,
+                created_at: created_at.clone(),
+                updated_at: created_at,
+                completed_at: None,
+            };
+            Ok(HepaImportedTask {
+                task_spec: task.task_spec,
+                fleet_task,
+                blocked_questions,
+            })
+        })
+        .collect::<Result<Vec<_>, HepaSpecImportError>>()?;
+    Ok(HepaImportedSpec { project_id, tasks })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +407,103 @@ Acceptance:
             cards[0].fields.get("readiness_state"),
             Some(&HepaHermesFieldValue::Text("not_ready".to_string()))
         );
+    }
+
+    #[test]
+    fn hermes_manager_intake_imports_draft_tasks_for_kanban_population() {
+        let artifact = HepaHermesManagerIntakeArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            author_profile_id: "hepa-manager".to_string(),
+            project: project(),
+            tasks: vec![hepa_core::contracts::HepaHermesManagerTaskIntake {
+                task_spec: HepaTaskSpec {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    task_id: "task-1".to_string(),
+                    project_id: "project-1".to_string(),
+                    goal: "Update README.md with the requested workflow.".to_string(),
+                    non_goals: Vec::new(),
+                    expected_areas: vec!["README.md".to_string()],
+                    acceptance_criteria: vec!["Workflow docs are present.".to_string()],
+                    validation_commands: vec!["cargo test".to_string()],
+                    dependencies: Vec::new(),
+                    target_branch: Some("main".to_string()),
+                    risk_level: HepaRiskLevel::Low,
+                    max_total_rounds: 3,
+                    created_at: "2026-06-16T00:00:00Z".to_string(),
+                },
+                title: "Write workflow docs".to_string(),
+                blocked_questions: Vec::new(),
+                priority: 7,
+            }],
+        };
+
+        let imported =
+            import_hermes_manager_intake(artifact).expect("manager intake should import");
+        let cards = imported_spec_to_draft_cards(project(), &imported)
+            .expect("manager intake should create draft cards");
+
+        assert_eq!(imported.project_id, "project-1");
+        assert_eq!(imported.tasks.len(), 1);
+        assert_eq!(imported.tasks[0].fleet_task.status, HepaTaskStatus::Draft);
+        assert_eq!(imported.tasks[0].fleet_task.priority, 7);
+        assert_eq!(imported.tasks[0].task_spec.max_total_rounds, 3);
+        assert_eq!(cards[0].title, "Write workflow docs");
+    }
+
+    #[test]
+    fn hermes_manager_intake_blocks_ambiguous_tasks_with_questions() {
+        let mut task_spec = HepaTaskSpec {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            project_id: "project-1".to_string(),
+            goal: "Clarify the requested workflow.".to_string(),
+            non_goals: Vec::new(),
+            expected_areas: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            validation_commands: Vec::new(),
+            dependencies: Vec::new(),
+            target_branch: None,
+            risk_level: HepaRiskLevel::Low,
+            max_total_rounds: 1,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+        };
+        let artifact = HepaHermesManagerIntakeArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            author_profile_id: "hepa-manager".to_string(),
+            project: project(),
+            tasks: vec![hepa_core::contracts::HepaHermesManagerTaskIntake {
+                task_spec: task_spec.clone(),
+                title: "Clarify workflow".to_string(),
+                blocked_questions: vec!["Which workflow should HEPA document?".to_string()],
+                priority: 1,
+            }],
+        };
+
+        let imported =
+            import_hermes_manager_intake(artifact).expect("questioned intake should import");
+        assert_eq!(
+            imported.tasks[0].fleet_task.readiness,
+            HepaReadinessState::Blocked
+        );
+        assert_eq!(
+            imported.tasks[0].blocked_questions,
+            vec!["Which workflow should HEPA document?"]
+        );
+
+        task_spec.project_id = "other-project".to_string();
+        let error = import_hermes_manager_intake(HepaHermesManagerIntakeArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            author_profile_id: "hepa-manager".to_string(),
+            project: project(),
+            tasks: vec![hepa_core::contracts::HepaHermesManagerTaskIntake {
+                task_spec,
+                title: "Clarify workflow".to_string(),
+                blocked_questions: vec!["Which workflow should HEPA document?".to_string()],
+                priority: 1,
+            }],
+        })
+        .expect_err("project mismatch should fail");
+        assert_eq!(error.field, "tasks[0].task_spec.project_id");
     }
 
     #[test]

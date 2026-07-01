@@ -11,12 +11,14 @@ use hepa_adapters::{
     registry::HepaAdapterRegistry,
 };
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
-use hepa_core::contracts::{HepaLaneState, HepaTimingRecord};
+use hepa_core::contracts::{HepaHermesManagerIntakeArtifact, HepaLaneState, HepaTimingRecord};
 use hepa_core::timing_trends::{HepaTimingTrendReport, timing_trend_report};
 use hepa_git::worktree::HepaWorktreeAllocator;
 use hepa_kanban::doctor::system_kanban_doctor_report;
 use hepa_kanban::github_webhook::{HepaGithubIssueWebhookRequest, import_github_issue_webhook};
-use hepa_kanban::spec_import::import_markdown_spec;
+use hepa_kanban::spec_import::{
+    import_hermes_manager_intake, import_markdown_spec, imported_spec_to_draft_cards,
+};
 use hepa_kanban::sync::{
     HepaKanbanSyncEngine, HepaKanbanSyncStatus, HepaUnavailableHermesCardStore,
 };
@@ -131,14 +133,43 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             install_adapter(adapter_id)
         }
         [command, ..] if command == "adapter" => Err("unknown adapter command".to_string()),
-        [command, subcommand, path] if command == "spec" && subcommand == "import" => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|error| format!("failed to read spec file: {error}"))?;
-            let imported = import_markdown_spec(&text).map_err(|error| error.to_string())?;
-            Ok(format!(
-                "HEPA spec import completed: tasks={}",
-                imported.tasks.len()
-            ))
+        [command, subcommand, path, flags @ ..] if command == "spec" && subcommand == "import" => {
+            let options = parse_spec_import_options(flags)?;
+            let (imported, source, cards) =
+                if let Some(artifact_path) = options.hermes_manager_intake {
+                    let raw = std::fs::read_to_string(&artifact_path).map_err(|error| {
+                        format!("failed to read Hermes manager intake artifact: {error}")
+                    })?;
+                    let artifact: HepaHermesManagerIntakeArtifact = serde_json::from_str(&raw)
+                        .map_err(|error| {
+                            format!("Hermes manager intake artifact JSON is invalid: {error}")
+                        })?;
+                    let project = artifact.project.clone();
+                    let imported = import_hermes_manager_intake(artifact)
+                        .map_err(|error| error.to_string())?;
+                    let cards = imported_spec_to_draft_cards(project, &imported)
+                        .map_err(|error| error.to_string())?;
+                    (imported, "hermes-manager", cards.len())
+                } else {
+                    let text = std::fs::read_to_string(path)
+                        .map_err(|error| format!("failed to read spec file: {error}"))?;
+                    (
+                        import_markdown_spec(&text).map_err(|error| error.to_string())?,
+                        "markdown",
+                        0,
+                    )
+                };
+            if source == "hermes-manager" {
+                Ok(format!(
+                    "HEPA spec import completed: source={source} tasks={} cards={cards}",
+                    imported.tasks.len()
+                ))
+            } else {
+                Ok(format!(
+                    "HEPA spec import completed: tasks={}",
+                    imported.tasks.len()
+                ))
+            }
         }
         [command, ..] if command == "spec" => Err("unknown spec command".to_string()),
         [command, subcommand, path, flags @ ..]
@@ -331,6 +362,29 @@ fn format_run_result(
             result.status, result.run_id, result.lane_id, summary
         ))
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpecImportOptions {
+    hermes_manager_intake: Option<String>,
+}
+
+fn parse_spec_import_options(flags: &[String]) -> Result<SpecImportOptions, String> {
+    let mut options = SpecImportOptions::default();
+    let mut index = 0;
+    while index < flags.len() {
+        match flags[index].as_str() {
+            "--hermes-manager-intake" => {
+                let value = flags
+                    .get(index + 1)
+                    .ok_or_else(|| "--hermes-manager-intake requires a value".to_string())?;
+                options.hermes_manager_intake = Some(value.clone());
+                index += 2;
+            }
+            flag => return Err(format!("unknown spec import option: {flag}")),
+        }
+    }
+    Ok(options)
 }
 
 #[derive(Debug, Clone)]
@@ -927,6 +981,74 @@ mod tests {
         .expect("spec import should run");
 
         assert_eq!(output, "HEPA spec import completed: tasks=1");
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn spec_import_command_consumes_hermes_manager_intake_artifact() {
+        let root = unique_test_dir("spec-import-hermes-manager");
+        std::fs::create_dir_all(&root).expect("spec dir");
+        let spec_path = root.join("fallback.md");
+        let intake_path = root.join("manager-intake.json");
+        std::fs::write(&spec_path, "unused fallback spec").expect("write fallback");
+        std::fs::write(
+            &intake_path,
+            r#"
+{
+  "schema_version": 1,
+  "author_profile_id": "hepa-manager",
+  "project": {
+    "schema_version": 1,
+    "project_id": "project-1",
+    "display_name": "Project One",
+    "repo_ref": "<PROJECT_REPO>",
+    "default_branch": "main",
+    "routing_policy_ref": null,
+    "is_active": true,
+    "created_at": "2026-06-16T00:00:00Z",
+    "updated_at": "2026-06-16T00:00:00Z"
+  },
+  "tasks": [
+    {
+      "task_spec": {
+        "schema_version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "goal": "Update README.md with the requested workflow.",
+        "non_goals": [],
+        "expected_areas": ["README.md"],
+        "acceptance_criteria": ["Workflow docs are present."],
+        "validation_commands": ["cargo test"],
+        "dependencies": [],
+        "target_branch": "main",
+        "risk_level": "low",
+        "max_total_rounds": 3,
+        "created_at": "2026-06-16T00:00:00Z"
+      },
+      "title": "Write workflow docs",
+      "blocked_questions": [],
+      "priority": 7
+    }
+  ]
+}
+"#,
+        )
+        .expect("write intake");
+
+        let output = run_cli(&args(&[
+            "spec",
+            "import",
+            spec_path.to_str().expect("path is UTF-8"),
+            "--hermes-manager-intake",
+            intake_path.to_str().expect("path is UTF-8"),
+        ]))
+        .expect("Hermes manager spec import should run");
+
+        assert_eq!(
+            output,
+            "HEPA spec import completed: source=hermes-manager tasks=1 cards=1"
+        );
 
         remove_test_dir(root);
     }

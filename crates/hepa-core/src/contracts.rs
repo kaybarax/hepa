@@ -541,6 +541,76 @@ impl HepaValidate for HepaHermesReviewManagerArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaHermesManagerIntakeArtifact {
+    pub schema_version: u32,
+    pub author_profile_id: String,
+    pub project: HepaProject,
+    pub tasks: Vec<HepaHermesManagerTaskIntake>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaHermesManagerTaskIntake {
+    pub task_spec: HepaTaskSpec,
+    pub title: String,
+    pub blocked_questions: Vec<String>,
+    pub priority: u32,
+}
+
+impl HepaValidate for HepaHermesManagerIntakeArtifact {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("author_profile_id", &self.author_profile_id)?;
+        if self.author_profile_id != "hepa-manager" {
+            return Err(HepaContractError::new(
+                "author_profile_id",
+                "manager intake artifact must be authored by the hepa-manager Hermes profile",
+            ));
+        }
+        self.project.validate()?;
+        if self.tasks.is_empty() {
+            return Err(HepaContractError::new(
+                "tasks",
+                "manager intake artifact must contain at least one task",
+            ));
+        }
+        for (index, task) in self.tasks.iter().enumerate() {
+            task.validate_for_project(index, &self.project.project_id)?;
+        }
+        Ok(())
+    }
+}
+
+impl HepaHermesManagerTaskIntake {
+    fn validate_for_project(&self, index: usize, project_id: &str) -> HepaContractResult {
+        self.task_spec.validate()?;
+        if self.task_spec.project_id != project_id {
+            return Err(HepaContractError::new(
+                format!("tasks[{index}].task_spec.project_id"),
+                "task project_id must match manager intake project",
+            ));
+        }
+        require_single_line(format!("tasks[{index}].title"), &self.title)?;
+        require_string_list(
+            &format!("tasks[{index}].blocked_questions"),
+            &self.blocked_questions,
+        )?;
+        if self.task_spec.max_total_rounds == 0 || self.task_spec.max_total_rounds > 3 {
+            return Err(HepaContractError::new(
+                format!("tasks[{index}].task_spec.max_total_rounds"),
+                "Hermes manager intake tasks must allow one to three total rounds",
+            ));
+        }
+        if self.task_spec.acceptance_criteria.is_empty() && self.blocked_questions.is_empty() {
+            return Err(HepaContractError::new(
+                format!("tasks[{index}].acceptance_or_questions"),
+                "manager intake tasks need acceptance criteria or blocking clarification questions",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaReviewStatus {
     Approved,
@@ -1403,6 +1473,86 @@ mod tests {
             .validate()
             .expect_err("unbounded worker brief should fail");
         assert_eq!(rounds_error.field, "max_total_rounds");
+    }
+
+    fn manager_intake_project() -> HepaProject {
+        HepaProject {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            project_id: "project-1".to_string(),
+            display_name: "Project One".to_string(),
+            repo_ref: "<PROJECT_REPO>".to_string(),
+            default_branch: "main".to_string(),
+            routing_policy_ref: None,
+            is_active: true,
+            created_at: "2026-06-16T00:00:00Z".to_string(),
+            updated_at: "2026-06-16T00:00:00Z".to_string(),
+        }
+    }
+
+    fn manager_intake_task() -> HepaHermesManagerTaskIntake {
+        HepaHermesManagerTaskIntake {
+            task_spec: HepaTaskSpec {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                project_id: "project-1".to_string(),
+                goal: "Update docs with the requested workflow.".to_string(),
+                non_goals: Vec::new(),
+                expected_areas: vec!["README.md".to_string()],
+                acceptance_criteria: vec!["Docs describe the workflow.".to_string()],
+                validation_commands: vec!["cargo test".to_string()],
+                dependencies: Vec::new(),
+                target_branch: Some("main".to_string()),
+                risk_level: HepaRiskLevel::Low,
+                max_total_rounds: 3,
+                created_at: "2026-06-16T00:00:00Z".to_string(),
+            },
+            title: "Write workflow docs".to_string(),
+            blocked_questions: Vec::new(),
+            priority: 5,
+        }
+    }
+
+    #[test]
+    fn hermes_manager_intake_requires_manager_authored_project_tasks() {
+        let artifact = HepaHermesManagerIntakeArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            author_profile_id: "hepa-manager".to_string(),
+            project: manager_intake_project(),
+            tasks: vec![manager_intake_task()],
+        };
+
+        artifact
+            .validate()
+            .expect("manager-authored intake artifact should validate");
+    }
+
+    #[test]
+    fn hermes_manager_intake_rejects_wrong_author_project_mismatch_and_unbounded_rounds() {
+        let mut artifact = HepaHermesManagerIntakeArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            author_profile_id: "hepa-worker".to_string(),
+            project: manager_intake_project(),
+            tasks: vec![manager_intake_task()],
+        };
+
+        let author_error = artifact
+            .validate()
+            .expect_err("non-manager intake should fail");
+        assert_eq!(author_error.field, "author_profile_id");
+
+        artifact.author_profile_id = "hepa-manager".to_string();
+        artifact.tasks[0].task_spec.project_id = "other-project".to_string();
+        let project_error = artifact
+            .validate()
+            .expect_err("project mismatch should fail");
+        assert_eq!(project_error.field, "tasks[0].task_spec.project_id");
+
+        artifact.tasks[0].task_spec.project_id = "project-1".to_string();
+        artifact.tasks[0].task_spec.max_total_rounds = 4;
+        let rounds_error = artifact
+            .validate()
+            .expect_err("unbounded manager intake should fail");
+        assert_eq!(rounds_error.field, "tasks[0].task_spec.max_total_rounds");
     }
 
     #[test]

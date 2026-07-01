@@ -29,6 +29,16 @@ Imported tasks stay draft and not-ready until readiness passes. Each card carrie
 the task id, dependencies, lane states, acceptance criteria, validation commands,
 risk, timing counters, sandbox postures, and arbitration/repair status.
 
+During the runtime transition, a Hermes manager can hand HEPA project/task intake
+by passing `--hermes-manager-intake <artifact.json>` to `hepa spec import`. The
+JSON must match `HepaHermesManagerIntakeArtifact`, be authored by
+`hepa-manager`, contain the target project, and include one or more finite task
+specs with one to three total rounds. HEPA validates the artifact, converts
+tasks into draft fleet records, and renders draft Hermes card payloads through
+the same card mapping used by markdown imports. Ambiguous manager-intake tasks
+must include blocked clarification questions and remain blocked until the done
+gate can be proven.
+
 ## GitHub issue webhooks
 
 GitHub `issues` webhook payloads can be converted into the same draft task
