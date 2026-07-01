@@ -457,6 +457,53 @@ impl HepaValidate for HepaReviewSignal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaHermesReviewArtifact {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub lane_id: String,
+    pub author_profile_id: String,
+    pub signals: Vec<HepaReviewSignal>,
+    pub arbitration_required: bool,
+}
+
+impl HepaValidate for HepaHermesReviewArtifact {
+    fn validate(&self) -> HepaContractResult {
+        require_schema(self.schema_version)?;
+        require_single_line("task_id", &self.task_id)?;
+        require_single_line("lane_id", &self.lane_id)?;
+        require_single_line("author_profile_id", &self.author_profile_id)?;
+        if self.author_profile_id != "hepa-reviewer" {
+            return Err(HepaContractError::new(
+                "author_profile_id",
+                "review artifact must be authored by the hepa-reviewer Hermes profile",
+            ));
+        }
+        if self.signals.is_empty() {
+            return Err(HepaContractError::new(
+                "signals",
+                "Hermes review artifact must include at least one review signal",
+            ));
+        }
+        for (index, signal) in self.signals.iter().enumerate() {
+            signal.validate()?;
+            if signal.lane_id != self.lane_id {
+                return Err(HepaContractError::new(
+                    format!("signals[{index}].lane_id"),
+                    "must match review artifact lane_id",
+                ));
+            }
+            if !signal.adapter_id.starts_with("hepa-reviewer") {
+                return Err(HepaContractError::new(
+                    format!("signals[{index}].adapter_id"),
+                    "must identify a Hermes reviewer profile",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HepaReviewStatus {
     Approved,
@@ -1319,5 +1366,62 @@ mod tests {
             .validate()
             .expect_err("unbounded worker brief should fail");
         assert_eq!(rounds_error.field, "max_total_rounds");
+    }
+
+    #[test]
+    fn hermes_review_artifact_requires_reviewer_authored_signals() {
+        let artifact = HepaHermesReviewArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-reviewer".to_string(),
+            signals: vec![HepaReviewSignal {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                review_id: "review-1".to_string(),
+                lane_id: "lane-1".to_string(),
+                adapter_id: "hepa-reviewer:primary".to_string(),
+                status: HepaReviewStatus::Approved,
+                findings: Vec::new(),
+                summary: vec!["No blocking findings.".to_string()],
+                completed_at: "2026-06-16T00:00:06Z".to_string(),
+            }],
+            arbitration_required: false,
+        };
+
+        artifact
+            .validate()
+            .expect("Hermes reviewer artifact should validate");
+    }
+
+    #[test]
+    fn hermes_review_artifact_rejects_manager_or_non_reviewer_signal() {
+        let mut artifact = HepaHermesReviewArtifact {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-manager".to_string(),
+            signals: vec![HepaReviewSignal {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                review_id: "review-1".to_string(),
+                lane_id: "lane-1".to_string(),
+                adapter_id: "pi".to_string(),
+                status: HepaReviewStatus::Approved,
+                findings: Vec::new(),
+                summary: vec!["No blocking findings.".to_string()],
+                completed_at: "2026-06-16T00:00:06Z".to_string(),
+            }],
+            arbitration_required: false,
+        };
+
+        let author_error = artifact
+            .validate()
+            .expect_err("manager-authored review artifact should fail");
+        assert_eq!(author_error.field, "author_profile_id");
+
+        artifact.author_profile_id = "hepa-reviewer".to_string();
+        let signal_error = artifact
+            .validate()
+            .expect_err("non-Hermes reviewer signal should fail");
+        assert_eq!(signal_error.field, "signals[0].adapter_id");
     }
 }

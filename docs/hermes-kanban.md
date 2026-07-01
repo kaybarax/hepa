@@ -79,6 +79,13 @@ summary, and human-review requirement. HEPA validates that the intent came from
 audit section, and performs the manager-owned GitHub operation. The PR remains
 for human review; HEPA does not auto-merge.
 
+Hermes reviewer profiles can hand HEPA review output by setting
+`HEPA_HERMES_REVIEW_ARTIFACT_FILE` to a JSON `HepaHermesReviewArtifact` file.
+The artifact must be authored by `hepa-reviewer` and contain one or more review
+signals labeled with Hermes reviewer profile IDs. HEPA then applies the same
+pass policy, finding aggregation, arbitration, and staging gates it uses for
+headless review fallback.
+
 During the runtime transition, a Hermes manager can hand HEPA an intent artifact
 by setting `HEPA_HERMES_PR_INTENT_FILE` to a JSON `HepaHermesPrIntent` file.
 When this variable is present, live PR creation uses that validated intent; when
