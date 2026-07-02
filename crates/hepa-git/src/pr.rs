@@ -275,6 +275,7 @@ impl HepaManagerGitLifecycle {
         if request.body.trim().is_empty() {
             return Err(HepaPrError::new("body", "PR body must not be empty"));
         }
+        self.require_base_not_ahead_of_remote(&request.base_branch)?;
 
         let args = vec![
             "pr".to_string(),
@@ -328,6 +329,37 @@ impl HepaManagerGitLifecycle {
             ));
         }
         Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
+    fn require_base_not_ahead_of_remote(&self, base_branch: &str) -> Result<(), HepaPrError> {
+        let remote_ref = format!("origin/{base_branch}");
+        if !self.git_ref_exists(&remote_ref)? || !self.git_ref_exists(base_branch)? {
+            return Ok(());
+        }
+        let ahead = self.git(&[
+            "rev-list".to_string(),
+            "--count".to_string(),
+            format!("{remote_ref}..{base_branch}"),
+        ])?;
+        let ahead = ahead.trim().parse::<u64>().unwrap_or(0);
+        if ahead > 0 {
+            return Err(HepaPrError::new(
+                "base_branch",
+                format!(
+                    "local base branch `{base_branch}` is {ahead} commit(s) ahead of `{remote_ref}`; refusing to create a polluted PR"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn git_ref_exists(&self, reference: &str) -> Result<bool, HepaPrError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", "--verify", "--quiet", reference])
+            .output()?;
+        Ok(output.status.success())
     }
 
     fn git(&self, args: &[String]) -> Result<String, HepaPrError> {
@@ -826,6 +858,40 @@ mod tests {
         assert_eq!(calls[0].0, "gh");
         assert!(calls[0].1.iter().any(|arg| arg == "create"));
         assert!(calls[0].1.iter().any(|arg| arg == "--head"));
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn pr_creation_refuses_local_base_ahead_of_remote_base() {
+        let repo = unique_test_dir("pr-base-ahead");
+        init_repo(&repo);
+        git(&repo, ["branch", "-M", "main"]);
+        let initial = git_output(&repo, ["rev-parse", "HEAD"]);
+        git(&repo, ["update-ref", "refs/remotes/origin/main", &initial]);
+        fs::write(repo.join("local-only.txt"), "local base commit\n").expect("local write");
+        git(&repo, ["add", "local-only.txt"]);
+        git(&repo, ["commit", "-m", "local base only"]);
+        git(&repo, ["checkout", "-b", "hepa/manager/lane-a"]);
+
+        let runner = FakeRunner::ok("https://example.invalid/org/repo/pull/7");
+        let lifecycle = HepaManagerGitLifecycle::manager(&repo);
+
+        let error = lifecycle
+            .create_pr(
+                &HepaPrRequest {
+                    title: "feat: change".to_string(),
+                    body: "## Summary\nDid the thing.".to_string(),
+                    base_branch: "main".to_string(),
+                    head_branch: "hepa/manager/lane-a".to_string(),
+                },
+                &runner,
+            )
+            .expect_err("polluted local base must be refused");
+
+        assert_eq!(error.field, "base_branch");
+        assert!(error.message.contains("ahead of `origin/main`"));
+        assert!(runner.calls.borrow().is_empty());
 
         remove_test_dir(repo);
     }
