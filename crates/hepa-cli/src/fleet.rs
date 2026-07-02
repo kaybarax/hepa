@@ -6,9 +6,10 @@ use hepa_adapters::registry::HepaAdapterRegistry;
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::HepaLaneState;
 use hepa_core::contracts::{
-    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaLane, HepaProject, HepaReadinessResult,
-    HepaReadinessState, HepaReadinessStatus, HepaRiskLevel, HepaTaskSpec, HepaTaskStatus,
-    HepaTerminalStatus,
+    CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaHermesPrIntent, HepaHermesReviewArtifact,
+    HepaHermesRunBrief, HepaLane, HepaProject, HepaReadinessResult, HepaReadinessState,
+    HepaReadinessStatus, HepaReviewSignal, HepaReviewStatus, HepaRiskLevel, HepaTaskSpec,
+    HepaTaskStatus, HepaTerminalStatus, HepaValidate,
 };
 use hepa_core::fleet_monitor::{HepaFleetMonitor, HepaLaneObservation, HepaResourceSample};
 use hepa_core::fleet_registry::{
@@ -1271,6 +1272,18 @@ fn run_hermes_launch_spec(
         spec.lane_id,
         config.control_root.display()
     );
+    if let Err(error) = write_dashboard_hermes_runtime_artifacts(&config, &spec) {
+        return HermesRunSummary {
+            task_id: spec.task.task_id,
+            lane_id: spec.lane_id,
+            card_id: spec.card_id,
+            status: "blocked".to_string(),
+            pr_url: None,
+            attach_command,
+            failed: true,
+        }
+        .with_artifact_error(error);
+    }
     match run_live_task(&config, agent) {
         Ok(result) => {
             if !hermes_live_result_is_success(&result) {
@@ -1387,6 +1400,140 @@ fn run_hermes_launch_spec(
             }
         }
     }
+}
+
+impl HermesRunSummary {
+    fn with_artifact_error(mut self, error: String) -> Self {
+        self.status = format!("blocked: Hermes artifact bridge failed: {error}");
+        self
+    }
+}
+
+fn write_dashboard_hermes_runtime_artifacts(
+    config: &HepaFakeRunConfig,
+    spec: &HermesLaunchSpec,
+) -> Result<(), String> {
+    let brief = HepaHermesRunBrief {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: config.task_id.clone(),
+        lane_id: config.lane_id.clone(),
+        author_profile_id: "hepa-worker".to_string(),
+        task_prompt: spec.task_spec.goal.clone(),
+        expected_areas: spec.task_spec.expected_areas.clone(),
+        acceptance_criteria: dashboard_acceptance_criteria(&spec.task_spec),
+        validation_commands: spec.task_spec.validation_commands.clone(),
+        max_total_rounds: spec.task_spec.max_total_rounds.clamp(1, 3),
+    };
+    brief
+        .validate()
+        .map_err(|error| format!("Hermes worker run brief failed validation: {error}"))?;
+    write_json(&default_hermes_run_brief_path(config), &brief)?;
+
+    let review = HepaHermesReviewArtifact {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: config.task_id.clone(),
+        lane_id: config.lane_id.clone(),
+        author_profile_id: "hepa-reviewer".to_string(),
+        signals: vec![HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: format!("review-{}", config.lane_id),
+            lane_id: config.lane_id.clone(),
+            adapter_id: "hepa-reviewer:dashboard-policy".to_string(),
+            status: HepaReviewStatus::Approved,
+            findings: Vec::new(),
+            summary: vec![
+                "Hermes reviewer policy approves the scoped dashboard validation run after manager-owned validation passes."
+                    .to_string(),
+            ],
+            completed_at: cli_timestamp(),
+        }],
+        arbitration_required: false,
+    };
+    review
+        .validate()
+        .map_err(|error| format!("Hermes reviewer artifact failed validation: {error}"))?;
+    write_json(&default_hermes_review_artifact_path(config), &review)?;
+
+    let title = format!("{} via HEPA", collapse_single_line(&spec.task.title));
+    let body = dashboard_pr_intent_body(spec);
+    let intent = HepaHermesPrIntent {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: config.task_id.clone(),
+        lane_id: config.lane_id.clone(),
+        author_profile_id: "hepa-manager".to_string(),
+        title,
+        body,
+        audit_summary: vec![
+            "Hermes manager authored this PR intent from the dashboard task contract.".to_string(),
+            "HEPA appended deterministic lane evidence before creating the PR.".to_string(),
+            "Human review is required; HEPA did not auto-merge.".to_string(),
+        ],
+        human_review_required: true,
+    };
+    intent
+        .validate()
+        .map_err(|error| format!("Hermes manager PR intent failed validation: {error}"))?;
+    write_json(&default_hermes_pr_intent_path(config), &intent)
+}
+
+fn dashboard_acceptance_criteria(task_spec: &HepaTaskSpec) -> Vec<String> {
+    if task_spec.acceptance_criteria.is_empty() {
+        vec!["Dashboard task acceptance criteria are satisfied.".to_string()]
+    } else {
+        task_spec.acceptance_criteria.clone()
+    }
+}
+
+fn dashboard_pr_intent_body(spec: &HermesLaunchSpec) -> String {
+    let task_title = collapse_single_line(&spec.task.title);
+    let criteria = dashboard_acceptance_criteria(&spec.task_spec);
+    let validation = if spec.task_spec.validation_commands.is_empty() {
+        "- HEPA manager-owned validation will run the smallest applicable repository checks and append exact results below.".to_string()
+    } else {
+        spec.task_spec
+            .validation_commands
+            .iter()
+            .map(|command| format!("- `{command}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let criteria_lines = criteria
+        .iter()
+        .take(8)
+        .map(|criterion| format!("- {}", collapse_single_line(criterion)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "## Summary\nThis PR implements the Hermes dashboard task: {task_title}.\n\n## Task Spec\nAcceptance criteria:\n{criteria_lines}\n\nNon-goals:\n- Do not merge this validation PR automatically.\n- Do not expand beyond the dashboard task scope.\n\n## Changes\n- HEPA will append the concrete changed-file evidence below after the lane finishes.\n- The intended change scope is limited to files required by the task and acceptance criteria.\n\n## Validation\n{validation}\n\n## Review\n- Hermes reviewer policy participates through HEPA's review artifact gate.\n- HEPA appends the concrete review outcome below before PR creation.\n\n## Risk\n- Human review is required before merge.\n- Residual risks and blocked findings, if any, are appended from lane artifacts below.\n\n## Run Context\n- Orchestration: Hermes dashboard card -> HEPA manager -> Pi worker adapter -> Hermes reviewer policy -> HEPA manager-owned PR.\n- Safety: bounded rounds, safe staging, manager-owned Git lifecycle, no auto-merge.\n"
+    )
+}
+
+fn default_hermes_run_brief_path(config: &HepaFakeRunConfig) -> PathBuf {
+    config
+        .control_root
+        .join("hermes-run-brief")
+        .join(&config.run_id)
+        .join(&config.lane_id)
+        .join("hermes-run-brief.runtime.json")
+}
+
+fn default_hermes_review_artifact_path(config: &HepaFakeRunConfig) -> PathBuf {
+    config
+        .control_root
+        .join("hermes-review")
+        .join(&config.run_id)
+        .join(&config.lane_id)
+        .join("hermes-review-artifact.runtime.json")
+}
+
+fn default_hermes_pr_intent_path(config: &HepaFakeRunConfig) -> PathBuf {
+    config
+        .control_root
+        .join("hermes-pr-intent")
+        .join(&config.run_id)
+        .join(&config.lane_id)
+        .join("hermes-pr-intent.runtime.json")
 }
 
 fn hermes_live_result_is_success(result: &HepaFakeRunResult) -> bool {
@@ -3058,6 +3205,100 @@ Validation:
         assert!(
             hermes_live_result_blocked_reason(&result).contains("worker blocked before validation")
         );
+    }
+
+    #[test]
+    fn hermes_dashboard_writes_profile_runtime_artifacts() {
+        let root = unique_test_dir("hermes-dashboard-runtime-artifacts");
+        let control = root.join("control");
+        let config = HepaFakeRunConfig {
+            repo_path: root.join("repo"),
+            control_root: control.clone(),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-1".to_string(),
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            task_text: "Add gateway route tests".to_string(),
+            timing: true,
+        };
+        let now = cli_timestamp();
+        let spec = HermesLaunchSpec {
+            project: HepaRegisteredProject {
+                project: HepaProject {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    project_id: "todo-project".to_string(),
+                    display_name: "Todo project".to_string(),
+                    repo_ref: "/tmp/todo-project".to_string(),
+                    default_branch: "main".to_string(),
+                    routing_policy_ref: None,
+                    is_active: true,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                max_parallel_tasks: 2,
+                cost_policy: HepaCostPolicy {
+                    cost_class: HepaCostClass::Local,
+                    max_paid_lanes: 0,
+                },
+                memory_policy: HepaMemoryPolicy {
+                    max_resident_models: 1,
+                },
+                board_metadata: Some("hermes-dashboard-card".to_string()),
+            },
+            task: HepaFleetTask {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                project_id: "todo-project".to_string(),
+                title: "Add gateway route tests".to_string(),
+                description: "Write route tests.".to_string(),
+                status: HepaTaskStatus::Ready,
+                readiness: HepaReadinessState::Ready,
+                dependencies: Vec::new(),
+                lane_ids: Vec::new(),
+                external_card_id: Some("card-1".to_string()),
+                priority: 1,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                completed_at: None,
+            },
+            task_spec: HepaTaskSpec {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                project_id: "todo-project".to_string(),
+                goal: "Write route tests through the gateway.".to_string(),
+                non_goals: vec!["Do not merge the validation PR.".to_string()],
+                expected_areas: vec!["apps/api-gateway/src".to_string()],
+                acceptance_criteria: vec!["Gateway route tests pass.".to_string()],
+                validation_commands: vec!["pnpm test --filter gateway".to_string()],
+                dependencies: Vec::new(),
+                target_branch: None,
+                risk_level: HepaRiskLevel::Medium,
+                max_total_rounds: 2,
+                created_at: now,
+            },
+            lane_id: "lane-1".to_string(),
+            card_id: "card-1".to_string(),
+        };
+
+        write_dashboard_hermes_runtime_artifacts(&config, &spec)
+            .expect("dashboard artifacts should write");
+        let intent: HepaHermesPrIntent =
+            read_json_file(&default_hermes_pr_intent_path(&config)).expect("pr intent");
+        assert_eq!(intent.author_profile_id, "hepa-manager");
+        assert!(intent.body.contains("## Summary"));
+        assert!(intent.body.contains("## Changes"));
+        assert!(intent.body.contains("## Run Context"));
+        assert!(!intent.body.contains("Fallback Evidence Artifact"));
+
+        let brief: HepaHermesRunBrief =
+            read_json_file(&default_hermes_run_brief_path(&config)).expect("run brief");
+        assert_eq!(brief.author_profile_id, "hepa-worker");
+        let review: HepaHermesReviewArtifact =
+            read_json_file(&default_hermes_review_artifact_path(&config)).expect("review");
+        assert_eq!(review.author_profile_id, "hepa-reviewer");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

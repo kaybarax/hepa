@@ -5,6 +5,12 @@
 terminal:
   backend: local
 
+kanban:
+  # HEPA owns decomposition and lane state. Hermes cards assigned to HEPA
+  # profiles must be handed to `hepa hermes run-dashboard-card`, not split into
+  # generic chat-worker children by the dashboard dispatcher.
+  auto_decompose: false
+
 skills:
   external_dirs:
     - "~/<path-to-workspace>/hepa/hermes-skills"

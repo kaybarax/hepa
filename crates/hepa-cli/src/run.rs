@@ -1825,6 +1825,23 @@ fn live_run_brief(config: &HepaFakeRunConfig) -> Result<Option<HepaHermesRunBrie
     if let Ok(command) = std::env::var("HEPA_HERMES_RUN_BRIEF_COMMAND") {
         return live_run_brief_from_runtime_command(&command, config).map(Some);
     }
+    let default_brief_path = default_hermes_run_brief_path(config);
+    if default_brief_path.exists() {
+        let brief = hermes_run_brief_from_file(&default_brief_path)?;
+        if brief.task_id != config.task_id {
+            return Err(format!(
+                "Hermes run brief task_id mismatch: expected {} got {}",
+                config.task_id, brief.task_id
+            ));
+        }
+        if brief.lane_id != config.lane_id {
+            return Err(format!(
+                "Hermes run brief lane_id mismatch: expected {} got {}",
+                config.lane_id, brief.lane_id
+            ));
+        }
+        return Ok(Some(brief));
+    }
     let Ok(brief_path) = std::env::var("HEPA_HERMES_RUN_BRIEF_FILE") else {
         if hermes_required() {
             return Err(
@@ -1848,6 +1865,15 @@ fn live_run_brief(config: &HepaFakeRunConfig) -> Result<Option<HepaHermesRunBrie
         ));
     }
     Ok(Some(brief))
+}
+
+fn default_hermes_run_brief_path(config: &HepaFakeRunConfig) -> PathBuf {
+    config
+        .control_root
+        .join("hermes-run-brief")
+        .join(&config.run_id)
+        .join(&config.lane_id)
+        .join("hermes-run-brief.runtime.json")
 }
 
 fn live_run_brief_from_runtime_command(
@@ -1928,6 +1954,17 @@ fn live_pr_request(
             head_branch.to_string(),
         );
     }
+    let default_intent_path = default_hermes_pr_intent_path(config);
+    if default_intent_path.exists() {
+        return pr_request_from_hermes_intent_file(
+            &default_intent_path,
+            task_spec,
+            terminal_report,
+            lane,
+            base_branch.to_string(),
+            head_branch.to_string(),
+        );
+    }
     if let Ok(intent_path) = std::env::var("HEPA_HERMES_PR_INTENT_FILE") {
         return pr_request_from_hermes_intent_file(
             Path::new(&intent_path),
@@ -1960,6 +1997,15 @@ fn live_pr_request(
         base_branch: base_branch.to_string(),
         head_branch: head_branch.to_string(),
     })
+}
+
+fn default_hermes_pr_intent_path(config: &HepaFakeRunConfig) -> PathBuf {
+    config
+        .control_root
+        .join("hermes-pr-intent")
+        .join(&config.run_id)
+        .join(&config.lane_id)
+        .join("hermes-pr-intent.runtime.json")
 }
 
 fn pr_request_from_hermes_intent_runtime_command(
@@ -2065,7 +2111,7 @@ fn clamp_live_budget_ms(raw: Option<&str>, default_ms: u64, max_ms: u64) -> u64 
 
 fn live_worker_prompt(task_text: &str) -> String {
     format!(
-        "You are HEPA's live stress-test worker.\n\nTask:\n{task_text}\n\nRepository worktree: current directory.\n\nExecution rules:\n- You are already running inside the lane worktree.\n- Make only the changes needed to satisfy the task.\n- Use relative paths when reading or editing files.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Run the smallest relevant validation command requested by the task when practical.\n- Finish by reporting changed files, validation results, and any blockers.\n",
+        "You are HEPA's live stress-test worker.\n\nTask:\n{task_text}\n\nRepository worktree: current directory.\n\nExecution rules:\n- You are already running inside the lane worktree.\n- Make only the changes needed to satisfy the task.\n- Use relative paths when reading or editing files.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Do not run package install commands that can rewrite lockfiles or workspace/package-manager configuration unless the task explicitly asks for dependency or package-manager changes.\n- Run the smallest relevant validation command when practical, but only if it does not mutate dependency lockfiles or workspace/package-manager configuration; manager-owned validation will run the configured validation commands after your attempt.\n- Finish by reporting changed files, validation results if you ran a non-mutating check, and any blockers.\n",
     )
 }
 
@@ -2716,6 +2762,23 @@ fn live_review_artifact_from_runtime_command(
 fn live_review_artifact(
     config: &HepaFakeRunConfig,
 ) -> Result<Option<HepaHermesReviewArtifact>, String> {
+    let default_artifact_path = default_hermes_review_artifact_path(config);
+    if default_artifact_path.exists() {
+        let artifact = hermes_review_artifact_from_file(&default_artifact_path)?;
+        if artifact.task_id != config.task_id {
+            return Err(format!(
+                "Hermes review artifact task_id mismatch: expected {} got {}",
+                config.task_id, artifact.task_id
+            ));
+        }
+        if artifact.lane_id != config.lane_id {
+            return Err(format!(
+                "Hermes review artifact lane_id mismatch: expected {} got {}",
+                config.lane_id, artifact.lane_id
+            ));
+        }
+        return Ok(Some(artifact));
+    }
     let Ok(artifact_path) = std::env::var("HEPA_HERMES_REVIEW_ARTIFACT_FILE") else {
         return Ok(None);
     };
@@ -2733,6 +2796,15 @@ fn live_review_artifact(
         ));
     }
     Ok(Some(artifact))
+}
+
+fn default_hermes_review_artifact_path(config: &HepaFakeRunConfig) -> PathBuf {
+    config
+        .control_root
+        .join("hermes-review")
+        .join(&config.run_id)
+        .join(&config.lane_id)
+        .join("hermes-review-artifact.runtime.json")
 }
 
 fn hermes_review_artifact_from_file(

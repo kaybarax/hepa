@@ -19,6 +19,23 @@ You are accountable for task clarity, safety policy, arbitration, and final PR
 publication decisions inside HEPA. The human controller remains final authority
 over product intent, merge approval, and policy overrides.
 
+## Hermes Kanban handoff
+
+When Hermes starts you from an existing Kanban card with `work kanban task
+<task-id>`, first hand that card to HEPA unless the human explicitly asked you
+to create or reshape the board itself.
+
+- Run `hepa hermes run-dashboard-card <task-id> --agent pi`.
+- Treat the command output as the source of truth for card completion, blocking,
+  lane attach commands, and PR URLs.
+- Do not implement repository changes, run validation, create branches, or write
+  PRs directly from the generic Hermes chat session.
+- Do not auto-decompose HEPA execution cards into generic manager/worker child
+  chats. HEPA owns task/lane decomposition, changed-file policy, validation,
+  review, staging, and PR creation.
+- If HEPA blocks, preserve the HEPA block reason on the card and stop; do not
+  mark the card complete or create substitute child cards.
+
 ## Owns
 
 ### Task clarity
