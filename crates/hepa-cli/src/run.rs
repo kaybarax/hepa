@@ -2670,6 +2670,12 @@ fn safe_validation_argv(command: &str) -> Result<Vec<String>, String> {
         ["yarn", "install", "--frozen-lockfile"] => parts,
         ["yarn", script] if matches!(*script, "test" | "test:e2e" | "build" | "lint") => parts,
         ["npx", "vitest", "run", file] if is_safe_validation_token(file) => parts,
+        ["bun", "test", files @ ..]
+            if !files.is_empty() && files.iter().all(|file| is_safe_validation_token(file)) =>
+        {
+            parts
+        }
+        ["bunx", "tsc", "--noEmit", "-p", config] if is_safe_validation_token(config) => parts,
         ["pnpm", "install", "--frozen-lockfile", "--offline"] => parts,
         ["pnpm", "format:check"] => parts,
         ["pnpm", "--filter", package, script]
@@ -6219,6 +6225,29 @@ JSON
         assert_eq!(
             safe_validation_argv("yarn test").expect("yarn test"),
             vec!["yarn", "test"]
+        );
+        assert_eq!(
+            safe_validation_argv(
+                "bun test apps/api-gateway/src/__tests__/app.test.ts apps/api-gateway/src/__tests__/health.test.ts"
+            )
+            .expect("bun test files"),
+            vec![
+                "bun",
+                "test",
+                "apps/api-gateway/src/__tests__/app.test.ts",
+                "apps/api-gateway/src/__tests__/health.test.ts"
+            ]
+        );
+        assert_eq!(
+            safe_validation_argv("bunx tsc --noEmit -p apps/api-gateway/tsconfig.json")
+                .expect("bunx tsc project"),
+            vec![
+                "bunx",
+                "tsc",
+                "--noEmit",
+                "-p",
+                "apps/api-gateway/tsconfig.json"
+            ]
         );
     }
 
