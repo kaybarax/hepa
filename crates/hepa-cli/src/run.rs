@@ -2265,17 +2265,24 @@ fn expected_areas_from_task(task_text: &str) -> Vec<String> {
 }
 
 fn live_validation_commands(task_text: &str) -> Vec<String> {
+    if task_text.contains("login-form.test.tsx") {
+        return vec!["npx vitest run login-form.test.tsx".to_string()];
+    }
+
     let mut commands = Vec::new();
     for command in [
         "pnpm install --frozen-lockfile --offline",
         "pnpm format:check",
         "yarn install --frozen-lockfile",
+        "yarn test",
         "yarn test:e2e",
         "yarn build",
         "npx vitest run login-form.test.tsx",
+        "pnpm --filter @todo/api-gateway test",
+        "pnpm --filter @todo/services test",
         "git diff --check",
     ] {
-        if task_text.contains(command) {
+        if task_text_contains_command(task_text, command) {
             commands.push(command.to_string());
         }
     }
@@ -2293,12 +2300,20 @@ fn live_validation_commands(task_text: &str) -> Vec<String> {
         return commands;
     }
 
-    if task_text.contains("login-form.test.tsx") {
-        vec!["npx vitest run login-form.test.tsx".to_string()]
-    } else if task_text.to_ascii_lowercase().contains("no-tests-detected") {
+    if task_text.to_ascii_lowercase().contains("no-tests-detected") {
         Vec::new()
     } else {
         vec!["git diff --check".to_string()]
+    }
+}
+
+fn task_text_contains_command(task_text: &str, command: &str) -> bool {
+    if command == "yarn test" {
+        task_text
+            .split(|ch: char| ch == '\n' || ch == ';' || ch == '.' || ch == ',')
+            .any(|part| part.trim() == command)
+    } else {
+        task_text.contains(command)
     }
 }
 
@@ -2463,20 +2478,32 @@ fn is_workspace_config_change(path: &str) -> bool {
 
 fn task_allows_dependency_lockfile_changes(task_text: &str) -> bool {
     let text = task_text.to_ascii_lowercase();
+    if contains_negative_change_instruction(
+        &text,
+        &["lockfile", "lock file", "pnpm-lock.yaml", "yarn.lock"],
+    ) {
+        return false;
+    }
     [
-        "dependency",
-        "dependencies",
-        "lockfile",
-        "lock file",
-        "package manager",
-        "package-manager",
+        "add a dependency",
+        "add dependency",
+        "add dependencies",
+        "upgrade a dependency",
+        "upgrade dependency",
+        "upgrade dependencies",
+        "update the lockfile",
+        "update lockfile",
+        "update the lock file",
+        "update lock file",
+        "edit the lockfile",
+        "edit lockfile",
+        "edit the lock file",
         "pnpm install",
         "npm install",
         "yarn install",
         "bun install",
         "add package",
         "upgrade package",
-        "update package",
     ]
     .iter()
     .any(|marker| text.contains(marker))
@@ -2484,19 +2511,45 @@ fn task_allows_dependency_lockfile_changes(task_text: &str) -> bool {
 
 fn task_allows_workspace_config_changes(task_text: &str) -> bool {
     let text = task_text.to_ascii_lowercase();
+    if contains_negative_change_instruction(
+        &text,
+        &[
+            "workspace config",
+            "package-manager configuration",
+            "pnpm-workspace.yaml",
+        ],
+    ) {
+        return false;
+    }
     [
-        "workspace",
-        "monorepo config",
-        "package manager",
-        "package-manager",
-        "pnpm-workspace",
-        "turbo",
-        "nx",
-        "lerna",
-        "rush",
+        "update workspace config",
+        "update the workspace config",
+        "update monorepo config",
+        "update the monorepo config",
+        "update package-manager configuration",
+        "update the package-manager configuration",
+        "update the pnpm-workspace",
+        "update pnpm-workspace",
+        "edit pnpm-workspace",
+        "update turbo config",
+        "update nx config",
+        "update lerna config",
+        "update rush config",
     ]
     .iter()
     .any(|marker| text.contains(marker))
+}
+
+fn contains_negative_change_instruction(text: &str, protected_markers: &[&str]) -> bool {
+    ["do not", "don't", "must not", "never"]
+        .iter()
+        .filter_map(|negative| text.find(negative).map(|index| &text[index..]))
+        .any(|suffix| {
+            let window = suffix.chars().take(180).collect::<String>();
+            protected_markers
+                .iter()
+                .any(|marker| window.contains(marker))
+        })
 }
 
 fn is_live_secret_like_path(path: &str) -> bool {
@@ -2562,21 +2615,10 @@ fn run_safe_validation_command(
     worktree: &Path,
     command: &str,
 ) -> Result<(i32, String, String), String> {
-    let argv = match command {
-        "yarn install --frozen-lockfile" => vec!["yarn", "install", "--frozen-lockfile"],
-        "yarn test:e2e" => vec!["yarn", "test:e2e"],
-        "yarn build" => vec!["yarn", "build"],
-        "npx vitest run login-form.test.tsx" => vec!["npx", "vitest", "run", "login-form.test.tsx"],
-        "pnpm install --frozen-lockfile --offline" => {
-            vec!["pnpm", "install", "--frozen-lockfile", "--offline"]
-        }
-        "pnpm format:check" => vec!["pnpm", "format:check"],
-        "git diff --check" => vec!["git", "diff", "--check"],
-        _ => return Err(format!("unsupported live validation command: {command}")),
-    };
+    let argv = safe_validation_argv(command)?;
     let timeout_ms = live_validation_timeout_ms();
     let started = Instant::now();
-    let mut child = Command::new(argv[0])
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(worktree)
         .stdout(Stdio::piped())
@@ -2619,6 +2661,41 @@ fn run_safe_validation_command(
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn safe_validation_argv(command: &str) -> Result<Vec<String>, String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let argv = match parts.as_slice() {
+        ["git", "diff", "--check"] => parts,
+        ["yarn", "install", "--frozen-lockfile"] => parts,
+        ["yarn", script] if matches!(*script, "test" | "test:e2e" | "build" | "lint") => parts,
+        ["npx", "vitest", "run", file] if is_safe_validation_token(file) => parts,
+        ["pnpm", "install", "--frozen-lockfile", "--offline"] => parts,
+        ["pnpm", "format:check"] => parts,
+        ["pnpm", "--filter", package, script]
+            if is_safe_package_filter(package)
+                && matches!(*script, "test" | "lint" | "typecheck" | "build") =>
+        {
+            parts
+        }
+        _ => return Err(format!("unsupported live validation command: {command}")),
+    };
+    Ok(argv.into_iter().map(str::to_string).collect())
+}
+
+fn is_safe_package_filter(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '@' | '/' | '-' | '_' | '.'))
+}
+
+fn is_safe_validation_token(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.'))
 }
 
 fn live_validation_timeout_ms() -> u64 {
@@ -6063,6 +6140,23 @@ JSON
     }
 
     #[test]
+    fn manager_changed_file_policy_treats_negative_dependency_text_as_no_permission() {
+        let changed = vec![
+            "apps/api-gateway/src/__tests__/route-parity.test.ts".to_string(),
+            "pnpm-lock.yaml".to_string(),
+            "pnpm-workspace.yaml".to_string(),
+        ];
+
+        let blocker = manager_changed_file_policy_blocker(
+            &changed,
+            "Do not edit pnpm-lock.yaml, pnpm-workspace.yaml, package.json dependency lists, generated dist files, or node_modules.",
+        )
+        .expect("negative dependency instructions must not authorize package-manager churn");
+
+        assert!(blocker.contains("pnpm-lock.yaml"));
+    }
+
+    #[test]
     fn manager_changed_file_policy_blocks_unrequested_workspace_config_churn() {
         let changed = vec![
             "apps/web/package.json".to_string(),
@@ -6104,6 +6198,30 @@ JSON
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn safe_validation_argv_allows_dashboard_package_scripts() {
+        assert_eq!(
+            safe_validation_argv("pnpm --filter @todo/api-gateway test").expect("pnpm filter"),
+            vec!["pnpm", "--filter", "@todo/api-gateway", "test"]
+        );
+        assert_eq!(
+            safe_validation_argv("pnpm --filter @todo/services test").expect("pnpm filter"),
+            vec!["pnpm", "--filter", "@todo/services", "test"]
+        );
+        assert_eq!(
+            safe_validation_argv("yarn test").expect("yarn test"),
+            vec!["yarn", "test"]
+        );
+    }
+
+    #[test]
+    fn safe_validation_argv_rejects_shell_commands() {
+        let error = safe_validation_argv("pnpm --filter @todo/api-gateway test; rm -rf .")
+            .expect_err("shell metachar command must not be accepted");
+
+        assert!(error.contains("unsupported live validation command"));
     }
 
     #[test]
