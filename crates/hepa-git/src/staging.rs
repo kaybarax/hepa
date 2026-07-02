@@ -477,6 +477,9 @@ fn line_has_secret_assignment(line: &str) -> bool {
             if is_documented_secret_placeholder(value) {
                 continue;
             }
+            if is_safe_auth_code_reference(value) {
+                continue;
+            }
             return true;
         }
     }
@@ -520,6 +523,20 @@ fn is_secret_assignment_key(key: &str) -> bool {
 fn is_documented_secret_placeholder(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     normalized.starts_with("your-") || normalized.starts_with("<your-")
+}
+
+fn is_safe_auth_code_reference(value: &str) -> bool {
+    matches!(
+        value,
+        "token"
+            | "refreshToken"
+            | "authToken"
+            | "this.token"
+            | "this.refreshToken"
+            | "this.authToken"
+            | "null"
+            | "undefined"
+    )
 }
 
 #[cfg(test)]
@@ -837,6 +854,30 @@ mod tests {
             HepaStagingRejectionReason::ContentPrivacy
         );
         assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_allows_auth_token_code_references() {
+        let repo = unique_test_dir("stage-content-auth-code");
+        init_repo(&repo);
+        fs::create_dir_all(repo.join("src/api")).expect("src dir");
+        fs::write(
+            repo.join("src/api/BaseApiClient.ts"),
+            "setAuthToken(token: string, refreshToken?: string): void {\n  this.authToken = token;\n  this.refreshToken = refreshToken ?? null;\n}\nconst body = { refreshToken: this.refreshToken };\n",
+        )
+        .expect("api client write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&["src/api/BaseApiClient.ts".to_string()])
+            .expect("ordinary auth token code references should stage");
+
+        assert_eq!(
+            report.staged_files,
+            vec!["src/api/BaseApiClient.ts".to_string()]
+        );
 
         remove_test_dir(repo);
     }
