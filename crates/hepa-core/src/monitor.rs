@@ -150,12 +150,21 @@ impl HepaMonitorPolicy {
 
 fn output_contains_secret_marker(output: &str, marker: &str) -> bool {
     if marker.contains('=') || marker.contains(':') {
-        return output.contains(marker);
+        return output
+            .match_indices(marker)
+            .any(|(index, _)| assignment_marker_has_value(output, index + marker.len()));
     }
 
     output
         .lines()
         .any(|line| contains_secret_assignment(line, marker))
+}
+
+fn assignment_marker_has_value(output: &str, value_start: usize) -> bool {
+    output[value_start..]
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_ascii_whitespace())
 }
 
 fn contains_secret_assignment(line: &str, marker: &str) -> bool {
@@ -339,6 +348,18 @@ mod tests {
                 .check_output("## Secrets:\nManaged through the deployment platform")
                 .is_ok()
         );
+        assert!(
+            policy
+                .check_output("monitor emitted an empty sentinel: secret=")
+                .is_ok()
+        );
+        assert!(matches!(
+            policy.check_output("monitor emitted a real value: secret=redacted"),
+            Err(HepaMonitorStop {
+                kind: HepaMonitorStopKind::SecretDetected,
+                ..
+            })
+        ));
     }
 
     #[test]

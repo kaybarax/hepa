@@ -371,16 +371,22 @@ fn classify_staging_content_for_path(
     path: &str,
     content: &str,
 ) -> Option<HepaStagingRejectionReason> {
-    classify_staging_content_with_options(content, !is_dependency_lockfile(path))
+    classify_staging_content_with_options(
+        content,
+        !is_dependency_lockfile(path),
+        !is_test_or_fixture_path(path),
+    )
 }
 
 fn classify_staging_content_with_options(
     content: &str,
     scan_secret_assignments: bool,
+    scan_private_path_markers: bool,
 ) -> Option<HepaStagingRejectionReason> {
-    if FORBIDDEN_CONTENT_PATH_MARKERS
-        .iter()
-        .any(|marker| content.contains(marker))
+    if (scan_private_path_markers
+        && FORBIDDEN_CONTENT_PATH_MARKERS
+            .iter()
+            .any(|marker| content.contains(marker)))
         || FORBIDDEN_CONTENT_ARTIFACT_MARKERS
             .iter()
             .any(|marker| content.contains(marker))
@@ -408,6 +414,22 @@ fn is_dependency_lockfile(path: &str) -> bool {
         name,
         "pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "bun.lock" | "bun.lockb"
     )
+}
+
+fn is_test_or_fixture_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/test/")
+        || normalized.contains("/tests/")
+        || normalized.contains("/__tests__/")
+        || normalized.contains("/fixtures/")
+        || normalized.ends_with(".test.ts")
+        || normalized.ends_with(".test.tsx")
+        || normalized.ends_with(".test.js")
+        || normalized.ends_with(".test.jsx")
+        || normalized.ends_with(".spec.ts")
+        || normalized.ends_with(".spec.tsx")
+        || normalized.ends_with(".spec.js")
+        || normalized.ends_with(".spec.jsx")
 }
 
 fn token_has_forbidden_prefix(token: &str) -> bool {
@@ -697,6 +719,56 @@ mod tests {
 
         assert_eq!(error.rejections.len(), 1);
         assert_eq!(error.rejections[0].path, "config.json");
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_allows_synthetic_private_paths_in_tests() {
+        let repo = unique_test_dir("stage-content-test-path");
+        init_repo(&repo);
+        fs::create_dir_all(repo.join("src/main")).expect("src dir");
+        fs::write(
+            repo.join("src/main/config.test.ts"),
+            "expect(configPath('/Users/tester/tmp/workspace')).toContain('/Users/tester/tmp');\n",
+        )
+        .expect("test write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&["src/main/config.test.ts".to_string()])
+            .expect("synthetic test fixture paths should not block staging");
+
+        assert_eq!(
+            report.staged_files,
+            vec!["src/main/config.test.ts".to_string()]
+        );
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_still_blocks_secret_assignments_in_tests() {
+        let repo = unique_test_dir("stage-content-test-secret");
+        init_repo(&repo);
+        fs::create_dir_all(repo.join("src/main")).expect("src dir");
+        fs::write(
+            repo.join("src/main/config.test.ts"),
+            "api_key = 'real-value'\n",
+        )
+        .expect("test write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["src/main/config.test.ts".to_string()])
+            .expect_err("test files must still block secret assignments");
+
+        assert_eq!(error.rejections.len(), 1);
         assert_eq!(
             error.rejections[0].reason,
             HepaStagingRejectionReason::ContentPrivacy
