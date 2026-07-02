@@ -2673,6 +2673,11 @@ fn safe_validation_argv(command: &str) -> Result<Vec<String>, String> {
         ["git", "diff", "--check"] => parts,
         ["yarn", "install", "--frozen-lockfile"] => parts,
         ["yarn", script] if matches!(*script, "test" | "test:e2e" | "build" | "lint") => parts,
+        ["yarn", "test", files @ ..]
+            if !files.is_empty() && files.iter().all(|file| is_safe_validation_token(file)) =>
+        {
+            parts
+        }
         ["npx", "vitest", "run", file] if is_safe_validation_token(file) => parts,
         ["bun", "test", files @ ..]
             if !files.is_empty() && files.iter().all(|file| is_safe_validation_token(file)) =>
@@ -2685,6 +2690,14 @@ fn safe_validation_argv(command: &str) -> Result<Vec<String>, String> {
         ["pnpm", "--filter", package, script]
             if is_safe_package_filter(package)
                 && matches!(*script, "test" | "lint" | "typecheck" | "build") =>
+        {
+            parts
+        }
+        ["pnpm", "--filter", package, script, "--", args @ ..]
+            if is_safe_package_filter(package)
+                && matches!(*script, "test" | "lint" | "typecheck" | "build")
+                && !args.is_empty()
+                && args.iter().all(|arg| is_safe_validation_token(arg)) =>
         {
             parts
         }
@@ -6242,6 +6255,24 @@ JSON
         assert_eq!(
             safe_validation_argv("yarn test").expect("yarn test"),
             vec!["yarn", "test"]
+        );
+        assert_eq!(
+            safe_validation_argv("yarn test src/app/util/util.test.ts")
+                .expect("targeted yarn test"),
+            vec!["yarn", "test", "src/app/util/util.test.ts"]
+        );
+        assert_eq!(
+            safe_validation_argv("pnpm --filter @todo/web test -- TodoFilters TodoList")
+                .expect("pnpm filter test args"),
+            vec![
+                "pnpm",
+                "--filter",
+                "@todo/web",
+                "test",
+                "--",
+                "TodoFilters",
+                "TodoList"
+            ]
         );
         assert_eq!(
             safe_validation_argv(

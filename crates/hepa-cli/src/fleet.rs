@@ -812,7 +812,31 @@ fn dashboard_task_text(task: &HermesDashboardTask) -> String {
 }
 
 fn extract_validation_commands(text: &str) -> Vec<String> {
-    extract_bullets_after_heading(text, "Validation")
+    let explicit = extract_bullets_after_heading(text, "Validation")
+        .into_iter()
+        .chain(extract_bullets_after_heading(text, "Validation commands"))
+        .flat_map(|value| split_validation_command_list(&value))
+        .collect::<Vec<_>>();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+
+    let mut commands = Vec::new();
+    for command in [
+        "pnpm --filter @todo/api-gateway test",
+        "pnpm --filter @todo/web test",
+        "pnpm --filter @todo/web test -- TodoFilters TodoList",
+        "yarn test",
+        "yarn build",
+        "git diff --check",
+    ] {
+        if text.contains(command) {
+            commands.push(command.to_string());
+        }
+    }
+    commands.sort();
+    commands.dedup();
+    commands
 }
 
 fn extract_acceptance_criteria(text: &str) -> Vec<String> {
@@ -861,6 +885,15 @@ fn extract_bullets_after_heading(text: &str, heading: &str) -> Vec<String> {
     let mut items = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
+        let heading_prefix = format!("{heading}:");
+        if let Some(position) = find_case_insensitive(trimmed, &heading_prefix) {
+            in_section = true;
+            let inline = trimmed[position + heading_prefix.len()..].trim();
+            if !inline.is_empty() {
+                items.push(inline.to_string());
+            }
+            continue;
+        }
         if trimmed.trim_end_matches(':').eq_ignore_ascii_case(heading) {
             in_section = true;
             continue;
@@ -877,6 +910,27 @@ fn extract_bullets_after_heading(text: &str, heading: &str) -> Vec<String> {
         }
     }
     items
+}
+
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+}
+
+fn split_validation_command_list(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(|command| {
+            command
+                .trim()
+                .trim_matches('`')
+                .trim_end_matches('.')
+                .trim()
+                .to_string()
+        })
+        .filter(|command| !command.is_empty())
+        .collect()
 }
 
 fn update_dashboard_card(
@@ -3423,6 +3477,21 @@ Validation:
         assert!(!body.contains("HEPA lane"));
         assert!(!body.contains("Hermes manager"));
         assert!(!body.contains("human review"));
+    }
+
+    #[test]
+    fn hermes_dashboard_extracts_inline_validation_commands() {
+        let commands = extract_validation_commands(
+            "Acceptance criteria: update source files. Validation: yarn test src/app/util/util.test.ts; yarn build.",
+        );
+
+        assert_eq!(
+            commands,
+            vec![
+                "yarn test src/app/util/util.test.ts".to_string(),
+                "yarn build".to_string()
+            ]
+        );
     }
 
     #[test]
