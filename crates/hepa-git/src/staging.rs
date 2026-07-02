@@ -471,6 +471,9 @@ fn line_has_secret_assignment(line: &str) -> bool {
             if is_safe_auth_code_reference(raw_value) {
                 continue;
             }
+            if is_documented_secret_placeholder(raw_value) {
+                continue;
+            }
             let value = raw_value
                 .split_whitespace()
                 .next()
@@ -528,11 +531,25 @@ fn is_secret_assignment_key(key: &str) -> bool {
 }
 
 fn is_documented_secret_placeholder(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase();
+    let normalized = value
+        .trim()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '<' | '>'
+            )
+        })
+        .to_ascii_lowercase();
     normalized.starts_with("your-")
         || normalized.starts_with("<your-")
         || normalized == "test-secret-value"
         || normalized == "test-jwt-secret"
+        || normalized == "bearer token"
+        || normalized == "bearer <token>"
+        || normalized == "bearer your-token"
+        || normalized == "nope"
+        || normalized == "none"
+        || normalized == "dummy"
 }
 
 fn is_safe_auth_code_reference(value: &str) -> bool {
@@ -897,6 +914,54 @@ mod tests {
     }
 
     #[test]
+    fn stage_approved_files_allows_bearer_token_placeholders_in_tests() {
+        let repo = unique_test_dir("stage-content-bearer-token-test");
+        init_repo(&repo);
+        fs::create_dir_all(repo.join("apps/api-gateway/src/__tests__")).expect("test dir");
+        let content = "const request = new Request('http://gateway.local', {\n  headers: {\n    authorization: 'Bearer token',\n    'x-secret-debug': 'nope',\n  },\n});\nexpect(headers.get('authorization')).toBe('Bearer token');\nexpect(headers.get('x-secret-debug')).toBeNull();\n";
+        assert_eq!(
+            classify_staging_path("apps/api-gateway/src/__tests__/route-proxy.test.ts"),
+            None
+        );
+        for line in content.lines() {
+            assert!(
+                !line_has_secret_assignment(line),
+                "fixture line should not be a secret assignment: {line}"
+            );
+            assert!(
+                !line.split_whitespace().any(token_has_forbidden_prefix),
+                "fixture line should not contain a forbidden token prefix: {line}"
+            );
+        }
+        assert_eq!(
+            classify_staging_content_for_path(
+                "apps/api-gateway/src/__tests__/route-proxy.test.ts",
+                content
+            ),
+            None
+        );
+        fs::write(
+            repo.join("apps/api-gateway/src/__tests__/route-proxy.test.ts"),
+            content,
+        )
+        .expect("route proxy test write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&[
+                "apps/api-gateway/src/__tests__/route-proxy.test.ts".to_string()
+            ])
+            .expect("ordinary bearer-token placeholders in tests should stage");
+
+        assert_eq!(
+            report.staged_files,
+            vec!["apps/api-gateway/src/__tests__/route-proxy.test.ts".to_string()]
+        );
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
     fn stage_approved_files_still_blocks_secret_assignments_in_tests() {
         let repo = unique_test_dir("stage-content-test-secret");
         init_repo(&repo);
@@ -911,6 +976,32 @@ mod tests {
         let error = staging
             .stage_approved_files(&["src/main/config.test.ts".to_string()])
             .expect_err("test files must still block secret assignments");
+
+        assert_eq!(error.rejections.len(), 1);
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_still_blocks_real_bearer_values_in_tests() {
+        let repo = unique_test_dir("stage-content-real-bearer-test");
+        init_repo(&repo);
+        fs::create_dir_all(repo.join("src/main")).expect("src dir");
+        fs::write(
+            repo.join("src/main/config.test.ts"),
+            "authorization: 'Bearer real-production-token-value'\n",
+        )
+        .expect("test write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["src/main/config.test.ts".to_string()])
+            .expect_err("real bearer-looking test values should still block");
 
         assert_eq!(error.rejections.len(), 1);
         assert_eq!(
