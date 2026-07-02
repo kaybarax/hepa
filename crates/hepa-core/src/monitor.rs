@@ -15,8 +15,10 @@ impl Default for HepaMonitorPolicy {
         Self {
             command_denylist: default_git_lifecycle_denylist(),
             secret_markers: vec![
-                "api_key".to_string(),
-                "private_key".to_string(),
+                "api_key=".to_string(),
+                "api_key:".to_string(),
+                "private_key=".to_string(),
+                "private_key:".to_string(),
                 "secret=".to_string(),
             ],
             blocked_scope_refs: Vec::new(),
@@ -325,6 +327,16 @@ mod tests {
         assert!(
             policy
                 .check_output("Updated ResetPasswordForm and reset-password tests")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_output("Document API key management without embedding credentials")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_output("## Secrets:\nManaged through the deployment platform")
                 .is_ok()
         );
     }

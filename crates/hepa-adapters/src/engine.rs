@@ -14,6 +14,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(not(test))]
+const MAX_ADAPTER_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(test)]
+const MAX_ADAPTER_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ADAPTER_STREAM_TEXT_BYTES: usize = 1024 * 1024;
+const OUTPUT_TRUNCATED_NOTICE: &[u8] =
+    b"\n[HEPA adapter output truncated after diagnostic capture limit]\n";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaOneshotAdapterInvocation {
     pub spec: HepaAdapterSpec,
@@ -255,6 +263,7 @@ fn wait_with_monitor(
             path,
             stream: "stdout",
             lock: Arc::clone(&stream_lock),
+            state: Arc::new(Mutex::new(OutputStreamState::default())),
         }),
     );
     let stderr_reader = spawn_output_reader(
@@ -263,6 +272,7 @@ fn wait_with_monitor(
             path,
             stream: "stderr",
             lock: stream_lock,
+            state: Arc::new(Mutex::new(OutputStreamState::default())),
         }),
     );
     let started_at = Instant::now();
@@ -292,7 +302,7 @@ fn wait_with_monitor(
 }
 
 struct OutputReader {
-    bytes: Arc<Mutex<Vec<u8>>>,
+    capture: Arc<Mutex<BoundedOutputCapture>>,
     done: mpsc::Receiver<Result<(), std::io::Error>>,
 }
 
@@ -301,14 +311,49 @@ struct OutputStreamSink {
     path: PathBuf,
     stream: &'static str,
     lock: Arc<Mutex<()>>,
+    state: Arc<Mutex<OutputStreamState>>,
+}
+
+#[derive(Debug, Default)]
+struct BoundedOutputCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedOutputCapture {
+    fn append(&mut self, chunk: &[u8]) {
+        if self.truncated {
+            return;
+        }
+        let remaining = MAX_ADAPTER_CAPTURE_BYTES.saturating_sub(self.bytes.len());
+        if remaining >= chunk.len() {
+            self.bytes.extend_from_slice(chunk);
+            return;
+        }
+        if remaining > 0 {
+            self.bytes.extend_from_slice(&chunk[..remaining]);
+        }
+        self.bytes.extend_from_slice(OUTPUT_TRUNCATED_NOTICE);
+        self.truncated = true;
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+}
+
+#[derive(Debug, Default)]
+struct OutputStreamState {
+    retained_text_bytes: usize,
+    truncated: bool,
 }
 
 fn spawn_output_reader<R>(mut stream: R, sink: Option<OutputStreamSink>) -> OutputReader
 where
     R: Read + Send + 'static,
 {
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let thread_bytes = Arc::clone(&bytes);
+    let capture = Arc::new(Mutex::new(BoundedOutputCapture::default()));
+    let thread_capture = Arc::clone(&capture);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut chunk = [0_u8; 8192];
@@ -316,10 +361,10 @@ where
             match stream.read(&mut chunk) {
                 Ok(0) => break Ok(()),
                 Ok(count) => {
-                    thread_bytes
+                    thread_capture
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extend_from_slice(&chunk[..count]);
+                        .append(&chunk[..count]);
                     if let Some(sink) = &sink {
                         if let Err(error) = append_stream_chunk(sink, &chunk[..count]) {
                             break Err(error);
@@ -332,7 +377,7 @@ where
         let _ = sender.send(result);
     });
     OutputReader {
-        bytes,
+        capture,
         done: receiver,
     }
 }
@@ -359,6 +404,25 @@ fn adapter_stream_path(
 }
 
 fn append_stream_chunk(sink: &OutputStreamSink, chunk: &[u8]) -> std::io::Result<()> {
+    let (text, truncated_now) = {
+        let mut state = sink
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.truncated {
+            return Ok(());
+        }
+        let remaining = MAX_ADAPTER_STREAM_TEXT_BYTES.saturating_sub(state.retained_text_bytes);
+        let retained = remaining.min(chunk.len());
+        state.retained_text_bytes += retained;
+        let truncated_now =
+            retained < chunk.len() || state.retained_text_bytes >= MAX_ADAPTER_STREAM_TEXT_BYTES;
+        if truncated_now {
+            state.truncated = true;
+        }
+        (chunk[..retained].to_vec(), truncated_now)
+    };
+
     let _guard = sink
         .lock
         .lock()
@@ -367,14 +431,27 @@ fn append_stream_chunk(sink: &OutputStreamSink, chunk: &[u8]) -> std::io::Result
         .create(true)
         .append(true)
         .open(&sink.path)?;
-    let event = serde_json::json!({
-        "schema_version": 1,
-        "stream": sink.stream,
-        "bytes": chunk.len(),
-        "text": String::from_utf8_lossy(chunk),
-    });
-    serde_json::to_writer(&mut file, &event)?;
-    file.write_all(b"\n")?;
+    if !text.is_empty() {
+        let event = serde_json::json!({
+            "schema_version": 1,
+            "stream": sink.stream,
+            "bytes": chunk.len(),
+            "retained_bytes": text.len(),
+            "text": String::from_utf8_lossy(&text),
+        });
+        serde_json::to_writer(&mut file, &event)?;
+        file.write_all(b"\n")?;
+    }
+    if truncated_now {
+        let event = serde_json::json!({
+            "schema_version": 1,
+            "stream": sink.stream,
+            "type": "output_truncated",
+            "limit_bytes": MAX_ADAPTER_STREAM_TEXT_BYTES,
+        });
+        serde_json::to_writer(&mut file, &event)?;
+        file.write_all(b"\n")?;
+    }
     file.flush()
 }
 
@@ -393,19 +470,19 @@ fn receive_output_reader(
             )
         })?;
     Ok(reader
-        .bytes
+        .capture
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone())
+        .snapshot())
 }
 
 fn receive_output_reader_snapshot(reader: &OutputReader) -> Vec<u8> {
     let _ = reader.done.recv_timeout(Duration::from_millis(100));
     reader
-        .bytes
+        .capture
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+        .snapshot()
 }
 
 fn write_prompt_file(
@@ -1293,6 +1370,53 @@ sleep 10
         assert!(error.stdout.contains("partial stdout before timeout"));
         assert!(error.stderr.contains("partial stderr before timeout"));
         assert!(error.sanitized_summary().contains("captured stdout="));
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn oneshot_executor_bounds_chatty_streams_on_monitor_stop() {
+        let root = unique_test_dir("monitor-chatty-output");
+        let worktree = root.join("lane-worktree");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        let script = root.join("fake-adapter");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+yes '{"type":"message_update","chunk":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}' | head -c 12000000
+sleep 10
+"#,
+        );
+
+        let error = run_monitor_case(
+            &worktree,
+            &artifact_dir,
+            format!("{} ignored", script.display()),
+            HepaMonitorPolicy {
+                timeout_ms: Some(2_000),
+                ..HepaMonitorPolicy::default()
+            },
+        )
+        .expect_err("timeout should retain bounded diagnostics");
+
+        let stream_log = artifact_dir
+            .join("streams")
+            .join("worker-adapter-stream.jsonl");
+        let stream_metadata = fs::metadata(&stream_log).expect("stream log metadata");
+        let stream_content = fs::read_to_string(stream_log).expect("stream log content");
+
+        assert_eq!(error.status.as_deref(), Some("blocked"));
+        assert!(error.message.contains("timeout"));
+        assert!(error.stdout.len() <= MAX_ADAPTER_CAPTURE_BYTES + OUTPUT_TRUNCATED_NOTICE.len());
+        assert!(
+            error
+                .stdout
+                .contains("[HEPA adapter output truncated after diagnostic capture limit]")
+        );
+        assert!(stream_metadata.len() < 2_000_000);
+        assert!(stream_content.contains("\"type\":\"output_truncated\""));
 
         remove_test_dir(root);
     }

@@ -103,7 +103,7 @@ impl HepaSafeStaging {
         }
         let bytes = fs::read(&full_path)?;
         let content = String::from_utf8_lossy(&bytes);
-        Ok(classify_staging_content(&content))
+        Ok(classify_staging_content_for_path(path, &content))
     }
 
     fn git_status<const N: usize>(&self, args: [&str; N]) -> Result<(), HepaStagingError> {
@@ -284,16 +284,6 @@ const FORBIDDEN_CONTENT_TOKEN_PREFIXES: &[&str] = &[
     "AKIA",
 ];
 
-const FORBIDDEN_CONTENT_SECRET_KEYS: &[&str] = &[
-    "api_key",
-    "apikey",
-    "authorization",
-    "credential",
-    "private_key",
-    "secret",
-    "token",
-];
-
 /// Classify an approved-file path, returning the first refusal reason found.
 fn classify_staging_path(path: &str) -> Option<HepaStagingRejectionReason> {
     let trimmed = path.trim();
@@ -377,7 +367,17 @@ fn is_secret_like_path(path: &str) -> bool {
         .any(|part| CREDENTIAL_STORE_DIRECTORIES.contains(part))
 }
 
-fn classify_staging_content(content: &str) -> Option<HepaStagingRejectionReason> {
+fn classify_staging_content_for_path(
+    path: &str,
+    content: &str,
+) -> Option<HepaStagingRejectionReason> {
+    classify_staging_content_with_options(content, !is_dependency_lockfile(path))
+}
+
+fn classify_staging_content_with_options(
+    content: &str,
+    scan_secret_assignments: bool,
+) -> Option<HepaStagingRejectionReason> {
     if FORBIDDEN_CONTENT_PATH_MARKERS
         .iter()
         .any(|marker| content.contains(marker))
@@ -392,11 +392,22 @@ fn classify_staging_content(content: &str) -> Option<HepaStagingRejectionReason>
         return Some(HepaStagingRejectionReason::ContentPrivacy);
     }
 
-    if content.lines().any(line_has_secret_assignment) {
+    if scan_secret_assignments && content.lines().any(line_has_secret_assignment) {
         return Some(HepaStagingRejectionReason::ContentPrivacy);
     }
 
     None
+}
+
+fn is_dependency_lockfile(path: &str) -> bool {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "bun.lock" | "bun.lockb"
+    )
 }
 
 fn token_has_forbidden_prefix(token: &str) -> bool {
@@ -430,11 +441,7 @@ fn line_has_secret_assignment(line: &str) -> bool {
         if !looks_like_secret_assignment_key(key) {
             continue;
         }
-        let key = key.to_ascii_lowercase();
-        if FORBIDDEN_CONTENT_SECRET_KEYS
-            .iter()
-            .any(|fragment| key.contains(fragment))
-        {
+        if is_secret_assignment_key(key) {
             return true;
         }
     }
@@ -447,6 +454,32 @@ fn looks_like_secret_assignment_key(key: &str) -> bool {
         && key.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
         })
+}
+
+fn is_secret_assignment_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "api_key" | "apikey" | "authorization" | "private_key"
+    ) {
+        return true;
+    }
+
+    let parts: Vec<&str> = normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+
+    if parts.as_slice() == ["api", "key"] || parts.as_slice() == ["private", "key"] {
+        return true;
+    }
+
+    parts.iter().any(|part| {
+        matches!(
+            *part,
+            "authorization" | "credential" | "credentials" | "secret" | "token"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -638,6 +671,114 @@ mod tests {
 
         assert_eq!(error.rejections.len(), 1);
         assert_eq!(error.rejections[0].path, "config.md");
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_blocks_json_secret_assignment_keys() {
+        let repo = unique_test_dir("stage-content-json-secret");
+        init_repo(&repo);
+        fs::write(
+            repo.join("config.json"),
+            "{\n  \"auth_token\": \"example-value\"\n}\n",
+        )
+        .expect("config write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["config.json".to_string()])
+            .expect_err("json secret assignment content must be refused");
+
+        assert_eq!(error.rejections.len(), 1);
+        assert_eq!(error.rejections[0].path, "config.json");
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_allows_normal_package_metadata() {
+        let repo = unique_test_dir("stage-package-metadata");
+        init_repo(&repo);
+        fs::write(
+            repo.join("package.json"),
+            r#"{
+  "name": "fixture",
+  "private": true,
+  "scripts": {
+    "tokens:build": "node scripts/build-tokens.mjs",
+    "doctor": "node scripts/doctor.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "latest"
+  }
+}
+"#,
+        )
+        .expect("package write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&["package.json".to_string()])
+            .expect("normal package metadata should not be treated as a secret");
+
+        assert_eq!(report.staged_files, vec!["package.json".to_string()]);
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_allows_dependency_lockfile_package_names() {
+        let repo = unique_test_dir("stage-lockfile-package-names");
+        init_repo(&repo);
+        fs::write(
+            repo.join("pnpm-lock.yaml"),
+            r#"lockfileVersion: '9.0'
+
+packages:
+  '@octokit/auth-token@6.0.0': {}
+  '@azure/keyvault-secrets@4.9.0': {}
+  '@csstools/css-tokenizer@4.0.0': {}
+"#,
+        )
+        .expect("lockfile write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&["pnpm-lock.yaml".to_string()])
+            .expect("normal lockfile package names should not be treated as secrets");
+
+        assert_eq!(report.staged_files, vec!["pnpm-lock.yaml".to_string()]);
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_still_blocks_private_paths_in_lockfiles() {
+        let repo = unique_test_dir("stage-lockfile-private-path");
+        init_repo(&repo);
+        fs::write(
+            repo.join("pnpm-lock.yaml"),
+            "packages:\n  local-file: file:/Users/example/private/package.tgz\n",
+        )
+        .expect("lockfile write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["pnpm-lock.yaml".to_string()])
+            .expect_err("private local paths in lockfiles must still be refused");
+
+        assert_eq!(error.rejections.len(), 1);
         assert_eq!(
             error.rejections[0].reason,
             HepaStagingRejectionReason::ContentPrivacy
