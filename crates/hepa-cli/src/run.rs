@@ -1045,42 +1045,49 @@ pub fn run_live_task(
         ],
     );
     let branch = lane.branch.clone();
-    let pr_request =
-        match live_pr_request(config, &task_spec, &terminal_report, &lane, "main", &branch) {
-            Ok(request) => request,
-            Err(error) => {
-                transition_and_record(
-                    &lane_paths,
-                    &mut lane,
-                    6,
-                    HepaLaneState::Blocked,
-                    "live Hermes PR intent failed",
-                    "2026-06-16T00:00:06Z",
-                )?;
-                return finish_blocked_live_run(FinishBlockedInput {
+    let pr_request = match live_pr_request(
+        config,
+        &task_spec,
+        &terminal_report,
+        &lane,
+        &attempt_outcome.changed_files,
+        "main",
+        &branch,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            transition_and_record(
+                &lane_paths,
+                &mut lane,
+                6,
+                HepaLaneState::Blocked,
+                "live Hermes PR intent failed",
+                "2026-06-16T00:00:06Z",
+            )?;
+            return finish_blocked_live_run(FinishBlockedInput {
+                config,
+                task,
+                run_paths: &run_paths,
+                lane_paths: &lane_paths,
+                allocator: &allocator,
+                lane: &mut lane,
+                validation,
+                review_signals: review_outcome.signals.clone(),
+                arbitration: Some(review_outcome.arbitration.clone()),
+                timing: live_timing_record(LiveTimingInput {
                     config,
-                    task,
-                    run_paths: &run_paths,
-                    lane_paths: &lane_paths,
-                    allocator: &allocator,
-                    lane: &mut lane,
-                    validation,
-                    review_signals: review_outcome.signals.clone(),
-                    arbitration: Some(review_outcome.arbitration.clone()),
-                    timing: live_timing_record(LiveTimingInput {
-                        config,
-                        adapter_id,
-                        worker_duration_seconds: attempt_outcome.duration_seconds,
-                        validation_duration_seconds,
-                        review_duration_seconds,
-                        reviewer_passes: review_outcome.reviewer_passes,
-                        terminal_phase: LivePipelinePhase::PrFailed,
-                        repair_timing,
-                    }),
-                    reason: error,
-                });
-            }
-        };
+                    adapter_id,
+                    worker_duration_seconds: attempt_outcome.duration_seconds,
+                    validation_duration_seconds,
+                    review_duration_seconds,
+                    reviewer_passes: review_outcome.reviewer_passes,
+                    terminal_phase: LivePipelinePhase::PrFailed,
+                    repair_timing,
+                }),
+                reason: error,
+            });
+        }
+    };
     let lifecycle = HepaManagerGitLifecycle::manager(&allocation.worktree_path);
     if let Err(error) = lifecycle.push_branch("origin", &branch, &HepaSystemProcessRunner) {
         transition_and_record(
@@ -1932,6 +1939,7 @@ fn live_pr_request(
     task_spec: &HepaTaskSpec,
     terminal_report: &HepaTerminalTaskReport,
     lane: &HepaLane,
+    changed_files: &[String],
     base_branch: &str,
     head_branch: &str,
 ) -> Result<HepaPrRequest, String> {
@@ -1942,6 +1950,7 @@ fn live_pr_request(
             task_spec,
             terminal_report,
             lane,
+            changed_files,
             base_branch.to_string(),
             head_branch.to_string(),
         );
@@ -2000,12 +2009,14 @@ fn default_hermes_pr_intent_path(config: &HepaFakeRunConfig) -> PathBuf {
         .join("hermes-pr-intent.runtime.json")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pr_request_from_hermes_intent_runtime_command(
     command: &str,
     config: &HepaFakeRunConfig,
     task_spec: &HepaTaskSpec,
     terminal_report: &HepaTerminalTaskReport,
     lane: &HepaLane,
+    changed_files: &[String],
     base_branch: String,
     head_branch: String,
 ) -> Result<HepaPrRequest, String> {
@@ -2026,6 +2037,7 @@ fn pr_request_from_hermes_intent_runtime_command(
         "lane_id": config.lane_id,
         "task_spec": task_spec,
         "terminal_report": terminal_report,
+        "changed_files": changed_files,
         "lane": lane,
         "base_branch": &base_branch,
         "head_branch": &head_branch,
@@ -2213,7 +2225,7 @@ fn live_task_spec_from_hermes_brief(
         schema_version: CONTRACT_SCHEMA_VERSION,
         task_id: config.task_id.clone(),
         project_id: "project-1".to_string(),
-        goal: brief.task_prompt.clone(),
+        goal: sanitized_task_text(config),
         non_goals: vec![
             "Adapter must not commit, push, create branches, or open pull requests.".to_string(),
             "Hermes worker brief scope must not be expanded by the coding adapter.".to_string(),
@@ -5069,6 +5081,7 @@ mod tests {
             &task_spec,
             &terminal_report,
             &lane,
+            &["README.md".to_string()],
             "main",
             "hepa/manager/lane-live",
         )
@@ -5213,6 +5226,7 @@ JSON
             &task_spec,
             &terminal_report,
             &lane,
+            &["README.md".to_string()],
             "main".to_string(),
             "hepa/manager/lane-live".to_string(),
         )
@@ -5241,6 +5255,15 @@ JSON
             )
             .expect("PR intent runtime stdout")
             .contains("manager pr-intent runtime invoked")
+        );
+        assert!(
+            fs::read_to_string(
+                config
+                    .control_root
+                    .join("hermes-pr-intent/run-live/lane-live/hermes-pr-intent-context.json")
+            )
+            .expect("PR intent runtime context")
+            .contains("\"changed_files\"")
         );
 
         remove_test_dir(root);
@@ -5341,12 +5364,16 @@ JSON
             run_id: "run-live".to_string(),
             task_id: "task-live".to_string(),
             lane_id: "lane-live".to_string(),
-            task_text: "Headless fallback text that should not drive the brief.".to_string(),
+            task_text: "Update the login page copy for returning users.".to_string(),
             timing: true,
         };
         let task_spec = live_task_spec_from_hermes_brief(&config, &loaded);
 
-        assert_eq!(task_spec.goal, brief.task_prompt);
+        assert_eq!(
+            task_spec.goal,
+            "Update the login page copy for returning users."
+        );
+        assert_ne!(task_spec.goal, brief.task_prompt);
         assert_eq!(task_spec.expected_areas, vec!["src/app/login.tsx"]);
         assert_eq!(task_spec.acceptance_criteria, brief.acceptance_criteria);
         assert_eq!(task_spec.validation_commands, vec!["yarn test:e2e"]);
@@ -5390,10 +5417,8 @@ JSON
             .expect("Hermes worker runtime should produce run brief");
         let task_spec = live_task_spec_from_hermes_brief(&config, &brief);
 
-        assert_eq!(
-            task_spec.goal,
-            "Update src/app/login.tsx to show the requested copy."
-        );
+        assert_eq!(task_spec.goal, "Update README.md");
+        assert_ne!(task_spec.goal, brief.task_prompt);
         assert_eq!(task_spec.expected_areas, vec!["src/app/login.tsx"]);
         assert_eq!(task_spec.validation_commands, vec!["yarn test:e2e"]);
         assert!(

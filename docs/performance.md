@@ -119,6 +119,14 @@ Hermes runtime-command profiles, validation repos redacted):
 | Pi + GPT-OSS 20B worker via llama.cpp, ctx8192 / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 42.97 s | 187.8 MiB | 21.1 MiB | ~12.6 GiB observed | PRs opened, then closed/cleaned |
 | Pi + DeepSeek worker/reviewer, multi-project/multi-task | 2 repos / 4 jobs | 4 | 4 succeeded / 0 failed | 19.54 s | 196.1 MiB | 14.7 MiB | n/a | PRs opened on validation repo/fork, then closed/cleaned |
 
+Fresh current-branch local-model rerun after task-focused PR-body cleanup
+(`HEPA_HERMES_REQUIRED=true`, GPT-OSS 20B served by llama.cpp, validation repos
+redacted):
+
+| Configuration | Repos/jobs | Max concurrency | Result | Wall time | Max RSS | Peak footprint | External model RSS | PR lifecycle |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| Pi + GPT-OSS 20B worker via llama.cpp, ctx8192, Hermes-required profiles | 2 | 2 | 2 succeeded / 0 failed | 80.44 s | 324.0 MiB | 30.3 MiB | ~9.5 GiB stable observed | PRs opened, then closed/cleaned |
+
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
 operator waits while HEPA schedules, executes, validates, reviews, stages, opens
@@ -211,6 +219,15 @@ Interpretation:
   using a read-only upstream `origin` with only a fork `pushurl` let `git push`
   succeed but made `gh pr create --head <branch>` unable to resolve the head
   branch.
+- The current-branch local-model rerun removed the remaining release caveat for
+  the tested local route. GPT-OSS 20B served by llama.cpp completed both
+  parallel Hermes-required lanes in 80.44 s. The frontend lane completed in one
+  worker loop with manager-owned `yarn install --frozen-lockfile`, `yarn build`,
+  and `git diff --check`; the docs lane initially failed `git diff --check`,
+  then completed after one bounded local-worker repair. Both validation PRs had
+  task-focused bodies, `HEPA Manager <hepa-manager@local.invalid>` commit
+  authorship, concrete changed-file context, no run-context/audit boilerplate,
+  and were closed and cleaned after evidence capture.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.

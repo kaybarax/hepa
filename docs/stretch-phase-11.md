@@ -28,7 +28,7 @@ manager-authored PR bodies:
 | Required item | Status |
 | --- | --- |
 | Bundled `hepa-manager`, `hepa-worker`, `hepa-reviewer`, and `hepa-review-manager` profile contracts | Contract tests passed |
-| Manager-authored `HepaHermesPrIntent` contract that requires human-friendly Summary, Changes, Validation, Review, Risk, and Run Context sections while rejecting generic HEPA validation-template PR bodies | Contract and PR-request tests passed |
+| Manager-authored `HepaHermesPrIntent` contract that requires human-friendly Summary, Task, Changes, Validation, Review, and Risk sections while rejecting generic HEPA validation-template PR bodies | Contract and PR-request tests passed |
 | Runtime route from Hermes Kanban task to worker profile brief to coding adapter lane | Manager intake and worker brief command-runtime bridge tests passed |
 | Per-lane live terminal/log streams for parallel Hermes-led runs | Adapter stdout/stderr, manager validation/tool-summary JSONL streams with redacted bounded model-visible previews, `hepa lane logs --tail`, and dashboard lane-stream presentation tests passed |
 | Hermes reviewer and review-manager arbitration runtime, with Pi limited to code implementation in the default path | Pi reviewer execution is blocked in Hermes-led adapter-review mode; reviewer/review-manager artifact hooks and command-runtime bridge tests passed |
@@ -37,7 +37,7 @@ manager-authored PR bodies:
 | Three-round task/work/review cap with human-intervention terminal state | Worker brief cap, review-to-worker repair mediation, round-3 allowance, and round-4 human-intervention cap tests passed |
 | Headless/degraded fallback labels PR bodies as fallback evidence, not Hermes-authored project intent | Fallback PR body and Hermes intent separation tests passed |
 | Hermes-first spec/card/run bridge with live lane visibility | `hepa hermes ingest-spec`, `hepa hermes run-ready`, `hepa hermes run-cards`, local card payloads, `lane_attach_commands`, `hepa lane attach`, and `hepa fleet watch` are documented and covered by focused CLI/card tests |
-| Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Passed with `HEPA_HERMES_REQUIRED=true`: GPT-OSS 20B via llama.cpp completed the pure-local app/docs lanes 2/2 in 74.82 s and the hybrid local-worker / DeepSeek-reviewer lanes 2/2 in 75.69 s; validation PRs were opened, then closed and cleaned |
+| Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Passed with `HEPA_HERMES_REQUIRED=true`: GPT-OSS 20B via llama.cpp completed the pure-local app/docs lanes 2/2 in 74.82 s and the hybrid local-worker / DeepSeek-reviewer lanes 2/2 in 75.69 s; a fresh current-branch local rerun completed 2/2 in 80.44 s after task-focused PR-body cleanup; validation PRs were opened, then closed and cleaned |
 
 The Phase 11 privacy scan found only pre-existing placeholder examples and
 redaction fixtures.
@@ -55,6 +55,6 @@ The original Phase 11 gate run passed `cargo fmt --check`, `cargo test`,
 `hepa timing trends <archive-root>` and
 `hepa fleet dashboard --output <dashboard-html> --control-root <control-root>`,
 and the repository privacy scan for the original Phase 11 items. The
-Hermes-led refinement now has fresh local/hybrid runtime-command evidence; final
-release still requires the normal repository checks and privacy scan after any
-later edits.
+Hermes-led refinement now has fresh local/hybrid runtime-command evidence.
+Final release still requires the normal repository checks and privacy scan after
+any later edits.
