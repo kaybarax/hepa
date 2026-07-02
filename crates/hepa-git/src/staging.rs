@@ -464,6 +464,19 @@ fn line_has_secret_assignment(line: &str) -> bool {
             continue;
         }
         if is_secret_assignment_key(key) {
+            let value = line[index + separator.len_utf8()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| {
+                    matches!(
+                        character,
+                        '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '<' | '>'
+                    )
+                });
+            if is_documented_secret_placeholder(value) {
+                continue;
+            }
             return true;
         }
     }
@@ -502,6 +515,11 @@ fn is_secret_assignment_key(key: &str) -> bool {
             "authorization" | "credential" | "credentials" | "secret" | "token"
         )
     })
+}
+
+fn is_documented_secret_placeholder(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.starts_with("your-") || normalized.starts_with("<your-")
 }
 
 #[cfg(test)]
@@ -693,6 +711,51 @@ mod tests {
 
         assert_eq!(error.rejections.len(), 1);
         assert_eq!(error.rejections[0].path, "config.md");
+        assert_eq!(
+            error.rejections[0].reason,
+            HepaStagingRejectionReason::ContentPrivacy
+        );
+        assert!(staged_names(&repo).is_empty());
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_allows_documented_secret_placeholders() {
+        let repo = unique_test_dir("stage-content-secret-placeholder");
+        init_repo(&repo);
+        fs::write(
+            repo.join("README.md"),
+            "Create `.env.local`:\n\nNEXTAUTH_SECRET=your-nextauth-secret\n",
+        )
+        .expect("readme write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&["README.md".to_string()])
+            .expect("documented placeholder secret values should not block staging");
+
+        assert_eq!(report.staged_files, vec!["README.md".to_string()]);
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_still_blocks_real_secret_values_in_docs() {
+        let repo = unique_test_dir("stage-content-secret-real-doc");
+        init_repo(&repo);
+        fs::write(
+            repo.join("README.md"),
+            "Create `.env.local`:\n\nNEXTAUTH_SECRET=real-token-value\n",
+        )
+        .expect("readme write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let error = staging
+            .stage_approved_files(&["README.md".to_string()])
+            .expect_err("real secret-looking values should still block staging");
+
+        assert_eq!(error.rejections.len(), 1);
         assert_eq!(
             error.rejections[0].reason,
             HepaStagingRejectionReason::ContentPrivacy
