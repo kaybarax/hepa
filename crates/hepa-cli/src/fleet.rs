@@ -1262,7 +1262,7 @@ fn run_hermes_launch_spec(
         run_id: format!("run-hermes-{}-{}", spec.task.task_id, cli_timestamp()),
         task_id: spec.task.task_id.clone(),
         lane_id: spec.lane_id.clone(),
-        task_text: spec.task_spec.goal.clone(),
+        task_text: hermes_run_task_text(&spec),
         timing: true,
     };
     let attach_command = format!(
@@ -1347,6 +1347,24 @@ fn run_hermes_launch_spec(
             }
         }
     }
+}
+
+fn hermes_run_task_text(spec: &HermesLaunchSpec) -> String {
+    let title = collapse_single_line(&spec.task.title);
+    if !title.is_empty() {
+        return title;
+    }
+
+    let goal = collapse_single_line(&spec.task_spec.goal);
+    if !goal.is_empty() {
+        return goal;
+    }
+
+    format!("Run Hermes dashboard task {}", spec.task.task_id)
+}
+
+fn collapse_single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn hermes_lane_record(
@@ -2866,6 +2884,75 @@ Validation:
         assert!(stale_rerun.contains("selected=1"));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn hermes_dashboard_run_uses_single_line_task_text() {
+        let now = cli_timestamp();
+        let spec = HermesLaunchSpec {
+            project: HepaRegisteredProject {
+                project: HepaProject {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    project_id: "todo-project".to_string(),
+                    display_name: "Todo project".to_string(),
+                    repo_ref: "/tmp/todo-project".to_string(),
+                    default_branch: "main".to_string(),
+                    routing_policy_ref: None,
+                    is_active: true,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                max_parallel_tasks: 2,
+                cost_policy: HepaCostPolicy {
+                    cost_class: HepaCostClass::Local,
+                    max_paid_lanes: 0,
+                },
+                memory_policy: HepaMemoryPolicy {
+                    max_resident_models: 1,
+                },
+                board_metadata: Some("hermes-dashboard-card".to_string()),
+            },
+            task: HepaFleetTask {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "t_abc123".to_string(),
+                project_id: "todo-project".to_string(),
+                title: "Implement route parity tests\nthrough gateway".to_string(),
+                description: "Write route parity tests.".to_string(),
+                status: HepaTaskStatus::Ready,
+                readiness: HepaReadinessState::Ready,
+                dependencies: Vec::new(),
+                lane_ids: Vec::new(),
+                external_card_id: Some("t_abc123".to_string()),
+                priority: 1,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                completed_at: None,
+            },
+            task_spec: HepaTaskSpec {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "t_abc123".to_string(),
+                project_id: "todo-project".to_string(),
+                goal: "Write route parity tests.\n\nAcceptance criteria:\n- Cover auth routes."
+                    .to_string(),
+                non_goals: Vec::new(),
+                expected_areas: Vec::new(),
+                acceptance_criteria: Vec::new(),
+                validation_commands: Vec::new(),
+                dependencies: Vec::new(),
+                target_branch: None,
+                risk_level: HepaRiskLevel::Medium,
+                max_total_rounds: 2,
+                created_at: now,
+            },
+            lane_id: "lane-1".to_string(),
+            card_id: "t_abc123".to_string(),
+        };
+
+        assert_eq!(
+            hermes_run_task_text(&spec),
+            "Implement route parity tests through gateway"
+        );
+        assert!(!hermes_run_task_text(&spec).contains('\n'));
     }
 
     #[test]
