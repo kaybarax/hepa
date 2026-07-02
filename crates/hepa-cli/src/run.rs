@@ -1034,6 +1034,10 @@ pub fn run_live_task(
                 attempt_outcome.changed_files.len()
             ),
             format!(
+                "Changed files: {}.",
+                summarize_changed_files(&attempt_outcome.changed_files)
+            ),
+            format!(
                 "Validation passed for {} command(s).",
                 validation.commands.len()
             ),
@@ -4339,6 +4343,22 @@ fn collect_changed_files(worktree: &Path) -> Result<Vec<String>, String> {
     Ok(changed)
 }
 
+fn summarize_changed_files(changed_files: &[String]) -> String {
+    if changed_files.is_empty() {
+        return "none".to_string();
+    }
+    let shown: Vec<&str> = changed_files.iter().take(8).map(String::as_str).collect();
+    if changed_files.len() > shown.len() {
+        format!(
+            "{} ({} more)",
+            shown.join(", "),
+            changed_files.len() - shown.len()
+        )
+    } else {
+        shown.join(", ")
+    }
+}
+
 fn collect_live_diff(worktree: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
@@ -6012,6 +6032,21 @@ JSON
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn summarize_changed_files_lists_concrete_paths_for_pr_evidence() {
+        let changed = vec![
+            "apps/web/README.md".to_string(),
+            "apps/web/package.json".to_string(),
+            "apps/web/src/lib/health.ts".to_string(),
+        ];
+
+        assert_eq!(
+            summarize_changed_files(&changed),
+            "apps/web/README.md, apps/web/package.json, apps/web/src/lib/health.ts"
+        );
+        assert_eq!(summarize_changed_files(&[]), "none");
     }
 
     #[test]
