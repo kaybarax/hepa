@@ -179,6 +179,9 @@ fn assignment_marker_has_value(output: &str, value_start: usize) -> bool {
 
 fn is_redacted_secret_placeholder(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
+    if normalized.starts_with("your-") || normalized.starts_with("<your-") {
+        return true;
+    }
     matches!(
         normalized.as_str(),
         "redacted"
@@ -384,6 +387,11 @@ mod tests {
         assert!(
             policy
                 .check_output("monitor emitted a redacted sentinel: secret=redacted")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_output("documentation placeholder: NEXTAUTH_SECRET=your-nextauth-secret")
                 .is_ok()
         );
         assert!(matches!(
