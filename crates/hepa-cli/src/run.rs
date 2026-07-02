@@ -965,16 +965,8 @@ pub fn run_live_task(
         }
     };
     let commit = match HepaManagerGitLifecycle::manager(&allocation.worktree_path).commit_staged(
-        &HepaCommitMessage::new(format!(
-            "hepa: {}",
-            commit_title(&sanitized_task_text(config))
-        ))
-        .with_body(vec![
-            format!("Task: {}", sanitized_task_text(config)),
-            format!("Run: {}", config.run_id),
-            format!("Lane: {}", config.lane_id),
-            "Manager-owned commit created by HEPA live pipeline.".to_string(),
-        ]),
+        &HepaCommitMessage::new(commit_title(&sanitized_task_text(config)))
+            .with_body(vec![format!("Task: {}", sanitized_task_text(config))]),
     ) {
         Ok(commit) => commit,
         Err(error) => {

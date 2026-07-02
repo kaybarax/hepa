@@ -118,6 +118,9 @@ pub struct HepaPrHandle {
     pub url: String,
 }
 
+const HEPA_MANAGER_GIT_NAME: &str = "HEPA Manager";
+const HEPA_MANAGER_GIT_EMAIL: &str = "hepa-manager@local.invalid";
+
 pub fn pr_request_from_hermes_intent(
     intent: &HepaHermesPrIntent,
     base_branch: impl Into<String>,
@@ -212,7 +215,7 @@ impl HepaManagerGitLifecycle {
             args.push("-m".to_string());
             args.push(message.body.join("\n"));
         }
-        self.git(&args)?;
+        self.git_manager_commit(&args)?;
         let commit_sha = self.git(&["rev-parse".to_string(), "HEAD".to_string()])?;
         Ok(HepaCommitOutcome { commit_sha })
     }
@@ -345,6 +348,25 @@ impl HepaManagerGitLifecycle {
             .arg("-C")
             .arg(&self.repo_root)
             .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(HepaPrError::new(
+                "git",
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn git_manager_commit(&self, args: &[String]) -> Result<String, HepaPrError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", HEPA_MANAGER_GIT_NAME)
+            .env("GIT_AUTHOR_EMAIL", HEPA_MANAGER_GIT_EMAIL)
+            .env("GIT_COMMITTER_NAME", HEPA_MANAGER_GIT_NAME)
+            .env("GIT_COMMITTER_EMAIL", HEPA_MANAGER_GIT_EMAIL)
             .output()?;
         if !output.status.success() {
             return Err(HepaPrError::new(
@@ -750,6 +772,28 @@ mod tests {
         assert_eq!(outcome.commit_sha, git_output(&repo, ["rev-parse", "HEAD"]));
         let body = git_output(&repo, ["log", "-1", "--pretty=%b"]);
         assert!(body.contains("Body line."));
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn manager_commit_uses_hepa_identity_over_repo_agent_config() {
+        let repo = unique_test_dir("commit-identity");
+        init_repo(&repo);
+        git(&repo, ["config", "user.email", "openhands@all-hands.dev"]);
+        git(&repo, ["config", "user.name", "openhands"]);
+        fs::write(repo.join("change.txt"), "content\n").expect("change write");
+        git(&repo, ["add", "change.txt"]);
+        let lifecycle = HepaManagerGitLifecycle::manager(&repo);
+
+        lifecycle
+            .commit_staged(&HepaCommitMessage::new("Implement readiness checks"))
+            .expect("manager commit should succeed");
+
+        let author = git_output(&repo, ["log", "-1", "--pretty=%an <%ae>"]);
+        let committer = git_output(&repo, ["log", "-1", "--pretty=%cn <%ce>"]);
+        assert_eq!(author, "HEPA Manager <hepa-manager@local.invalid>");
+        assert_eq!(committer, "HEPA Manager <hepa-manager@local.invalid>");
 
         remove_test_dir(repo);
     }
