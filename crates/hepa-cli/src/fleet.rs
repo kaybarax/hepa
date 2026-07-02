@@ -1206,13 +1206,14 @@ fn run_hermes_selected(
         .iter()
         .map(|summary| {
             format!(
-                "{} status={} card={} lane={} pr={} attach='{}'",
+                "{} status={} card={} lane={} pr={} attach='{}'{}",
                 summary.task_id,
                 summary.status,
                 summary.card_id,
                 summary.lane_id,
                 summary.pr_url.as_deref().unwrap_or("none"),
-                summary.attach_command
+                summary.attach_command,
+                summary.terminal_fragment()
             )
         })
         .collect::<Vec<_>>()
@@ -1249,7 +1250,20 @@ struct HermesRunSummary {
     status: String,
     pr_url: Option<String>,
     attach_command: String,
+    terminal_session: Option<String>,
+    terminal_log: Option<PathBuf>,
     failed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveTerminalMirror {
+    lane_id: String,
+    session_id: String,
+    log_path: PathBuf,
+    record_path: PathBuf,
+    attach_command: String,
+    started_at: String,
+    stopped_at: Option<String>,
 }
 
 fn run_hermes_launch_spec(
@@ -1283,11 +1297,38 @@ fn run_hermes_launch_spec(
             status: "blocked".to_string(),
             pr_url: None,
             attach_command,
+            terminal_session: None,
+            terminal_log: None,
             failed: true,
         }
         .with_artifact_error(error);
     }
-    match run_live_task(&config, agent) {
+    let mirror = match start_live_terminal_mirror(
+        &spec.lane_id,
+        &config.control_root,
+        &repo_path,
+        &attach_command,
+    ) {
+        Ok(mirror) => mirror,
+        Err(error) => {
+            return HermesRunSummary {
+                task_id: spec.task.task_id,
+                lane_id: spec.lane_id,
+                card_id: spec.card_id,
+                status: format!("blocked: live terminal mirror failed: {error}"),
+                pr_url: None,
+                attach_command,
+                terminal_session: None,
+                terminal_log: None,
+                failed: true,
+            };
+        }
+    };
+    let terminal_session = mirror.as_ref().map(|mirror| mirror.session_id.clone());
+    let terminal_log = mirror.as_ref().map(|mirror| mirror.log_path.clone());
+    let live_result = run_live_task(&config, agent);
+    stop_live_terminal_mirror(mirror);
+    match live_result {
         Ok(result) => {
             if !hermes_live_result_is_success(&result) {
                 let reason = hermes_live_result_blocked_reason(&result);
@@ -1324,6 +1365,8 @@ fn run_hermes_launch_spec(
                     status: result.status,
                     pr_url: result.terminal_report.pr_url,
                     attach_command,
+                    terminal_session,
+                    terminal_log,
                     failed: true,
                 };
             }
@@ -1362,6 +1405,8 @@ fn run_hermes_launch_spec(
                 status: result.status,
                 pr_url: result.terminal_report.pr_url,
                 attach_command,
+                terminal_session,
+                terminal_log,
                 failed: false,
             }
         }
@@ -1399,6 +1444,8 @@ fn run_hermes_launch_spec(
                 status: "blocked".to_string(),
                 pr_url: None,
                 attach_command,
+                terminal_session,
+                terminal_log,
                 failed: true,
             }
         }
@@ -1409,6 +1456,131 @@ impl HermesRunSummary {
     fn with_artifact_error(mut self, error: String) -> Self {
         self.status = format!("blocked: Hermes artifact bridge failed: {error}");
         self
+    }
+
+    fn terminal_fragment(&self) -> String {
+        match (&self.terminal_session, &self.terminal_log) {
+            (Some(session), Some(log)) => {
+                format!(
+                    " terminal_session={} terminal_log={}",
+                    session,
+                    log.display()
+                )
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+fn live_terminal_root_from_env() -> Option<PathBuf> {
+    ["HEPA_LIVE_TERMINAL_ROOT", "HEPA_HERMES_LIVE_TERMINAL_ROOT"]
+        .into_iter()
+        .find_map(std::env::var_os)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn sanitize_tmux_session_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn live_terminal_loop_command(lane_id: &str, control_root: &Path, log_path: &Path) -> String {
+    format!(
+        "while true; do date -u '+%Y-%m-%dT%H:%M:%SZ'; hepa lane attach {} --control-root {} --tail 120; sleep 2; done >> {} 2>&1",
+        shell_quote(lane_id),
+        shell_quote(&control_root.display().to_string()),
+        shell_quote(&log_path.display().to_string())
+    )
+}
+
+fn start_live_terminal_mirror(
+    lane_id: &str,
+    control_root: &Path,
+    repo_path: &Path,
+    attach_command: &str,
+) -> Result<Option<LiveTerminalMirror>, String> {
+    let Some(root) = live_terminal_root_from_env() else {
+        return Ok(None);
+    };
+    let session_id = format!("hepa-{}", sanitize_tmux_session_id(lane_id));
+    let mirror_dir = root.join(sanitize_tmux_session_id(lane_id));
+    fs::create_dir_all(&mirror_dir).map_err(|error| {
+        format!(
+            "failed to create live terminal mirror dir {}: {error}",
+            mirror_dir.display()
+        )
+    })?;
+    let log_path = mirror_dir.join("lane-attach.log");
+    let record_path = mirror_dir.join("live-terminal.json");
+    let mirror = LiveTerminalMirror {
+        lane_id: lane_id.to_string(),
+        session_id: session_id.clone(),
+        log_path: log_path.clone(),
+        record_path: record_path.clone(),
+        attach_command: attach_command.to_string(),
+        started_at: cli_timestamp(),
+        stopped_at: None,
+    };
+    write_json(&record_path, &mirror)?;
+    fs::write(
+        &log_path,
+        format!("HEPA live terminal mirror started for {lane_id}\nattach={attach_command}\n\n"),
+    )
+    .map_err(|error| format!("failed to initialize live terminal log: {error}"))?;
+    let loop_command = live_terminal_loop_command(lane_id, control_root, &log_path);
+    let output = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_id,
+            "sh",
+            "-lc",
+            &loop_command,
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|error| format!("failed to start tmux live terminal session: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux failed to start live terminal session {}: {}{}",
+            session_id,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(Some(mirror))
+}
+
+fn stop_live_terminal_mirror(mirror: Option<LiveTerminalMirror>) {
+    let Some(mut mirror) = mirror else {
+        return;
+    };
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", &mirror.session_id])
+        .output();
+    mirror.stopped_at = Some(cli_timestamp());
+    let _ = write_json(&mirror.record_path, &mirror);
+    if let Ok(mut log) = fs::OpenOptions::new().append(true).open(&mirror.log_path) {
+        use std::io::Write;
+        let _ = writeln!(
+            log,
+            "\nHEPA live terminal mirror stopped for {}",
+            mirror.lane_id
+        );
     }
 }
 
@@ -2847,6 +3019,68 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    fn dashboard_launch_spec_for_test() -> HermesLaunchSpec {
+        let now = cli_timestamp();
+        HermesLaunchSpec {
+            project: HepaRegisteredProject {
+                project: HepaProject {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    project_id: "todo-project".to_string(),
+                    display_name: "Todo project".to_string(),
+                    repo_ref: "/tmp/todo-project".to_string(),
+                    default_branch: "main".to_string(),
+                    routing_policy_ref: None,
+                    is_active: true,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                max_parallel_tasks: 2,
+                cost_policy: HepaCostPolicy {
+                    cost_class: HepaCostClass::Local,
+                    max_paid_lanes: 0,
+                },
+                memory_policy: HepaMemoryPolicy {
+                    max_resident_models: 1,
+                },
+                board_metadata: Some("hermes-dashboard-card".to_string()),
+            },
+            task: HepaFleetTask {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "t_abc123".to_string(),
+                project_id: "todo-project".to_string(),
+                title: "Implement route parity tests\nthrough gateway".to_string(),
+                description: "Write route parity tests.".to_string(),
+                status: HepaTaskStatus::Ready,
+                readiness: HepaReadinessState::Ready,
+                dependencies: Vec::new(),
+                lane_ids: Vec::new(),
+                external_card_id: Some("t_abc123".to_string()),
+                priority: 1,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                completed_at: None,
+            },
+            task_spec: HepaTaskSpec {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "t_abc123".to_string(),
+                project_id: "todo-project".to_string(),
+                goal: "Write route parity tests.\n\nAcceptance criteria:\n- Cover auth routes."
+                    .to_string(),
+                non_goals: Vec::new(),
+                expected_areas: Vec::new(),
+                acceptance_criteria: Vec::new(),
+                validation_commands: Vec::new(),
+                dependencies: Vec::new(),
+                target_branch: None,
+                risk_level: HepaRiskLevel::Medium,
+                max_total_rounds: 2,
+                created_at: now,
+            },
+            lane_id: "lane-1".to_string(),
+            card_id: "t_abc123".to_string(),
+        }
+    }
+
     #[test]
     fn project_add_list_show_doctor_and_remove() {
         let root = unique_test_dir("project");
@@ -3165,6 +3399,30 @@ Validation:
             "Implement route parity tests through gateway"
         );
         assert!(!hermes_run_task_text(&spec).contains('\n'));
+    }
+
+    #[test]
+    fn hermes_dashboard_live_terminal_command_streams_lane_attach_to_external_log() {
+        let command = live_terminal_loop_command(
+            "lane-hermes-t_abc123",
+            Path::new("/tmp/hepa-control"),
+            Path::new("/tmp/hepa-live/lane-hermes-t_abc123/lane-attach.log"),
+        );
+
+        assert!(command.contains("hepa lane attach 'lane-hermes-t_abc123'"));
+        assert!(command.contains("--control-root '/tmp/hepa-control'"));
+        assert!(command.contains(">> '/tmp/hepa-live/lane-hermes-t_abc123/lane-attach.log'"));
+    }
+
+    #[test]
+    fn hermes_dashboard_pr_body_stays_task_focused() {
+        let body = dashboard_pr_intent_body(&dashboard_launch_spec_for_test());
+
+        assert!(body.contains("## Summary"));
+        assert!(body.contains("Implement route parity tests through gateway"));
+        assert!(!body.contains("HEPA lane"));
+        assert!(!body.contains("Hermes manager"));
+        assert!(!body.contains("human review"));
     }
 
     #[test]
