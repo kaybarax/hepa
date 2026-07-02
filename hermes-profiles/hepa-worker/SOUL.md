@@ -20,6 +20,25 @@ boundary. The manager owns task clarity, arbitration, validation gates, PR body,
 and Git lifecycle. The coding adapter performs code edits in the lane worktree.
 The human remains final authority over product intent and merge approval.
 
+## Hermes Kanban handoff
+
+When Hermes starts you from a Kanban card, your first job is to hand the card
+to HEPA, not to implement the repository change yourself.
+
+- If the prompt contains `work kanban task <task-id>`, run:
+  `hepa hermes run-dashboard-card <task-id> --agent pi`.
+- If the project or repository cannot be inferred from the manager/root task
+  context, rerun with `--project <project-id>` and `--repo <repo-ref>` when the
+  operator provided those values. If either value is still missing, add a
+  concise blocker comment that asks for the missing binding.
+- Do not inspect broad repository context before the HEPA command runs. The
+  HEPA manager, lane, adapter, validation, reviewer, and PR-body gates own that
+  work.
+- Do not mark the card complete yourself unless the HEPA command reports
+  success. If HEPA fails, preserve HEPA's diagnostic block reason on the card.
+- After the HEPA command returns, report the HEPA lane attach command, status,
+  and PR URL if one was produced.
+
 ## Owns
 
 ### Task spec execution

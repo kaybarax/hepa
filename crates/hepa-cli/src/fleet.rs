@@ -26,6 +26,7 @@ use hepa_kanban::{
     sync::{HepaKanbanSyncEngine, HepaMemoryHermesCardStore},
 };
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
@@ -340,9 +341,9 @@ pub fn task_command(args: &[String]) -> Result<String, String> {
 
 /// Dispatch `hepa hermes ...`.
 pub fn hermes_command(args: &[String]) -> Result<String, String> {
-    let (subcommand, rest) = args
-        .split_first()
-        .ok_or_else(|| "usage: hepa hermes <ingest-spec|run-ready|run-cards|cards>".to_string())?;
+    let (subcommand, rest) = args.split_first().ok_or_else(|| {
+        "usage: hepa hermes <ingest-spec|run-dashboard-card|run-ready|run-cards|cards>".to_string()
+    })?;
     let (control_root, mut flags) = take_control_root(rest)?;
     let registry = HepaFleetRegistry::new(&control_root);
 
@@ -483,6 +484,49 @@ pub fn hermes_command(args: &[String]) -> Result<String, String> {
                 Ok(format!("HEPA hermes cards:\n{}", lines.join("\n")))
             }
         }
+        "run-dashboard-card" => {
+            let dry_run = take_flag(&mut flags, "--dry-run");
+            let update_hermes = !take_flag(&mut flags, "--no-hermes-update");
+            let agent = take_option(&mut flags, "--agent")?.unwrap_or_else(|| "pi".to_string());
+            let task_json = take_option(&mut flags, "--task-json")?;
+            let project_id = take_option(&mut flags, "--project")?;
+            let repo_ref = take_option(&mut flags, "--repo")?;
+            let (project_id, repo_ref, card_id) = match flags.len() {
+                1 => (
+                    project_id,
+                    repo_ref,
+                    positional(&flags, 0, "Hermes card id")?,
+                ),
+                3 => (
+                    Some(positional(&flags, 0, "project id")?),
+                    Some(positional(&flags, 1, "repo ref")?),
+                    positional(&flags, 2, "Hermes card id")?,
+                ),
+                _ => {
+                    return Err(
+                        "usage: hepa hermes run-dashboard-card <card-id> [--project <id>] [--repo <repo-ref>] or hepa hermes run-dashboard-card <project-id> <repo-ref> <card-id>"
+                            .to_string(),
+                    );
+                }
+            };
+            if flags.len() > 3 {
+                return Err(format!(
+                    "unknown hermes run-dashboard-card flags: {}",
+                    flags[3..].join(" ")
+                ));
+            }
+            run_dashboard_card(
+                &registry,
+                &control_root,
+                project_id.as_deref(),
+                repo_ref.as_deref(),
+                &card_id,
+                &agent,
+                dry_run,
+                update_hermes,
+                task_json.as_deref(),
+            )
+        }
         "run-ready" | "run-cards" => {
             let project_id = positional(&flags, 0, "project id")?;
             let dry_run = take_flag(&mut flags, "--dry-run");
@@ -527,6 +571,369 @@ pub fn hermes_command(args: &[String]) -> Result<String, String> {
         }
         other => Err(format!("unknown hermes command: {other}")),
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HermesDashboardTaskEnvelope {
+    task: HermesDashboardTask,
+    #[serde(default)]
+    parents: Vec<String>,
+    #[serde(default)]
+    children: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HermesDashboardTask {
+    id: String,
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+}
+
+fn run_dashboard_card(
+    registry: &HepaFleetRegistry,
+    control_root: &Path,
+    project_id: Option<&str>,
+    repo_ref: Option<&str>,
+    card_id: &str,
+    agent: &str,
+    dry_run: bool,
+    update_hermes: bool,
+    task_json: Option<&str>,
+) -> Result<String, String> {
+    let envelope = read_dashboard_task(card_id, task_json)?;
+    let related_context = if task_json.is_none() {
+        read_dashboard_related_context(&envelope)
+    } else {
+        Vec::new()
+    };
+    let description = dashboard_task_description(&envelope, &related_context);
+    let project_id = project_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| extract_project_name(&description))
+        .unwrap_or_else(|| "hermes-dashboard".to_string());
+    let repo_ref = repo_ref
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| resolve_repo_ref(&project_id))
+        .ok_or_else(|| {
+            format!(
+                "repo ref is required for project {project_id}; pass --repo <path> or set HEPA_PROJECTS_ROOT"
+            )
+        })?;
+    let now = cli_timestamp();
+    let registration = HepaRegisteredProject {
+        project: HepaProject {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            project_id: project_id.clone(),
+            display_name: project_id.clone(),
+            repo_ref: repo_ref.clone(),
+            default_branch: "main".to_string(),
+            routing_policy_ref: None,
+            is_active: true,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        max_parallel_tasks: 2,
+        cost_policy: HepaCostPolicy {
+            cost_class: HepaCostClass::Local,
+            max_paid_lanes: 0,
+        },
+        memory_policy: HepaMemoryPolicy {
+            max_resident_models: 1,
+        },
+        board_metadata: Some("hermes-dashboard-card".to_string()),
+    };
+    registry
+        .register_project(&registration)
+        .map_err(|error| error.to_string())?;
+    let validation_commands = extract_validation_commands(&description);
+    let acceptance_criteria = extract_acceptance_criteria(&description);
+    let task = HepaFleetTask {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: envelope.task.id.clone(),
+        project_id: project_id.to_string(),
+        title: envelope.task.title.clone(),
+        description: description.clone(),
+        status: HepaTaskStatus::Ready,
+        readiness: HepaReadinessState::Ready,
+        dependencies: Vec::new(),
+        lane_ids: Vec::new(),
+        external_card_id: Some(card_id.to_string()),
+        priority: envelope.task.priority.unwrap_or(1).max(1) as u32,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        completed_at: None,
+    };
+    match registry
+        .show_task(&task.task_id)
+        .map_err(|error| error.to_string())?
+    {
+        Some(existing) => {
+            if existing.status != HepaTaskStatus::Ready
+                || existing.readiness != HepaReadinessState::Ready
+            {
+                registry
+                    .resume_task(&task.task_id, &now)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        None => registry
+            .create_task(&task)
+            .map_err(|error| error.to_string())?,
+    }
+
+    let task_spec = HepaTaskSpec {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: envelope.task.id.clone(),
+        project_id: project_id.to_string(),
+        goal: description,
+        non_goals: vec!["Do not merge the validation PR.".to_string()],
+        expected_areas: Vec::new(),
+        acceptance_criteria,
+        validation_commands,
+        dependencies: Vec::new(),
+        target_branch: None,
+        risk_level: HepaRiskLevel::Medium,
+        max_total_rounds: 2,
+        created_at: now.clone(),
+    };
+    write_hermes_task_spec(control_root, &task_spec)?;
+    write_local_hermes_card(
+        control_root,
+        card_id,
+        &registration.project,
+        &task_spec,
+        &task,
+        Vec::new(),
+        None,
+        Vec::new(),
+    )?;
+
+    let run_result = run_hermes_selected(
+        registry,
+        control_root,
+        &project_id,
+        agent,
+        1,
+        1,
+        dry_run,
+        vec![card_id.to_string()],
+    );
+    if dry_run || !update_hermes {
+        return run_result;
+    }
+    match run_result {
+        Ok(message) => {
+            update_dashboard_card(
+                "complete",
+                card_id,
+                &message,
+                Some(r#"{"hepa_status":"completed"}"#),
+            )?;
+            Ok(format!(
+                "{message}\nHermes dashboard card {card_id} completed"
+            ))
+        }
+        Err(message) => {
+            let reason = trim_for_dashboard(&message, 1200);
+            update_dashboard_card("block", card_id, &reason, None)?;
+            Err(format!(
+                "{message}\nHermes dashboard card {card_id} blocked"
+            ))
+        }
+    }
+}
+
+fn read_dashboard_task(
+    card_id: &str,
+    task_json: Option<&str>,
+) -> Result<HermesDashboardTaskEnvelope, String> {
+    let text = match task_json {
+        Some(path) => {
+            fs::read_to_string(path).map_err(|error| format!("failed to read {path}: {error}"))?
+        }
+        None => {
+            let output = Command::new("hermes")
+                .args(["kanban", "show", card_id, "--json"])
+                .output()
+                .map_err(|error| format!("failed to run hermes kanban show: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "hermes kanban show failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|error| format!("hermes kanban show output was not UTF-8: {error}"))?
+        }
+    };
+    serde_json::from_str(&text).map_err(|error| format!("Hermes task JSON is invalid: {error}"))
+}
+
+fn read_dashboard_related_context(envelope: &HermesDashboardTaskEnvelope) -> Vec<String> {
+    envelope
+        .parents
+        .iter()
+        .chain(envelope.children.iter())
+        .filter(|related_id| related_id.as_str() != envelope.task.id)
+        .filter_map(|related_id| read_dashboard_task(related_id, None).ok())
+        .map(|related| dashboard_task_text(&related.task))
+        .filter(|text| !text.trim().is_empty())
+        .take(4)
+        .collect()
+}
+
+fn dashboard_task_description(
+    envelope: &HermesDashboardTaskEnvelope,
+    related_context: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if !related_context.is_empty() {
+        parts.push(format!(
+            "Related Hermes context:\n{}",
+            related_context.join("\n\n---\n\n")
+        ));
+    }
+    parts.push(format!(
+        "Hermes dashboard task {}:\n{}",
+        envelope.task.id,
+        dashboard_task_text(&envelope.task)
+    ));
+    parts.push(
+        "HEPA must execute this task through its lane manager, coding adapter, validation, review, Git lifecycle, and PR body gates."
+            .to_string(),
+    );
+    parts.join("\n\n")
+}
+
+fn dashboard_task_text(task: &HermesDashboardTask) -> String {
+    match task
+        .body
+        .as_ref()
+        .map(|body| body.trim())
+        .filter(|body| !body.is_empty())
+    {
+        Some(body) => format!("Title: {}\n\n{}", task.title.trim(), body),
+        None => task.title.trim().to_string(),
+    }
+}
+
+fn extract_validation_commands(text: &str) -> Vec<String> {
+    extract_bullets_after_heading(text, "Validation")
+}
+
+fn extract_acceptance_criteria(text: &str) -> Vec<String> {
+    let criteria = extract_bullets_after_heading(text, "Acceptance criteria");
+    if criteria.is_empty() {
+        vec!["HEPA lane completes and creates a reviewable PR.".to_string()]
+    } else {
+        criteria
+    }
+}
+
+fn extract_project_name(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("Project:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    })
+}
+
+fn resolve_repo_ref(project_id: &str) -> Option<String> {
+    if project_id.contains(std::path::MAIN_SEPARATOR) {
+        let path = PathBuf::from(project_id);
+        if path.exists() {
+            return Some(path.display().to_string());
+        }
+    }
+    let roots = [
+        std::env::var_os("HEPA_PROJECTS_ROOT").map(PathBuf::from),
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("workspace").join("projects")),
+    ];
+    roots
+        .into_iter()
+        .flatten()
+        .map(|root| root.join(project_id))
+        .find(|path| path.exists())
+        .map(|path| path.display().to_string())
+}
+
+fn extract_bullets_after_heading(text: &str, heading: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut items = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.trim_end_matches(':').eq_ignore_ascii_case(heading) {
+            in_section = true;
+            continue;
+        }
+        if in_section && trimmed.ends_with(':') && !trimmed.starts_with('-') {
+            break;
+        }
+        if in_section {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                items.push(item.trim().to_string());
+            } else if !trimmed.is_empty() && items.is_empty() {
+                items.push(trimmed.to_string());
+            }
+        }
+    }
+    items
+}
+
+fn update_dashboard_card(
+    action: &str,
+    card_id: &str,
+    message: &str,
+    metadata: Option<&str>,
+) -> Result<(), String> {
+    let mut command = Command::new("hermes");
+    match action {
+        "complete" => {
+            command
+                .args(["kanban", "complete", card_id, "--result"])
+                .arg(trim_for_dashboard(message, 1800))
+                .args(["--summary"])
+                .arg(trim_for_dashboard(message, 1800));
+            if let Some(metadata) = metadata {
+                command.args(["--metadata", metadata]);
+            }
+        }
+        "block" => {
+            command
+                .args(["kanban", "block", card_id, "--kind", "transient"])
+                .arg(trim_for_dashboard(message, 1800));
+        }
+        other => return Err(format!("unknown dashboard update action: {other}")),
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to run hermes kanban {action}: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "hermes kanban {action} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn trim_for_dashboard(text: &str, max_chars: usize) -> String {
+    let mut trimmed = text.trim().chars().take(max_chars).collect::<String>();
+    if text.trim().chars().count() > max_chars {
+        trimmed.push_str("...");
+    }
+    trimmed
 }
 
 fn normalize_imported_project(
@@ -2381,6 +2788,55 @@ Validation:
         let card_json = std::fs::read_to_string(card_path).expect("card json");
         assert!(card_json.contains("lane_attach_commands"));
         assert!(card_json.contains("fleet_watch_command"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn hermes_dashboard_card_imports_into_hepa_dry_run() {
+        let root = unique_test_dir("hermes-dashboard");
+        let control = root.join("control");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let task_json = root.join("dashboard-task.json");
+        std::fs::write(
+            &task_json,
+            r#"
+{
+  "task": {
+    "id": "t_abc123",
+    "title": "Implement route parity tests",
+    "body": "Write gateway route parity tests.\n\nAcceptance criteria:\n- Route tests cover auth, user, and todo routes.\n- Tests use deterministic mocks.\n\nValidation:\n- pnpm test --filter gateway",
+    "priority": 3
+  },
+  "parents": [],
+  "children": []
+}
+"#,
+        )
+        .expect("task json");
+
+        let output = hermes_command(&s(&[
+            "run-dashboard-card",
+            "todo-project",
+            repo.to_str().expect("repo"),
+            "t_abc123",
+            "--task-json",
+            task_json.to_str().expect("task json path"),
+            "--dry-run",
+            "--no-hermes-update",
+            "--control-root",
+            control.to_str().expect("control path"),
+        ]))
+        .expect("dashboard dry run");
+        assert!(output.contains("HEPA hermes dry-run"));
+        assert!(output.contains("t_abc123"));
+        assert!(output.contains("card=t_abc123"));
+
+        let spec_path = local_hermes_spec_path(&control, "t_abc123");
+        let spec_json = std::fs::read_to_string(spec_path).expect("spec json");
+        assert!(spec_json.contains("Route tests cover auth"));
+        assert!(spec_json.contains("pnpm test --filter gateway"));
 
         std::fs::remove_dir_all(&root).ok();
     }
