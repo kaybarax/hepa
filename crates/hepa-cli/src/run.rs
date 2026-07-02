@@ -1411,32 +1411,41 @@ fn execute_live_worker_attempt(
                 }
             }
             Err(error) => {
-                let attempt = HepaAttemptReport {
-                    schema_version: CONTRACT_SCHEMA_VERSION,
-                    attempt_id: attempt_id.to_string(),
-                    lane_id: config.lane_id.clone(),
-                    task_id: config.task_id.clone(),
-                    round,
-                    role: HepaAgentRole::Worker,
-                    adapter_id: adapter_id.to_string(),
-                    status: hepa_core::contracts::HepaAttemptStatus::Blocked,
-                    commands_run: vec![result.command],
-                    changed_files,
-                    summary: live_attempt_summary(
-                        &allocation.worktree_path,
-                        &result.stdout,
-                        &result.stderr,
-                    ),
-                    blocked_reason: Some(format!(
+                if pi_parse_error_is_eof_truncation(&error) && !changed_files.is_empty() {
+                    append_pi_truncated_stream_event(
+                        lane_paths,
+                        round,
+                        &error.to_string(),
+                        &changed_files,
+                    )?;
+                } else {
+                    let attempt = HepaAttemptReport {
+                        schema_version: CONTRACT_SCHEMA_VERSION,
+                        attempt_id: attempt_id.to_string(),
+                        lane_id: config.lane_id.clone(),
+                        task_id: config.task_id.clone(),
+                        round,
+                        role: HepaAgentRole::Worker,
+                        adapter_id: adapter_id.to_string(),
+                        status: hepa_core::contracts::HepaAttemptStatus::Blocked,
+                        commands_run: vec![result.command],
+                        changed_files,
+                        summary: live_attempt_summary(
+                            &allocation.worktree_path,
+                            &result.stdout,
+                            &result.stderr,
+                        ),
+                        blocked_reason: Some(format!(
+                            "local_provider_empty_or_malformed_response: {error}"
+                        )),
+                        started_at: started_at.to_string(),
+                        completed_at: Some(completed_at.to_string()),
+                    };
+                    write_attempt(lane_paths, &attempt)?;
+                    return Err(format!(
                         "local_provider_empty_or_malformed_response: {error}"
-                    )),
-                    started_at: started_at.to_string(),
-                    completed_at: Some(completed_at.to_string()),
-                };
-                write_attempt(lane_paths, &attempt)?;
-                return Err(format!(
-                    "local_provider_empty_or_malformed_response: {error}"
-                ));
+                    ));
+                }
             }
         }
     }
@@ -1554,6 +1563,43 @@ fn append_tool_summary_stream_event(
     serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
     file.write_all(b"\n").map_err(|error| error.to_string())?;
     file.flush().map_err(|error| error.to_string())
+}
+
+fn append_pi_truncated_stream_event(
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    round: u32,
+    error: &str,
+    changed_files: &[String],
+) -> Result<(), String> {
+    let stream_path = lane_paths
+        .lane_dir
+        .join("streams")
+        .join("manager-tool-summary-stream.jsonl");
+    if let Some(parent) = stream_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stream_path)
+        .map_err(|error| error.to_string())?;
+    let event = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "source": "hepa-manager",
+        "event": "pi_truncated_stream_continued",
+        "round": round,
+        "error": bounded_model_visible_summary(error),
+        "changed_files": changed_files,
+        "policy": "Pi stdout ended with an EOF-truncated JSON event after producing changed files; HEPA continued to validation/review instead of discarding the attempt."
+    });
+    serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())
+}
+
+fn pi_parse_error_is_eof_truncation(error: &hepa_adapters::pi::HepaPiParseError) -> bool {
+    let message = error.to_string();
+    message.contains("EOF while parsing")
 }
 
 fn bounded_model_visible_summary(message: &str) -> String {
@@ -2120,9 +2166,11 @@ fn clamp_live_budget_ms(raw: Option<&str>, default_ms: u64, max_ms: u64) -> u64 
 }
 
 fn live_worker_prompt(task_text: &str) -> String {
-    format!(
+    let mut prompt = format!(
         "You are HEPA's live stress-test worker.\n\nTask:\n{task_text}\n\nRepository worktree: current directory.\n\nExecution rules:\n- You are already running inside the lane worktree.\n- Make only the changes needed to satisfy the task.\n- Use relative paths when reading or editing files.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Do not run package install commands that can rewrite lockfiles or workspace/package-manager configuration unless the task explicitly asks for dependency or package-manager changes.\n- Run the smallest relevant validation command when practical, but only if it does not mutate dependency lockfiles or workspace/package-manager configuration; manager-owned validation will run the configured validation commands after your attempt.\n- Finish by reporting changed files, validation results if you ran a non-mutating check, and any blockers.\n",
-    )
+    );
+    prompt.push_str(repo_privacy_rules());
+    prompt
 }
 
 fn live_worker_prompt_for_adapter(
@@ -2153,6 +2201,7 @@ fn live_repair_worker_prompt_for_adapter(
     let mut prompt = format!(
         "{repair_prompt}\n\nExecution rules:\n- You are already running inside the same lane worktree.\n- Fix only the evidenced failures named above.\n- Do not create commits, branches, tags, pull requests, or Git remotes; HEPA owns the Git lifecycle.\n- Do not read or print provider keys, credentials, or unrelated local files.\n- Finish by reporting changed files, rerun validation results, and any remaining blockers.\n"
     );
+    prompt.push_str(repo_privacy_rules());
     if adapter_id == "pi" {
         prompt.push_str(pi_tool_path_rules());
     }
@@ -2172,6 +2221,10 @@ fn live_repair_worker_prompt_for_adapter(
 
 fn pi_tool_path_rules() -> &'static str {
     "\nPi tool path rules:\n- Treat the lane worktree root as the current directory for all read/edit/write calls.\n- If a find call uses a search root such as `./src` and returns `app/file.tsx`, read or edit `src/app/file.tsx`.\n- Prefer find from `.` when practical so returned paths are already worktree-root relative.\n- Before editing a file discovered by find, verify the exact worktree-relative path exists.\n"
+}
+
+fn repo_privacy_rules() -> &'static str {
+    "\nRepository privacy rules:\n- Do not write absolute local filesystem paths, home-directory paths, usernames, hostnames, machine names, HEPA control/archive/worktree paths, provider names, or credentials into repository files or tests.\n- When a test needs a path-like value, use a relative path or neutral placeholder fixture such as `fixtures/example-project`.\n"
 }
 
 fn pi_local_provider_bounded_task_rules() -> &'static str {
@@ -4844,6 +4897,82 @@ mod tests {
     }
 
     #[test]
+    fn live_pi_truncated_eof_with_changed_files_continues_to_validation_path() {
+        let root = unique_test_dir("live-pi-truncated-with-changes");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let config = HepaFakeRunConfig {
+            repo_path: repo.clone(),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-truncated".to_string(),
+            task_id: "task-truncated".to_string(),
+            lane_id: "lane-truncated".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let layout =
+            HepaArtifactLayout::new(&config.control_root, &config.archive_root).expect("layout");
+        let lane_paths = layout
+            .run(&config.run_id, &config.task_id)
+            .expect("run paths")
+            .lane(&config.lane_id)
+            .expect("lane paths");
+        fs::create_dir_all(&lane_paths.lane_dir).expect("lane dir");
+        let allocator = HepaWorktreeAllocator::new(&config.repo_path, &config.worktree_root);
+        let allocation = allocator
+            .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
+            .expect("allocation");
+        let fake_pi = root.join("pi-truncated");
+        write_executable(
+            &fake_pi,
+            "#!/usr/bin/env sh\ncat >/dev/null\nprintf 'changed by pi\\n' >> README.md\nprintf '%s\\n' '{\"type\":\"agent_start\"}' '{\"type\":\"tool_call\",\"name\":\"edit\"}'\nprintf '%s' '{\"type\":\"message_update\",\"delta\":\"unterminated'\n",
+        );
+        let mut spec = dummy_pi_spec();
+        spec.command = format!("{} --mode json", fake_pi.display());
+        spec.required_commands = vec![fake_pi.to_string_lossy().to_string()];
+
+        let result = execute_live_worker_attempt(ExecuteLiveAttemptInput {
+            config: &config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            spec,
+            adapter_id: "pi",
+            environment: std::collections::BTreeMap::new(),
+            attempt_id: "attempt-1",
+            round: 1,
+            prompt: "fixture prompt".to_string(),
+            started_at: "2026-06-16T00:00:02Z",
+            completed_at: "2026-06-16T00:00:03Z",
+        })
+        .expect("changed files should continue after EOF-truncated Pi output");
+
+        assert_eq!(result.changed_files, vec!["README.md".to_string()]);
+        let attempt_json = fs::read_to_string(
+            lane_paths
+                .attempt("attempt-1")
+                .expect("attempt paths")
+                .attempt_dir
+                .join("attempt.json"),
+        )
+        .expect("attempt report");
+        assert!(attempt_json.contains("\"status\": \"completed\""));
+        let stream = fs::read_to_string(
+            lane_paths
+                .lane_dir
+                .join("streams/manager-tool-summary-stream.jsonl"),
+        )
+        .expect("stream event");
+        assert!(stream.contains("pi_truncated_stream_continued"));
+
+        allocator
+            .cleanup_lane(&config.lane_id, "2026-06-16T00:00:09Z")
+            .expect("cleanup");
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn fake_terminal_run_records_memory_signals() {
         let root = unique_test_dir("fake-memory");
         let repo = root.join("repo");
@@ -4951,6 +5080,9 @@ mod tests {
         assert!(prompt.contains("Repository worktree: current directory"));
         assert!(prompt.contains("HEPA owns the Git lifecycle"));
         assert!(prompt.contains("Run the smallest relevant validation command"));
+        assert!(prompt.contains("Repository privacy rules"));
+        assert!(prompt.contains("Do not write absolute local filesystem paths"));
+        assert!(prompt.contains("neutral placeholder fixture"));
         assert!(!prompt.contains("/tmp/hepa-lane"));
         assert!(!prompt.contains("Added by Pi smoke test"));
         assert!(!prompt.contains("Make exactly one change"));
@@ -6571,6 +6703,8 @@ JSON
         assert!(prompt.contains("git diff --check"));
         assert!(prompt.contains("Fix only the evidenced failures"));
         assert!(prompt.contains("HEPA owns the Git lifecycle"));
+        assert!(prompt.contains("Repository privacy rules"));
+        assert!(prompt.contains("Do not write absolute local filesystem paths"));
         assert!(prompt.contains("Pi tool path rules"));
         assert!(prompt.contains("find call uses a search root"));
         assert!(!prompt.contains("/no_think"));

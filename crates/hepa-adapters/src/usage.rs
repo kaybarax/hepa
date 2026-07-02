@@ -111,12 +111,16 @@ fn first_usage_payload(raw_output: &str) -> Result<Option<UsagePayload>, HepaAda
         if line.is_empty() {
             continue;
         }
-        let envelope = serde_json::from_str::<UsageEnvelope>(line).map_err(|error| {
-            HepaAdapterUsageError::new(
-                "usage",
-                format!("line {} usage JSON parse failed: {error}", line_index + 1),
-            )
-        })?;
+        let envelope = match serde_json::from_str::<UsageEnvelope>(line) {
+            Ok(envelope) => envelope,
+            Err(error) if error.is_eof() => break,
+            Err(error) => {
+                return Err(HepaAdapterUsageError::new(
+                    "usage",
+                    format!("line {} usage JSON parse failed: {error}", line_index + 1),
+                ));
+            }
+        };
         if let Some(payload) = envelope.into_payload() {
             return Ok(Some(payload));
         }
@@ -182,6 +186,19 @@ mod tests {
             &HepaAdapterCostClass::PaidCloud,
         )
         .expect("missing usage should not fail");
+
+        assert!(extraction.entry.is_none());
+    }
+
+    #[test]
+    fn eof_truncated_tail_without_usage_is_non_blocking() {
+        let extraction = extract_adapter_usage(
+            "{\"type\":\"agent_start\"}\n{\"type\":\"message_update\",\"delta\":\"unterminated",
+            "pi",
+            "attempt-1",
+            &HepaAdapterCostClass::PaidCloud,
+        )
+        .expect("EOF-truncated tail should not fail usage extraction");
 
         assert!(extraction.entry.is_none());
     }
