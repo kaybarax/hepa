@@ -464,7 +464,14 @@ fn line_has_secret_assignment(line: &str) -> bool {
             continue;
         }
         if is_secret_assignment_key(key) {
-            let value = line[index + separator.len_utf8()..]
+            let raw_value = line[index + separator.len_utf8()..].trim();
+            if separator == ':' && is_safe_type_annotation(raw_value) {
+                continue;
+            }
+            if is_safe_auth_code_reference(raw_value) {
+                continue;
+            }
+            let value = raw_value
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
@@ -526,8 +533,20 @@ fn is_documented_secret_placeholder(value: &str) -> bool {
 }
 
 fn is_safe_auth_code_reference(value: &str) -> bool {
+    if value.contains("${this.authToken}") || value.contains("${this.refreshToken}") {
+        return true;
+    }
+    let normalized = value.trim_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '<' | '>'
+        )
+    });
+    if normalized.ends_with("_error") || normalized.ends_with("-error") {
+        return true;
+    }
     matches!(
-        value,
+        normalized,
         "token"
             | "refreshToken"
             | "authToken"
@@ -536,6 +555,24 @@ fn is_safe_auth_code_reference(value: &str) -> bool {
             | "this.authToken"
             | "null"
             | "undefined"
+    )
+}
+
+fn is_safe_type_annotation(value: &str) -> bool {
+    let normalized = value.trim_start_matches('?').trim_start();
+    matches!(
+        normalized.split_whitespace().next().unwrap_or_default(),
+        "string"
+            | "number"
+            | "boolean"
+            | "unknown"
+            | "void"
+            | "Promise<void>"
+            | "Promise<string>"
+            | "Promise<boolean>"
+            | "string;"
+            | "number;"
+            | "boolean;"
     )
 }
 
@@ -865,7 +902,7 @@ mod tests {
         fs::create_dir_all(repo.join("src/api")).expect("src dir");
         fs::write(
             repo.join("src/api/BaseApiClient.ts"),
-            "setAuthToken(token: string, refreshToken?: string): void {\n  this.authToken = token;\n  this.refreshToken = refreshToken ?? null;\n}\nconst body = { refreshToken: this.refreshToken };\n",
+            "enum ApiErrorCode {\n  AUTHORIZATION_ERROR = 'authorization_error',\n}\nsetAuthToken(token: string, refreshToken?: string): void {\n  this.authToken = token;\n  this.refreshToken = refreshToken ?? null;\n}\nconst body = { refreshToken: this.refreshToken };\nconfig.headers.Authorization = `Bearer ${this.authToken}`;\n",
         )
         .expect("api client write");
         let staging = HepaSafeStaging::new(&repo);
@@ -880,6 +917,23 @@ mod tests {
         );
 
         remove_test_dir(repo);
+    }
+
+    #[test]
+    fn auth_token_code_lines_are_not_secret_assignments() {
+        for line in [
+            "  AUTHORIZATION_ERROR = 'authorization_error',",
+            "setAuthToken(token: string, refreshToken?: string): void {",
+            "  this.authToken = token;",
+            "  this.refreshToken = refreshToken ?? null;",
+            "const body = { refreshToken: this.refreshToken };",
+            "config.headers.Authorization = `Bearer ${this.authToken}`;",
+        ] {
+            assert!(
+                !line_has_secret_assignment(line),
+                "line should not be classified as a secret assignment: {line}"
+            );
+        }
     }
 
     #[test]
