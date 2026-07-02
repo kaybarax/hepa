@@ -145,6 +145,38 @@ pub fn pr_request_from_hermes_intent(
     })
 }
 
+pub fn pr_request_from_hermes_intent_with_run_evidence(
+    intent: &HepaHermesPrIntent,
+    evidence: &HepaPrBodyInput<'_>,
+    base_branch: impl Into<String>,
+    head_branch: impl Into<String>,
+) -> Result<HepaPrRequest, HepaPrError> {
+    intent
+        .validate()
+        .map_err(|error| HepaPrError::new(error.field, error.message))?;
+
+    let mut body = intent.body.trim_end().to_string();
+    body.push_str("\n\n");
+    body.push_str(&build_hermes_run_evidence_body(evidence));
+    body.push_str("\n## HEPA audit\n");
+    for line in &intent.audit_summary {
+        body.push_str("- ");
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push_str("- PR intent author: ");
+    body.push_str(&intent.author_profile_id);
+    body.push('\n');
+    body.push_str("- HEPA appended structured run evidence from lane artifacts before manager-owned PR creation.\n");
+
+    Ok(HepaPrRequest {
+        title: intent.title.clone(),
+        body,
+        base_branch: base_branch.into(),
+        head_branch: head_branch.into(),
+    })
+}
+
 /// Manager-owned git lifecycle. The only type exposing commit/push/PR creation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HepaManagerGitLifecycle {
@@ -326,7 +358,6 @@ pub struct HepaPrBodyInput<'a> {
 /// Build a deterministic, sanitized PR body that reconstructs the run:
 /// summary, validation, review, risk, adapter, timing, and the Hermes card link.
 pub fn build_pr_body(input: &HepaPrBodyInput) -> String {
-    let report = input.terminal_report;
     let mut lines = Vec::new();
 
     lines.push("## Fallback Evidence Artifact".to_string());
@@ -339,9 +370,53 @@ pub fn build_pr_body(input: &HepaPrBodyInput) -> String {
             .to_string(),
     );
     lines.push(String::new());
+    lines.extend(run_evidence_lines(input));
+
+    let mut body = lines.join("\n");
+    body.push('\n');
+    body
+}
+
+pub fn build_hermes_run_evidence_body(input: &HepaPrBodyInput) -> String {
+    let mut lines = Vec::new();
+    lines.push("## HEPA run evidence".to_string());
+    lines.push(
+        "HEPA reconstructed these details from deterministic lane artifacts before publishing the manager-owned PR."
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.extend(run_evidence_lines(input));
+
+    let mut body = lines.join("\n");
+    body.push('\n');
+    body
+}
+
+fn run_evidence_lines(input: &HepaPrBodyInput) -> Vec<String> {
+    let report = input.terminal_report;
+    let mut lines = Vec::new();
+
     lines.push("## Summary".to_string());
     lines.push(format!("- Status: {}", terminal_status_label(report)));
     lines.push(format!("- Task: {}", input.task_spec.goal));
+    if !input.task_spec.expected_areas.is_empty() {
+        lines.push(format!(
+            "- Expected areas: {}",
+            input.task_spec.expected_areas.join(", ")
+        ));
+    }
+    if !input.task_spec.acceptance_criteria.is_empty() {
+        lines.push("- Acceptance criteria:".to_string());
+        for criterion in input.task_spec.acceptance_criteria.iter().take(8) {
+            lines.push(format!("  - {criterion}"));
+        }
+        if input.task_spec.acceptance_criteria.len() > 8 {
+            lines.push(format!(
+                "  - ({} more omitted)",
+                input.task_spec.acceptance_criteria.len() - 8
+            ));
+        }
+    }
     if report.summary.is_empty() {
         lines.push("- No summary recorded.".to_string());
     } else {
@@ -466,9 +541,7 @@ pub fn build_pr_body(input: &HepaPrBodyInput) -> String {
         _ => lines.push("- No Hermes card linked.".to_string()),
     }
 
-    let mut body = lines.join("\n");
-    body.push('\n');
-    body
+    lines
 }
 
 fn terminal_status_label(report: &HepaTerminalTaskReport) -> &'static str {

@@ -30,7 +30,7 @@ use hepa_core::{config::HepaConfigOverrides, redaction::redact_secrets};
 use hepa_git::{
     pr::{
         HepaCommitMessage, HepaManagerGitLifecycle, HepaPrBodyInput, HepaPrRequest,
-        HepaSystemProcessRunner, build_pr_body, pr_request_from_hermes_intent,
+        HepaSystemProcessRunner, build_pr_body, pr_request_from_hermes_intent_with_run_evidence,
     },
     staging::HepaSafeStaging,
     worktree::{HepaWorktreeAllocation, HepaWorktreeAllocator},
@@ -1890,6 +1890,9 @@ fn live_pr_request(
     if let Ok(intent_path) = std::env::var("HEPA_HERMES_PR_INTENT_FILE") {
         return pr_request_from_hermes_intent_file(
             Path::new(&intent_path),
+            task_spec,
+            terminal_report,
+            lane,
             base_branch.to_string(),
             head_branch.to_string(),
         );
@@ -1958,11 +1961,21 @@ fn pr_request_from_hermes_intent_runtime_command(
         stdout_path: &stdout_path,
         stderr_path: &stderr_path,
     })?;
-    pr_request_from_hermes_intent_file(&output_path, base_branch, head_branch)
+    pr_request_from_hermes_intent_file(
+        &output_path,
+        task_spec,
+        terminal_report,
+        lane,
+        base_branch,
+        head_branch,
+    )
 }
 
 fn pr_request_from_hermes_intent_file(
     intent_path: &Path,
+    task_spec: &HepaTaskSpec,
+    terminal_report: &HepaTerminalTaskReport,
+    lane: &HepaLane,
     base_branch: String,
     head_branch: String,
 ) -> Result<HepaPrRequest, String> {
@@ -1970,7 +1983,13 @@ fn pr_request_from_hermes_intent_file(
         .map_err(|error| format!("Hermes PR intent could not be read: {error}"))?;
     let intent: HepaHermesPrIntent = serde_json::from_str(&raw)
         .map_err(|error| format!("Hermes PR intent JSON is invalid: {error}"))?;
-    pr_request_from_hermes_intent(&intent, base_branch, head_branch)
+    let evidence = HepaPrBodyInput {
+        task_spec,
+        terminal_report,
+        lane,
+        external_card_id: None,
+    };
+    pr_request_from_hermes_intent_with_run_evidence(&intent, &evidence, base_branch, head_branch)
         .map_err(|error| format!("Hermes PR intent failed validation: {error}"))
 }
 
@@ -4796,9 +4815,37 @@ mod tests {
             serde_json::to_string_pretty(&intent).expect("intent json"),
         )
         .expect("write intent");
+        let config = runtime_review_config(&root);
+        let task_spec = live_task_spec(&config);
+        let validation = passed_validation();
+        let review = HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: "review-1".to_string(),
+            lane_id: config.lane_id.clone(),
+            adapter_id: "hepa-reviewer:primary".to_string(),
+            status: HepaReviewStatus::Approved,
+            findings: Vec::new(),
+            summary: vec!["No blocking findings.".to_string()],
+            completed_at: "2026-06-16T00:00:06Z".to_string(),
+        };
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 1.0,
+            validation_duration_seconds: 0.1,
+            review_duration_seconds: 0.1,
+            reviewer_passes: 1,
+            terminal_phase: LivePipelinePhase::Completed,
+            repair_timing: None,
+        });
+        let terminal_report = terminal_report(&config, validation, review, timing);
+        let lane = completed_lane(&config);
 
         let request = pr_request_from_hermes_intent_file(
             &intent_path,
+            &task_spec,
+            &terminal_report,
+            &lane,
             "main".to_string(),
             "hepa/manager/lane-1".to_string(),
         )
@@ -4813,6 +4860,8 @@ mod tests {
                 .contains("Adds the requested app readiness badge")
         );
         assert!(request.body.contains("## HEPA audit"));
+        assert!(request.body.contains("## HEPA run evidence"));
+        assert!(request.body.contains("Agent loops: 1"));
         assert!(request.body.contains("PR intent author: hepa-manager"));
 
         remove_test_dir(root);
@@ -4924,9 +4973,37 @@ JSON
             serde_json::to_string_pretty(&intent).expect("intent json"),
         )
         .expect("write intent");
+        let config = runtime_review_config(&root);
+        let task_spec = live_task_spec(&config);
+        let validation = passed_validation();
+        let review = HepaReviewSignal {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            review_id: "review-1".to_string(),
+            lane_id: config.lane_id.clone(),
+            adapter_id: "hepa-reviewer:primary".to_string(),
+            status: HepaReviewStatus::Approved,
+            findings: Vec::new(),
+            summary: vec!["No blocking findings.".to_string()],
+            completed_at: "2026-06-16T00:00:06Z".to_string(),
+        };
+        let timing = live_timing_record(LiveTimingInput {
+            config: &config,
+            adapter_id: "pi",
+            worker_duration_seconds: 1.0,
+            validation_duration_seconds: 0.1,
+            review_duration_seconds: 0.1,
+            reviewer_passes: 1,
+            terminal_phase: LivePipelinePhase::Completed,
+            repair_timing: None,
+        });
+        let terminal_report = terminal_report(&config, validation, review, timing);
+        let lane = completed_lane(&config);
 
         let error = pr_request_from_hermes_intent_file(
             &intent_path,
+            &task_spec,
+            &terminal_report,
+            &lane,
             "main".to_string(),
             "hepa/manager/lane-1".to_string(),
         )
