@@ -1,13 +1,14 @@
 //! CLI handlers for the fleet command groups (project/task/scheduler/fleet),
 //! all backed by the deterministic, temp-root-safe `HepaFleetRegistry`.
 
-use crate::run::{HepaFakeRunConfig, run_live_task};
+use crate::run::{HepaFakeRunConfig, HepaFakeRunResult, run_live_task};
 use hepa_adapters::registry::HepaAdapterRegistry;
 use hepa_core::config::{HepaConfig, HepaConfigOverrides};
 use hepa_core::contracts::HepaLaneState;
 use hepa_core::contracts::{
     CONTRACT_SCHEMA_VERSION, HepaFleetTask, HepaLane, HepaProject, HepaReadinessResult,
     HepaReadinessState, HepaReadinessStatus, HepaRiskLevel, HepaTaskSpec, HepaTaskStatus,
+    HepaTerminalStatus,
 };
 use hepa_core::fleet_monitor::{HepaFleetMonitor, HepaLaneObservation, HepaResourceSample};
 use hepa_core::fleet_registry::{
@@ -1272,6 +1273,45 @@ fn run_hermes_launch_spec(
     );
     match run_live_task(&config, agent) {
         Ok(result) => {
+            if !hermes_live_result_is_success(&result) {
+                let reason = hermes_live_result_blocked_reason(&result);
+                let blocked = registry
+                    .block_task(&spec.task.task_id, &cli_timestamp())
+                    .unwrap_or_else(|_| HepaFleetTask {
+                        status: HepaTaskStatus::Blocked,
+                        ..spec.task.clone()
+                    });
+                let lane = hermes_lane_record(
+                    &spec.project.project,
+                    &blocked,
+                    &spec.lane_id,
+                    agent,
+                    HepaLaneState::Blocked,
+                );
+                let _ = write_local_hermes_card(
+                    &control_root,
+                    &spec.card_id,
+                    &spec.project.project,
+                    &spec.task_spec,
+                    &HepaFleetTask {
+                        lane_ids: vec![spec.lane_id.clone()],
+                        ..blocked
+                    },
+                    vec![lane],
+                    Some(result.terminal_report.clone()),
+                    vec![reason.clone()],
+                );
+                return HermesRunSummary {
+                    task_id: spec.task.task_id,
+                    lane_id: result.lane_id,
+                    card_id: spec.card_id,
+                    status: result.status,
+                    pr_url: result.terminal_report.pr_url,
+                    attach_command,
+                    failed: true,
+                };
+            }
+
             let completed = registry
                 .complete_task(&spec.task.task_id, &cli_timestamp())
                 .unwrap_or_else(|_| HepaFleetTask {
@@ -1346,6 +1386,28 @@ fn run_hermes_launch_spec(
                 failed: true,
             }
         }
+    }
+}
+
+fn hermes_live_result_is_success(result: &HepaFakeRunResult) -> bool {
+    result.status == "completed"
+        && result.terminal_report.status == HepaTerminalStatus::Completed
+        && result.terminal_report.pr_url.is_some()
+}
+
+fn hermes_live_result_blocked_reason(result: &HepaFakeRunResult) -> String {
+    let summary = result.terminal_report.summary.join(" ");
+    let summary = collapse_single_line(&summary);
+    if summary.is_empty() {
+        format!(
+            "HEPA run did not reach PR-ready completion: status={}",
+            result.status
+        )
+    } else {
+        format!(
+            "HEPA run did not reach PR-ready completion: status={} summary={}",
+            result.status, summary
+        )
     }
 }
 
@@ -2622,6 +2684,7 @@ fn positional(flags: &[String], index: usize, label: &str) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hepa_core::contracts::{HepaTerminalTaskReport, HepaTimingCounters, HepaTimingRecord};
 
     fn unique_test_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -2953,6 +3016,48 @@ Validation:
             "Implement route parity tests through gateway"
         );
         assert!(!hermes_run_task_text(&spec).contains('\n'));
+    }
+
+    #[test]
+    fn hermes_dashboard_run_treats_blocked_live_result_as_failure() {
+        let result = HepaFakeRunResult {
+            run_id: "run-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            status: "blocked".to_string(),
+            timing: HepaTimingRecord {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                run_id: "run-1".to_string(),
+                phases: Vec::new(),
+                counters: HepaTimingCounters {
+                    agent_loops: 1,
+                    manager_passes: 1,
+                    worker_profile_llm_calls: 0,
+                    reviewer_passes: 0,
+                    install_events: 0,
+                    container_count: 0,
+                },
+            },
+            terminal_report: HepaTerminalTaskReport {
+                schema_version: CONTRACT_SCHEMA_VERSION,
+                task_id: "task-1".to_string(),
+                lane_id: "lane-1".to_string(),
+                status: HepaTerminalStatus::Blocked,
+                pr_url: None,
+                validation: None,
+                review_signals: Vec::new(),
+                arbitration: None,
+                timing: None,
+                summary: vec!["worker blocked before validation".to_string()],
+                human_attention_required: true,
+                completed_at: "2026-06-16T00:00:00Z".to_string(),
+            },
+            cleanup_performed: false,
+        };
+
+        assert!(!hermes_live_result_is_success(&result));
+        assert!(
+            hermes_live_result_blocked_reason(&result).contains("worker blocked before validation")
+        );
     }
 
     #[test]
