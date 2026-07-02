@@ -157,6 +157,17 @@ pub fn map_task_to_hermes_card(
         "lane_states".to_string(),
         HepaHermesFieldValue::List(lane_state_refs(input)?),
     );
+    let attach_commands = lane_attach_commands(input);
+    if !attach_commands.is_empty() {
+        fields.insert(
+            "lane_attach_commands".to_string(),
+            HepaHermesFieldValue::List(attach_commands),
+        );
+        fields.insert(
+            "fleet_watch_command".to_string(),
+            HepaHermesFieldValue::Text("hepa fleet watch".to_string()),
+        );
+    }
     if let Some(external_card_id) = &input.task.external_card_id {
         insert_text(&mut fields, "external_card_id", external_card_id);
     }
@@ -413,6 +424,19 @@ fn lane_state_refs(
                 stable_json_name(&lane.state)?
             ))
         })
+        .collect()
+}
+
+fn lane_attach_commands(input: &HepaHermesCardMappingInput) -> Vec<String> {
+    let mut lane_ids = input.task.lane_ids.clone();
+    for lane in &input.lanes {
+        if !lane_ids.iter().any(|lane_id| lane_id == &lane.lane_id) {
+            lane_ids.push(lane.lane_id.clone());
+        }
+    }
+    lane_ids
+        .into_iter()
+        .map(|lane_id| format!("hepa lane attach {lane_id} --tail 50"))
         .collect()
 }
 

@@ -21,10 +21,11 @@ use hepa_core::scheduler::{
 };
 use hepa_git::worktree::HepaWorktreeAllocator;
 use hepa_kanban::{
-    card_mapping::HepaHermesCardMappingInput,
+    card_mapping::{HepaHermesCardMappingInput, HepaHermesCardPayload, map_task_to_hermes_card},
+    spec_import::{HepaImportedSpec, import_markdown_spec},
     sync::{HepaKanbanSyncEngine, HepaMemoryHermesCardStore},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
@@ -72,6 +73,14 @@ fn take_option(flags: &mut Vec<String>, name: &str) -> Result<Option<String>, St
         return Ok(Some(value));
     }
     Ok(None)
+}
+
+fn take_flag(flags: &mut Vec<String>, name: &str) -> bool {
+    if let Some(position) = flags.iter().position(|flag| flag == name) {
+        flags.remove(position);
+        return true;
+    }
+    false
 }
 
 /// Dispatch `hepa project ...`.
@@ -326,6 +335,657 @@ pub fn task_command(args: &[String]) -> Result<String, String> {
             ))
         }
         other => Err(format!("unknown task command: {other}")),
+    }
+}
+
+/// Dispatch `hepa hermes ...`.
+pub fn hermes_command(args: &[String]) -> Result<String, String> {
+    let (subcommand, rest) = args
+        .split_first()
+        .ok_or_else(|| "usage: hepa hermes <ingest-spec|run-ready|run-cards|cards>".to_string())?;
+    let (control_root, mut flags) = take_control_root(rest)?;
+    let registry = HepaFleetRegistry::new(&control_root);
+
+    match subcommand.as_str() {
+        "ingest-spec" => {
+            let project_id = positional(&flags, 0, "project id")?;
+            let repo_ref = positional(&flags, 1, "repo ref")?;
+            let spec_path = positional(&flags, 2, "spec path")?;
+            let display_name =
+                take_option(&mut flags, "--name")?.unwrap_or_else(|| project_id.clone());
+            let default_branch =
+                take_option(&mut flags, "--branch")?.unwrap_or_else(|| "main".to_string());
+            let max_parallel_tasks = take_option(&mut flags, "--max-parallel")?
+                .map(|value| value.parse::<u32>())
+                .transpose()
+                .map_err(|_| "--max-parallel must be a number".to_string())?
+                .unwrap_or(2)
+                .max(1);
+            if flags.len() > 3 {
+                return Err(format!(
+                    "unknown hermes ingest-spec flags: {}",
+                    flags[3..].join(" ")
+                ));
+            }
+            let now = cli_timestamp();
+            let registration = HepaRegisteredProject {
+                project: HepaProject {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    project_id: project_id.clone(),
+                    display_name,
+                    repo_ref: repo_ref.clone(),
+                    default_branch,
+                    routing_policy_ref: None,
+                    is_active: true,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                max_parallel_tasks,
+                cost_policy: HepaCostPolicy {
+                    cost_class: HepaCostClass::Local,
+                    max_paid_lanes: 0,
+                },
+                memory_policy: HepaMemoryPolicy {
+                    max_resident_models: 1,
+                },
+                board_metadata: Some("hermes-first-spec-ingest".to_string()),
+            };
+            registry
+                .register_project(&registration)
+                .map_err(|error| error.to_string())?;
+            let markdown = fs::read_to_string(&spec_path)
+                .map_err(|error| format!("failed to read spec file: {error}"))?;
+            let imported = normalize_imported_project(
+                import_markdown_spec(&markdown).map_err(|error| error.to_string())?,
+                &project_id,
+            );
+            let mut ready = 0usize;
+            let mut blocked = 0usize;
+            let mut card_ids = Vec::new();
+            for imported_task in imported.tasks {
+                let card_id = local_hermes_card_id(&project_id, &imported_task.fleet_task.task_id);
+                let mut fleet_task = imported_task.fleet_task.clone();
+                fleet_task.status = if imported_task.blocked_questions.is_empty() {
+                    ready += 1;
+                    HepaTaskStatus::Ready
+                } else {
+                    blocked += 1;
+                    HepaTaskStatus::Blocked
+                };
+                fleet_task.readiness = if imported_task.blocked_questions.is_empty() {
+                    HepaReadinessState::Ready
+                } else {
+                    HepaReadinessState::Blocked
+                };
+                fleet_task.priority = fleet_task.priority.max(1);
+                fleet_task.external_card_id = Some(card_id.clone());
+                fleet_task.updated_at = now.clone();
+                registry
+                    .create_task(&fleet_task)
+                    .map_err(|error| error.to_string())?;
+                write_hermes_task_spec(&control_root, &imported_task.task_spec)?;
+                write_local_hermes_card(
+                    &control_root,
+                    &card_id,
+                    &registration.project,
+                    &imported_task.task_spec,
+                    &fleet_task,
+                    Vec::new(),
+                    None,
+                    imported_task.blocked_questions.clone(),
+                )?;
+                card_ids.push(card_id);
+            }
+            Ok(format!(
+                "HEPA hermes ingest-spec: project={} repo_ref={} tasks={} ready={} blocked={} cards={} card_dir={}",
+                project_id,
+                repo_ref,
+                card_ids.len(),
+                ready,
+                blocked,
+                card_ids.join(","),
+                local_hermes_cards_dir(&control_root).display()
+            ))
+        }
+        "cards" => {
+            let project_filter = take_option(&mut flags, "--project")?;
+            if !flags.is_empty() {
+                return Err(format!("unknown hermes cards flags: {}", flags.join(" ")));
+            }
+            let mut cards = local_hermes_card_files(&control_root)?;
+            cards.sort();
+            let mut lines = Vec::new();
+            for path in cards {
+                let payload: HepaHermesCardPayload = read_json_file(&path)?;
+                let project_id = payload
+                    .fields
+                    .get("project_id")
+                    .map(|value| format_field_value(value))
+                    .unwrap_or_else(|| "unknown".to_string());
+                if project_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter != &project_id)
+                {
+                    continue;
+                }
+                lines.push(format!(
+                    "{} project={} title={}",
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("unknown-card"),
+                    project_id,
+                    payload.title
+                ));
+            }
+            if lines.is_empty() {
+                Ok("HEPA hermes cards: no local cards".to_string())
+            } else {
+                Ok(format!("HEPA hermes cards:\n{}", lines.join("\n")))
+            }
+        }
+        "run-ready" | "run-cards" => {
+            let project_id = positional(&flags, 0, "project id")?;
+            let dry_run = take_flag(&mut flags, "--dry-run");
+            let agent = take_option(&mut flags, "--agent")?.unwrap_or_else(|| "pi".to_string());
+            let limit = take_option(&mut flags, "--limit")?
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| "--limit must be a number".to_string())?
+                .unwrap_or(1)
+                .max(1);
+            let max_concurrency = take_option(&mut flags, "--max-concurrency")?
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| "--max-concurrency must be a number".to_string())?
+                .unwrap_or(limit)
+                .max(1);
+            let requested_cards = if subcommand == "run-cards" {
+                let cards = flags.iter().skip(1).cloned().collect::<Vec<String>>();
+                if cards.is_empty() {
+                    return Err("hepa hermes run-cards requires at least one card id".to_string());
+                }
+                cards
+            } else {
+                if flags.len() > 1 {
+                    return Err(format!(
+                        "unknown hermes run-ready flags: {}",
+                        flags[1..].join(" ")
+                    ));
+                }
+                Vec::new()
+            };
+            run_hermes_selected(
+                &registry,
+                &control_root,
+                &project_id,
+                &agent,
+                limit,
+                max_concurrency,
+                dry_run,
+                requested_cards,
+            )
+        }
+        other => Err(format!("unknown hermes command: {other}")),
+    }
+}
+
+fn normalize_imported_project(
+    mut imported: HepaImportedSpec,
+    project_id: &str,
+) -> HepaImportedSpec {
+    imported.project_id = project_id.to_string();
+    for task in &mut imported.tasks {
+        task.task_spec.project_id = project_id.to_string();
+        task.fleet_task.project_id = project_id.to_string();
+    }
+    imported
+}
+
+fn local_hermes_card_id(project_id: &str, task_id: &str) -> String {
+    format!("hermes-{project_id}-{task_id}")
+}
+
+fn local_hermes_cards_dir(control_root: &Path) -> PathBuf {
+    control_root.join("hermes").join("cards")
+}
+
+fn local_hermes_specs_dir(control_root: &Path) -> PathBuf {
+    control_root.join("hermes").join("task-specs")
+}
+
+fn local_hermes_card_path(control_root: &Path, card_id: &str) -> PathBuf {
+    local_hermes_cards_dir(control_root).join(format!("{card_id}.json"))
+}
+
+fn local_hermes_spec_path(control_root: &Path, task_id: &str) -> PathBuf {
+    local_hermes_specs_dir(control_root).join(format!("{task_id}.json"))
+}
+
+fn write_hermes_task_spec(control_root: &Path, task_spec: &HepaTaskSpec) -> Result<(), String> {
+    write_json(
+        &local_hermes_spec_path(control_root, &task_spec.task_id),
+        task_spec,
+    )
+}
+
+fn read_hermes_task_spec(
+    control_root: &Path,
+    task: &HepaFleetTask,
+) -> Result<HepaTaskSpec, String> {
+    let path = local_hermes_spec_path(control_root, &task.task_id);
+    if path.exists() {
+        return read_json_file(&path);
+    }
+    Ok(HepaTaskSpec {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        task_id: task.task_id.clone(),
+        project_id: task.project_id.clone(),
+        goal: if task.description.trim().is_empty() {
+            task.title.clone()
+        } else {
+            task.description.clone()
+        },
+        non_goals: Vec::new(),
+        expected_areas: Vec::new(),
+        acceptance_criteria: vec!["HEPA lane completes and creates a reviewable PR.".to_string()],
+        validation_commands: Vec::new(),
+        dependencies: task.dependencies.clone(),
+        target_branch: None,
+        risk_level: HepaRiskLevel::Low,
+        max_total_rounds: 1,
+        created_at: task.created_at.clone(),
+    })
+}
+
+fn write_local_hermes_card(
+    control_root: &Path,
+    card_id: &str,
+    project: &HepaProject,
+    task_spec: &HepaTaskSpec,
+    task: &HepaFleetTask,
+    lanes: Vec<HepaLane>,
+    terminal_report: Option<hepa_core::contracts::HepaTerminalTaskReport>,
+    blocked_questions: Vec<String>,
+) -> Result<(), String> {
+    let payload = map_task_to_hermes_card(&HepaHermesCardMappingInput {
+        project: project.clone(),
+        task_spec: task_spec.clone(),
+        task: task.clone(),
+        lanes,
+        readiness: None,
+        validation: terminal_report
+            .as_ref()
+            .and_then(|report| report.validation.clone()),
+        review_signals: terminal_report
+            .as_ref()
+            .map(|report| report.review_signals.clone())
+            .unwrap_or_default(),
+        terminal_report: terminal_report.clone(),
+        timing: terminal_report.and_then(|report| report.timing),
+        steering_records: Vec::new(),
+        blocked_questions,
+    })
+    .map_err(|error| error.to_string())?;
+    write_json(&local_hermes_card_path(control_root, card_id), &payload)
+}
+
+fn local_hermes_card_files(control_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let dir = local_hermes_cards_dir(control_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn format_field_value(value: &hepa_kanban::card_mapping::HepaHermesFieldValue) -> String {
+    match value {
+        hepa_kanban::card_mapping::HepaHermesFieldValue::Text(value) => value.clone(),
+        hepa_kanban::card_mapping::HepaHermesFieldValue::Number(value) => value.to_string(),
+        hepa_kanban::card_mapping::HepaHermesFieldValue::Bool(value) => value.to_string(),
+        hepa_kanban::card_mapping::HepaHermesFieldValue::List(values) => values.join(","),
+    }
+}
+
+fn run_hermes_selected(
+    registry: &HepaFleetRegistry,
+    control_root: &Path,
+    project_id: &str,
+    agent: &str,
+    limit: usize,
+    max_concurrency: usize,
+    dry_run: bool,
+    requested_cards: Vec<String>,
+) -> Result<String, String> {
+    let project = registry
+        .show_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("project not found: {project_id}"))?;
+    let mut tasks = registry
+        .list_tasks()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|task| task.project_id == project_id)
+        .filter(|task| {
+            if requested_cards.is_empty() {
+                task.status == HepaTaskStatus::Ready && task.readiness == HepaReadinessState::Ready
+            } else {
+                task.external_card_id.as_ref().is_some_and(|card_id| {
+                    requested_cards.iter().any(|requested| requested == card_id)
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    tasks.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    tasks.truncate(limit);
+    if tasks.is_empty() {
+        return Ok(format!(
+            "HEPA hermes {}: selected=0 project={} reason=no-ready-cards",
+            if dry_run { "dry-run" } else { "run" },
+            project_id
+        ));
+    }
+
+    let now = cli_timestamp();
+    let run_nonce = now.clone();
+    let mut launch_specs = Vec::new();
+    for task in tasks {
+        if !registry
+            .unmet_dependencies(&task.task_id)
+            .map_err(|error| error.to_string())?
+            .is_empty()
+        {
+            continue;
+        }
+        let lane_id = format!("lane-hermes-{}-{run_nonce}", task.task_id);
+        let task_spec = read_hermes_task_spec(control_root, &task)?;
+        let lane = hermes_lane_record(
+            &project.project,
+            &task,
+            &lane_id,
+            agent,
+            HepaLaneState::Running,
+        );
+        let card_id = task
+            .external_card_id
+            .clone()
+            .unwrap_or_else(|| local_hermes_card_id(project_id, &task.task_id));
+        let claimed = if dry_run {
+            HepaFleetTask {
+                lane_ids: vec![lane_id.clone()],
+                ..task.clone()
+            }
+        } else {
+            registry
+                .claim_task_into_lane(&task.task_id, &lane_id, &now)
+                .map_err(|error| error.to_string())?
+        };
+        write_local_hermes_card(
+            control_root,
+            &card_id,
+            &project.project,
+            &task_spec,
+            &HepaFleetTask {
+                lane_ids: vec![lane_id.clone()],
+                ..claimed.clone()
+            },
+            vec![lane],
+            None,
+            Vec::new(),
+        )?;
+        launch_specs.push(HermesLaunchSpec {
+            project: project.clone(),
+            task: claimed,
+            task_spec,
+            lane_id,
+            card_id,
+        });
+    }
+
+    if dry_run {
+        let lines = launch_specs
+            .iter()
+            .map(|spec| {
+                format!(
+                    "{} card={} attach='hepa lane attach {} --control-root {} --tail 50'",
+                    spec.task.task_id,
+                    spec.card_id,
+                    spec.lane_id,
+                    control_root.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(format!(
+            "HEPA hermes dry-run: project={} selected={} agent={} max_concurrency={}\n{}",
+            project_id,
+            launch_specs.len(),
+            agent,
+            max_concurrency,
+            lines
+        ));
+    }
+
+    let mut summaries = Vec::new();
+    for chunk in launch_specs.chunks(max_concurrency) {
+        let handles = chunk
+            .iter()
+            .cloned()
+            .map(|spec| {
+                let control_root = control_root.to_path_buf();
+                let agent = agent.to_string();
+                thread::spawn(move || run_hermes_launch_spec(control_root, spec, &agent))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            summaries.push(
+                handle
+                    .join()
+                    .map_err(|_| "Hermes run worker thread panicked".to_string())?,
+            );
+        }
+    }
+    let failed = summaries.iter().filter(|summary| summary.failed).count();
+    let lines = summaries
+        .iter()
+        .map(|summary| {
+            format!(
+                "{} status={} card={} lane={} pr={} attach='{}'",
+                summary.task_id,
+                summary.status,
+                summary.card_id,
+                summary.lane_id,
+                summary.pr_url.as_deref().unwrap_or("none"),
+                summary.attach_command
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let message = format!(
+        "HEPA hermes run: project={} selected={} failed={} agent={} max_concurrency={}\n{}",
+        project_id,
+        summaries.len(),
+        failed,
+        agent,
+        max_concurrency,
+        lines
+    );
+    if failed == 0 {
+        Ok(message)
+    } else {
+        Err(message)
+    }
+}
+
+#[derive(Clone)]
+struct HermesLaunchSpec {
+    project: HepaRegisteredProject,
+    task: HepaFleetTask,
+    task_spec: HepaTaskSpec,
+    lane_id: String,
+    card_id: String,
+}
+
+struct HermesRunSummary {
+    task_id: String,
+    lane_id: String,
+    card_id: String,
+    status: String,
+    pr_url: Option<String>,
+    attach_command: String,
+    failed: bool,
+}
+
+fn run_hermes_launch_spec(
+    control_root: PathBuf,
+    spec: HermesLaunchSpec,
+    agent: &str,
+) -> HermesRunSummary {
+    let registry = HepaFleetRegistry::new(&control_root);
+    let repo_path = PathBuf::from(&spec.project.project.repo_ref);
+    let config = HepaFakeRunConfig {
+        control_root: repo_path.join(".hepa/control"),
+        worktree_root: repo_path.join(".hepa/worktrees"),
+        archive_root: repo_path.join(".hepa/archive"),
+        repo_path: repo_path.clone(),
+        run_id: format!("run-hermes-{}-{}", spec.task.task_id, cli_timestamp()),
+        task_id: spec.task.task_id.clone(),
+        lane_id: spec.lane_id.clone(),
+        task_text: spec.task_spec.goal.clone(),
+        timing: true,
+    };
+    let attach_command = format!(
+        "hepa lane attach {} --control-root {} --tail 50",
+        spec.lane_id,
+        config.control_root.display()
+    );
+    match run_live_task(&config, agent) {
+        Ok(result) => {
+            let completed = registry
+                .complete_task(&spec.task.task_id, &cli_timestamp())
+                .unwrap_or_else(|_| HepaFleetTask {
+                    status: HepaTaskStatus::Completed,
+                    completed_at: Some(cli_timestamp()),
+                    ..spec.task.clone()
+                });
+            let lane = hermes_lane_record(
+                &spec.project.project,
+                &completed,
+                &spec.lane_id,
+                agent,
+                HepaLaneState::Completed,
+            );
+            let _ = write_local_hermes_card(
+                &control_root,
+                &spec.card_id,
+                &spec.project.project,
+                &spec.task_spec,
+                &HepaFleetTask {
+                    lane_ids: vec![spec.lane_id.clone()],
+                    ..completed
+                },
+                vec![lane],
+                Some(result.terminal_report.clone()),
+                Vec::new(),
+            );
+            HermesRunSummary {
+                task_id: spec.task.task_id,
+                lane_id: result.lane_id,
+                card_id: spec.card_id,
+                status: result.status,
+                pr_url: result.terminal_report.pr_url,
+                attach_command,
+                failed: false,
+            }
+        }
+        Err(error) => {
+            let blocked = registry
+                .block_task(&spec.task.task_id, &cli_timestamp())
+                .unwrap_or_else(|_| HepaFleetTask {
+                    status: HepaTaskStatus::Blocked,
+                    ..spec.task.clone()
+                });
+            let lane = hermes_lane_record(
+                &spec.project.project,
+                &blocked,
+                &spec.lane_id,
+                agent,
+                HepaLaneState::Blocked,
+            );
+            let _ = write_local_hermes_card(
+                &control_root,
+                &spec.card_id,
+                &spec.project.project,
+                &spec.task_spec,
+                &HepaFleetTask {
+                    lane_ids: vec![spec.lane_id.clone()],
+                    ..blocked
+                },
+                vec![lane],
+                None,
+                vec![format!("HEPA run failed: {error}")],
+            );
+            HermesRunSummary {
+                task_id: spec.task.task_id,
+                lane_id: spec.lane_id,
+                card_id: spec.card_id,
+                status: "blocked".to_string(),
+                pr_url: None,
+                attach_command,
+                failed: true,
+            }
+        }
+    }
+}
+
+fn hermes_lane_record(
+    project: &HepaProject,
+    task: &HepaFleetTask,
+    lane_id: &str,
+    agent: &str,
+    state: HepaLaneState,
+) -> HepaLane {
+    let timestamp = cli_timestamp();
+    let completed_at = if matches!(
+        state,
+        HepaLaneState::Completed | HepaLaneState::Blocked | HepaLaneState::Cancelled
+    ) {
+        Some(timestamp.clone())
+    } else {
+        None
+    };
+    HepaLane {
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        lane_id: lane_id.to_string(),
+        project_id: project.project_id.clone(),
+        task_id: task.task_id.clone(),
+        adapter_id: agent.to_string(),
+        state,
+        worktree_ref: format!("worktree:{lane_id}"),
+        branch: format!("hepa/{}", task.task_id),
+        run_dir_ref: format!("control:runs/{lane_id}"),
+        attempt_count: 0,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+        completed_at,
     }
 }
 
@@ -917,7 +1577,7 @@ fn html_escape(value: &str) -> String {
 /// Dispatch `hepa fleet <status|doctor|report|cleanup|reconcile|dashboard|live-matrix>`.
 pub fn fleet_command(args: &[String]) -> Result<String, String> {
     let (subcommand, rest) = args.split_first().ok_or_else(|| {
-        "usage: hepa fleet <status|doctor|report|cleanup|reconcile|dashboard|live-matrix>"
+        "usage: hepa fleet <status|watch|doctor|report|cleanup|reconcile|dashboard|live-matrix>"
             .to_string()
     })?;
     let (control_root, mut flags) = take_control_root(rest)?;
@@ -968,6 +1628,34 @@ pub fn fleet_command(args: &[String]) -> Result<String, String> {
                 lanes.len(),
                 running
             ))
+        }
+        "watch" => {
+            if !flags.is_empty() {
+                return Err(format!("unknown fleet watch flags: {}", flags.join(" ")));
+            }
+            let control_root_display = control_root.display().to_string();
+            let active = tasks
+                .iter()
+                .filter(|task| task.status == HepaTaskStatus::Running)
+                .flat_map(|task| {
+                    let control_root_display = control_root_display.clone();
+                    task.lane_ids.iter().map(move |lane_id| {
+                        format!(
+                            "{} task={} project={} attach='hepa lane attach {} --control-root {} --tail 50'",
+                            lane_id,
+                            task.task_id,
+                            task.project_id,
+                            lane_id,
+                            control_root_display
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if active.is_empty() {
+                Ok("HEPA fleet watch: no active lanes".to_string())
+            } else {
+                Ok(format!("HEPA fleet watch:\n{}", active.join("\n")))
+            }
         }
         "doctor" => {
             let control_ok = control_root.exists() || control_root.parent().is_some();
@@ -1230,12 +1918,12 @@ fn run_live_matrix_job(job: LiveMatrixJob, agent: &str) -> LiveMatrixJobSummary 
     }
 }
 
-/// Dispatch `hepa lane <list|show|logs|stop>`. `lane send` is handled by the
+/// Dispatch `hepa lane <list|show|logs|attach|stop>`. `lane send` is handled by the
 /// tmux steering path in `main`.
 pub fn lane_command(args: &[String]) -> Result<String, String> {
     let (subcommand, rest) = args
         .split_first()
-        .ok_or_else(|| "usage: hepa lane <list|show|logs|send|stop>".to_string())?;
+        .ok_or_else(|| "usage: hepa lane <list|show|logs|attach|send|stop>".to_string())?;
     let (control_root, flags) = take_control_root(rest)?;
     let registry = HepaFleetRegistry::new(&control_root);
     let tasks = registry.list_tasks().map_err(|error| error.to_string())?;
@@ -1300,6 +1988,43 @@ pub fn lane_command(args: &[String]) -> Result<String, String> {
                     for line in tail_file_lines(stream, tail)? {
                         lines.push(format!("  {line}"));
                     }
+                }
+            }
+            if streams.is_empty() {
+                lines.push("streams=none".to_string());
+            }
+            Ok(lines.join("\n"))
+        }
+        "attach" => {
+            let lane_id = positional(&flags, 0, "lane id")?;
+            let mut flags = flags;
+            let tail = take_option(&mut flags, "--tail")?
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "--tail must be a non-negative integer".to_string())
+                })
+                .transpose()?
+                .unwrap_or(50);
+            if flags.len() > 1 {
+                return Err(format!(
+                    "unknown lane attach flags: {}",
+                    flags[1..].join(" ")
+                ));
+            }
+            let streams = find_lane_stream_logs(&control_root, &lane_id)
+                .map_err(|error| error.to_string())?;
+            let mut lines = vec![
+                format!("HEPA lane attach: {lane_id}"),
+                format!(
+                    "watch_hint=watch -n 2 'hepa lane attach {lane_id} --control-root {} --tail {tail}'",
+                    control_root.display()
+                ),
+            ];
+            for stream in &streams {
+                lines.push(format!("stream={}", stream.display()));
+                for line in tail_file_lines(stream, tail)? {
+                    lines.push(format!("  {line}"));
                 }
             }
             if streams.is_empty() {
@@ -1584,6 +2309,83 @@ mod tests {
     }
 
     #[test]
+    fn hermes_ingest_spec_creates_ready_cards_and_dry_run_attach_hints() {
+        let root = unique_test_dir("hermes");
+        let control = root.join("control");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let spec = root.join("roadmap.md");
+        std::fs::write(
+            &spec,
+            r#"
+Project: ignored-project
+
+## Task: task-alpha: Add analytics pipeline
+Implement a small analytics pipeline across source and script files.
+Acceptance:
+- Analytics events are captured.
+- Validation documents the command.
+Validation:
+- pnpm test
+
+## Task: task-beta: Add reviewer dashboard
+Implement a dashboard for review state.
+Acceptance:
+- Dashboard renders the review state.
+Validation:
+- pnpm lint
+"#,
+        )
+        .expect("spec");
+
+        let ingest = hermes_command(&s(&[
+            "ingest-spec",
+            "todo-project",
+            repo.to_str().expect("repo path"),
+            spec.to_str().expect("spec path"),
+            "--control-root",
+            control.to_str().expect("control path"),
+            "--max-parallel",
+            "2",
+        ]))
+        .expect("ingest");
+        assert!(ingest.contains("tasks=2"));
+        assert!(ingest.contains("ready=2"));
+        assert!(ingest.contains("hermes-todo-project-task-alpha"));
+
+        let cards = hermes_command(&s(&[
+            "cards",
+            "--control-root",
+            control.to_str().expect("control"),
+        ]))
+        .expect("cards");
+        assert!(cards.contains("task-alpha"));
+        assert!(cards.contains("todo-project"));
+
+        let dry_run = hermes_command(&s(&[
+            "run-ready",
+            "todo-project",
+            "--dry-run",
+            "--limit",
+            "1",
+            "--max-concurrency",
+            "1",
+            "--control-root",
+            control.to_str().expect("control path"),
+        ]))
+        .expect("dry run");
+        assert!(dry_run.contains("HEPA hermes dry-run"));
+        assert!(dry_run.contains("hepa lane attach"));
+
+        let card_path = local_hermes_card_path(&control, "hermes-todo-project-task-alpha");
+        let card_json = std::fs::read_to_string(card_path).expect("card json");
+        assert!(card_json.contains("lane_attach_commands"));
+        assert!(card_json.contains("fleet_watch_command"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn fleet_status_doctor_report_cleanup_and_reconcile() {
         let root = unique_test_dir("fleet");
         let control = root.to_str().expect("path is UTF-8").to_string();
@@ -1832,6 +2634,18 @@ mod tests {
         assert!(logs.contains("worker-adapter-stream.jsonl"));
         assert!(logs.contains("\"text\":\"second\""));
         assert!(!logs.contains("\"text\":\"first\""));
+        let attach = lane_command(&s(&[
+            "attach",
+            "lane-1",
+            "--tail",
+            "1",
+            "--control-root",
+            &control,
+        ]))
+        .expect("attach");
+        assert!(attach.contains("HEPA lane attach: lane-1"));
+        assert!(attach.contains("watch_hint="));
+        assert!(attach.contains("\"text\":\"second\""));
         let stop = lane_command(&s(&["stop", "lane-1", "--control-root", &control])).expect("stop");
         assert!(stop.contains("Blocked"));
 

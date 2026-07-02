@@ -84,7 +84,7 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             if command == "lane"
                 && matches!(
                     rest.first().map(String::as_str),
-                    Some("list" | "show" | "logs" | "stop")
+                    Some("list" | "show" | "logs" | "attach" | "stop")
                 ) =>
         {
             fleet::lane_command(rest)
@@ -113,6 +113,7 @@ fn run_cli_with_tmux(args: &[String], tmux: &mut impl HepaTmux) -> Result<String
             Ok(report.to_redacted_summary())
         }
         [command, ..] if command == "kanban" => Err("unknown kanban command".to_string()),
+        [command, rest @ ..] if command == "hermes" => fleet::hermes_command(rest),
         [command, subcommand] if command == "adapter" && subcommand == "list" => {
             let config = load_cli_config()?;
             let registry = HepaAdapterRegistry::load_from_config(&config)

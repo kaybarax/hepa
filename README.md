@@ -109,10 +109,18 @@ root (used throughout the test suite).
 
 ## Hermes Kanban Workflow
 
-Import a spec to create draft cards, let the scheduler claim ready tasks into
-lanes, and watch board state stay reconciled with HEPA's authoritative lane
-state. Board actions are transition *requests*; HEPA validates each before
-changing authoritative state. See [docs/hermes-kanban.md](docs/hermes-kanban.md).
+Import a project roadmap/spec into Hermes cards, ask Hermes to hand selected or
+ready cards to HEPA, and watch each lane from a terminal while board state stays
+reconciled with HEPA's authoritative registry:
+
+```bash
+hepa hermes ingest-spec project-1 /path/to/repo path/to/spec.md --max-parallel 4
+hepa hermes run-ready project-1 --limit 2 --max-concurrency 2 --agent pi
+hepa fleet watch
+```
+
+Board actions are transition *requests*; HEPA validates each before changing
+authoritative state. See [docs/hermes-kanban.md](docs/hermes-kanban.md).
 
 Hermes-led runs use bundled manager, worker, reviewer, and review-manager
 profiles. The manager profile owns task intake, assignment, bounded

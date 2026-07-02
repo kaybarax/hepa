@@ -39,13 +39,17 @@ hepa lane list
 hepa lane show <lane-id>
 hepa lane logs <lane-id>
 hepa lane logs <lane-id> --tail 20
+hepa lane attach <lane-id> --tail 50
 hepa lane stop <lane-id>
 ```
 
 `lane logs` reports the legacy lane log path plus any lane-local adapter stream
 artifacts. `--tail <n>` prints the last `n` JSONL events from each stream so
 operators can inspect parallel live lanes without opening the artifact tree by
-hand. `lane stop` records a manager-owned blocked terminal state for the task.
+hand. `lane attach` is the operator-friendly form used by Hermes cards and
+multi-terminal dashboards; it prints the current stream tails plus a repeatable
+watch command. `lane stop` records a manager-owned blocked terminal state for
+the task.
 
 ## Resource and conflict rules
 
@@ -62,6 +66,7 @@ Admission enforces, with a recorded wait reason for every block:
 
 ```bash
 hepa fleet status
+hepa fleet watch
 hepa fleet report
 hepa fleet reconcile
 hepa fleet cleanup
@@ -72,6 +77,9 @@ The monitor refreshes process liveness, branch/PR status, validation/review
 state, resource samples, and card drift. Reconcile repairs stale leases, missing
 cards, orphaned worktrees, and terminal lanes. Cleanup removes only
 HEPA-created runtime state and preserves unrelated user changes.
+`hepa fleet watch` lists active lanes and their `hepa lane attach ...` commands
+so Hermes Desktop or a human operator can open one terminal per task during
+parallel work.
 
 `hepa fleet dashboard` writes a static desktop HTML snapshot and sibling JSON
 from the same project, task, scheduler, and wait-reason registry that Hermes and

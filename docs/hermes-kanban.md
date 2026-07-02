@@ -17,7 +17,40 @@ When Hermes is unavailable the doctor reports a degraded status with actionable
 remediations (install CLI/API, configure access, authenticate, select
 workspace/board). CLI and headless operation continue regardless.
 
-## Spec import
+## Hermes-first workflow
+
+The intended desktop workflow is Hermes-first: tell Hermes where the project
+spec or roadmap lives, let Hermes populate the board, then ask Hermes to hand
+selected cards to HEPA. HEPA exposes that path as a small bridge command set so
+Hermes Desktop, scripts, or a human terminal can all drive the same
+authoritative registry.
+
+```bash
+hepa hermes ingest-spec project-1 /path/to/repo path/to/spec.md --max-parallel 4
+hepa hermes cards --project project-1
+hepa hermes run-ready project-1 --limit 2 --max-concurrency 2 --agent pi
+hepa hermes run-cards project-1 hermes-project-1-task-a hermes-project-1-task-b --agent pi
+```
+
+`ingest-spec` registers the project, imports the spec tasks, stores validated
+task specs under the HEPA control root, and writes local Hermes card payloads
+under `hermes/cards/`. Tasks with acceptance criteria and no blocked questions
+become ready; tasks with open questions become blocked. Each card keeps the
+external card id, HEPA task id, readiness, dependencies, acceptance criteria,
+validation commands, lane ids, lane states, and live visibility commands.
+
+`run-ready` selects ready cards by project and priority. `run-cards` selects
+specific card ids. Both commands support `--dry-run`, which previews the lane
+ids and attach commands without claiming tasks or launching adapters. Live runs
+claim each task into exactly one lane before invoking the configured adapter, so
+parallel starts remain deterministic even across projects.
+
+Hermes Desktop can treat the local card payloads as the durable bridge when the
+live Hermes API is unavailable. When live board access is configured, the same
+payloads are what the sync engine projects onto the board; HEPA registry state
+remains authoritative either way.
+
+## Legacy spec import
 
 Import a markdown spec to create draft tasks and Hermes cards:
 
@@ -25,9 +58,11 @@ Import a markdown spec to create draft tasks and Hermes cards:
 hepa spec import path/to/spec.md
 ```
 
-Imported tasks stay draft and not-ready until readiness passes. Each card carries
-the task id, dependencies, lane states, acceptance criteria, validation commands,
-risk, timing counters, sandbox postures, and arbitration/repair status.
+`hepa spec import` is retained for validation and low-level ingestion. Imported
+tasks stay draft and not-ready until a higher-level workflow promotes them. Each
+card carries the task id, dependencies, lane states, acceptance criteria,
+validation commands, risk, timing counters, sandbox postures, and
+arbitration/repair status.
 
 During the runtime transition, a Hermes manager can hand HEPA project/task intake
 by passing `--hermes-manager-intake <artifact.json>` to `hepa spec import`. The
@@ -173,6 +208,18 @@ when available; HEPA does not stream hidden reasoning. These files are the
 per-lane stream source for terminal/dashboard views during parallel Hermes-led
 work; final `stdout.log`, `stderr.log`, and validation summary artifacts remain
 the complete post-run captures.
+
+Cards for active lanes include `lane_attach_commands` such as:
+
+```bash
+hepa lane attach <lane-id> --tail 50
+```
+
+For a multi-terminal workspace, open one terminal per active lane and run the
+attach command shown on the card. `hepa fleet watch` lists currently running
+lanes with the same attach commands, and `hepa fleet dashboard --output ...`
+writes a static HTML/JSON snapshot with lane stream tails for Hermes Desktop or
+degraded-mode review.
 
 ```bash
 hepa task sync-kanban   # push task records to Hermes (degrades if unavailable)

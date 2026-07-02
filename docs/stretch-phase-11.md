@@ -16,6 +16,7 @@ validation through the bundled profiles.
 | Additional local-CLI adapters | Built-in registry, local-only routing, and local-worker tests cover local CLI routes through the same adapter contract. Runtime evidence exercised `hepa adapter list` and `hepa adapter doctor`. |
 | Timing trend reports across archived runs | Core and CLI timing trend tests cover archived `timing.json` discovery, medians, per-run summaries, portable refs, and empty archive rejection. Runtime evidence exercised `hepa timing trends <archive-root>` over two archived records. |
 | Desktop dashboard packaging | CLI tests cover static HTML and JSON snapshot generation, HTML escaping, scheduler state, card flags, and repo path omission. Runtime evidence exercised `hepa fleet dashboard --output <dashboard-html> --control-root <control-root>`. |
+| Hermes-first desktop bridge | CLI and card-mapping tests cover spec-to-card ingest, ready/blocked task projection, dry-run card selection, deterministic lane attach commands, `hepa lane attach`, and `hepa fleet watch`. Runtime evidence exercised `cargo test -p hepa-cli fleet::tests::` and `cargo test -p hepa-kanban card_mapping`. |
 
 ## Required Hermes-Led Refinement
 
@@ -35,6 +36,7 @@ manager-authored PR bodies:
 | Explicit Hermes-required mode for release validation | `HEPA_HERMES_REQUIRED=true` blocks headless fallback when worker brief, reviewer artifact, review-manager arbitration for findings, or manager PR intent sources are missing; focused CLI tests passed |
 | Three-round task/work/review cap with human-intervention terminal state | Worker brief cap, review-to-worker repair mediation, round-3 allowance, and round-4 human-intervention cap tests passed |
 | Headless/degraded fallback labels PR bodies as fallback evidence, not Hermes-authored project intent | Fallback PR body and Hermes intent separation tests passed |
+| Hermes-first spec/card/run bridge with live lane visibility | `hepa hermes ingest-spec`, `hepa hermes run-ready`, `hepa hermes run-cards`, local card payloads, `lane_attach_commands`, `hepa lane attach`, and `hepa fleet watch` are documented and covered by focused CLI/card tests |
 | Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Passed with `HEPA_HERMES_REQUIRED=true`: GPT-OSS 20B via llama.cpp completed the pure-local app/docs lanes 2/2 in 74.82 s and the hybrid local-worker / DeepSeek-reviewer lanes 2/2 in 75.69 s; validation PRs were opened, then closed and cleaned |
 
 The Phase 11 privacy scan found only pre-existing placeholder examples and
