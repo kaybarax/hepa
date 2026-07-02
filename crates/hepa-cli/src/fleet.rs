@@ -463,7 +463,7 @@ pub fn hermes_command(args: &[String]) -> Result<String, String> {
                 let project_id = payload
                     .fields
                     .get("project_id")
-                    .map(|value| format_field_value(value))
+                    .map(format_field_value)
                     .unwrap_or_else(|| "unknown".to_string());
                 if project_filter
                     .as_ref()
@@ -594,6 +594,7 @@ struct HermesDashboardTask {
     priority: Option<i64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_dashboard_card(
     registry: &HepaFleetRegistry,
     control_root: &Path,
@@ -992,6 +993,7 @@ fn read_hermes_task_spec(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_local_hermes_card(
     control_root: &Path,
     card_id: &str,
@@ -1055,6 +1057,7 @@ fn format_field_value(value: &hepa_kanban::card_mapping::HepaHermesFieldValue) -
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hermes_selected(
     registry: &HepaFleetRegistry,
     control_root: &Path,

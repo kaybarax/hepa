@@ -368,18 +368,14 @@ pub struct HepaPrBodyInput<'a> {
 /// Build a deterministic, sanitized PR body that reconstructs the run:
 /// summary, validation, review, risk, adapter, timing, and the Hermes card link.
 pub fn build_pr_body(input: &HepaPrBodyInput) -> String {
-    let mut lines = Vec::new();
-
-    lines.push("## Fallback Evidence Artifact".to_string());
-    lines.push(
+    let mut lines = vec![
+        "## Fallback Evidence Artifact".to_string(),
         "- This body is HEPA's deterministic headless/degraded fallback evidence artifact, not Hermes-authored project PR intent."
             .to_string(),
-    );
-    lines.push(
         "- In Hermes-present release runs, `hepa-manager` must author `HepaHermesPrIntent` for project-specific PR content."
             .to_string(),
-    );
-    lines.push(String::new());
+        String::new(),
+    ];
     lines.extend(run_evidence_lines(input));
 
     let mut body = lines.join("\n");

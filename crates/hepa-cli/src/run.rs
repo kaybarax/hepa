@@ -2310,7 +2310,7 @@ fn live_validation_commands(task_text: &str) -> Vec<String> {
 fn task_text_contains_command(task_text: &str, command: &str) -> bool {
     if command == "yarn test" {
         task_text
-            .split(|ch: char| ch == '\n' || ch == ';' || ch == '.' || ch == ',')
+            .split(['\n', ';', '.', ','])
             .any(|part| part.trim() == command)
     } else {
         task_text.contains(command)
