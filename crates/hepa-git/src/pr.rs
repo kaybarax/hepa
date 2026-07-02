@@ -227,6 +227,7 @@ impl HepaManagerGitLifecycle {
 
         let mut args = vec![
             "commit".to_string(),
+            "--no-verify".to_string(),
             "-m".to_string(),
             message.title.clone(),
         ];
@@ -776,6 +777,38 @@ mod tests {
         assert_eq!(outcome.commit_sha, git_output(&repo, ["rev-parse", "HEAD"]));
         let body = git_output(&repo, ["log", "-1", "--pretty=%b"]);
         assert!(body.contains("Body line."));
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn manager_commit_bypasses_repo_hooks_after_hepa_validation() {
+        let repo = unique_test_dir("commit-no-verify");
+        init_repo(&repo);
+        let hooks_dir = repo.join(".git/hooks");
+        fs::create_dir_all(&hooks_dir).expect("hooks dir");
+        let hook_path = hooks_dir.join("pre-commit");
+        fs::write(
+            &hook_path,
+            "#!/usr/bin/env sh\necho project hook should not run >&2\nexit 1\n",
+        )
+        .expect("hook write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&hook_path)
+                .expect("hook metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook_path, permissions).expect("hook permissions");
+        }
+        fs::write(repo.join("change.txt"), "content\n").expect("change write");
+        git(&repo, ["add", "change.txt"]);
+        let lifecycle = HepaManagerGitLifecycle::manager(&repo);
+
+        lifecycle
+            .commit_staged(&HepaCommitMessage::new("feat: validated change"))
+            .expect("manager commit should not be blocked by repo-local hooks");
 
         remove_test_dir(repo);
     }
