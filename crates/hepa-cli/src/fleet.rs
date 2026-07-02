@@ -668,33 +668,9 @@ fn run_dashboard_card(
         updated_at: now.clone(),
         completed_at: None,
     };
-    match registry
-        .show_task(&task.task_id)
-        .map_err(|error| error.to_string())?
-    {
-        Some(existing) => {
-            if existing.status != HepaTaskStatus::Ready
-                || existing.readiness != HepaReadinessState::Ready
-            {
-                if existing.status == HepaTaskStatus::Running {
-                    registry
-                        .block_task(&task.task_id, &now)
-                        .map_err(|error| error.to_string())?;
-                }
-                if existing.status != HepaTaskStatus::Queued {
-                    registry
-                        .resume_task(&task.task_id, &now)
-                        .map_err(|error| error.to_string())?;
-                }
-                registry
-                    .mark_task_ready(&task.task_id, &now)
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        None => registry
-            .create_task(&task)
-            .map_err(|error| error.to_string())?,
-    }
+    registry
+        .create_task(&task)
+        .map_err(|error| error.to_string())?;
 
     let task_spec = HepaTaskSpec {
         schema_version: CONTRACT_SCHEMA_VERSION,
@@ -920,7 +896,7 @@ fn update_dashboard_card(
         }
         "block" => {
             command
-                .args(["kanban", "block", card_id, "--kind", "transient"])
+                .args(["kanban", "block", "--kind", "transient", card_id])
                 .arg(trim_for_dashboard(message, 1800));
         }
         other => return Err(format!("unknown dashboard update action: {other}")),
