@@ -117,6 +117,7 @@ Hermes runtime-command profiles, validation repos redacted):
 | Pi + DeepSeek worker/reviewer | 3 | 3 | 2 succeeded / 1 safe-blocked | 13.55 s | 193.2 MiB | 12.8 MiB | n/a | PRs opened for successful lanes, then closed/cleaned |
 | Pi + DeepSeek worker/reviewer monorepo rerun on non-secret docs file | 1 | 1 | 1 succeeded / 0 failed | 14.10 s | 190.4 MiB | 9.0 MiB | n/a | PR opened, then closed/cleaned |
 | Pi + GPT-OSS 20B worker via llama.cpp, ctx8192 / DeepSeek reviewer | 2 | 2 | 2 succeeded / 0 failed | 42.97 s | 187.8 MiB | 21.1 MiB | ~12.6 GiB observed | PRs opened, then closed/cleaned |
+| Pi + DeepSeek worker/reviewer, multi-project/multi-task | 2 repos / 4 jobs | 4 | 4 succeeded / 0 failed | 19.54 s | 196.1 MiB | 14.7 MiB | n/a | PRs opened on validation repo/fork, then closed/cleaned |
 
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
@@ -199,6 +200,17 @@ Interpretation:
   when Pi streamed documented secret-shaped examples from that README; a
   monorepo rerun against `docs/README.md` then completed in 14.10 s. That block
   is release-relevant safety evidence, not an unclassified failure.
+- The multi-project/multi-task rerun exercised two validation repositories with
+  two concurrent lanes each under one `fleet live-matrix` invocation
+  (`max_concurrency=4`). All four DeepSeek/Pi lanes completed in 19.54 s wall
+  time, with per-lane wall times from 8.79 s to 19.54 s. Each lane recorded one
+  worker adapter loop, one manager pass, one Hermes reviewer pass, zero
+  containers, host-worktree posture, passed `git diff --check`, manager-owned
+  staging/commit/PR creation, and validation cleanup. A fork-backed validation
+  repo required the writable fork to be the active `origin` during the run;
+  using a read-only upstream `origin` with only a fork `pushurl` let `git push`
+  succeed but made `gh pr create --head <branch>` unable to resolve the head
+  branch.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
   backend, so it exercises the same HEPA local-provider class as other loopback
   local servers while accurately representing the runtime used in this test.
