@@ -898,7 +898,7 @@ impl HepaValidate for HepaHermesRunBrief {
             ));
         }
         require_non_empty("task_prompt", &self.task_prompt)?;
-        reject_secret_like_ref("task_prompt", &self.task_prompt)?;
+        reject_private_context_text("task_prompt", &self.task_prompt)?;
         require_string_list("expected_areas", &self.expected_areas)?;
         require_string_list("acceptance_criteria", &self.acceptance_criteria)?;
         require_string_list("validation_commands", &self.validation_commands)?;
@@ -944,7 +944,7 @@ impl HepaValidate for HepaHermesPrIntent {
         }
         require_single_line("title", &self.title)?;
         require_non_empty("body", &self.body)?;
-        reject_secret_like_ref("body", &self.body)?;
+        reject_private_context_text("body", &self.body)?;
         if !self.body.contains("## Summary") {
             return Err(HepaContractError::new(
                 "body",
@@ -1076,6 +1076,31 @@ fn reject_secret_like_ref(field: impl Into<String>, value: &str) -> HepaContract
         Err(HepaContractError::new(
             field,
             "must not contain secret-like path or value fragments",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_private_context_text(field: impl Into<String>, value: &str) -> HepaContractResult {
+    let lowered = value.to_ascii_lowercase();
+    let private_context = [
+        "/users/",
+        "/home/",
+        "c:\\users\\",
+        "api_key=",
+        "apikey=",
+        "access_token=",
+        "secret_key=",
+        "private_key=",
+        "-----begin ",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    if private_context {
+        Err(HepaContractError::new(
+            field,
+            "must not contain private local paths or raw credential material",
         ))
     } else {
         Ok(())
@@ -1470,6 +1495,49 @@ mod tests {
         brief
             .validate()
             .expect("worker-authored run brief should validate");
+    }
+
+    #[test]
+    fn hermes_run_brief_allows_product_domain_auth_words() {
+        let brief = HepaHermesRunBrief {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-worker".to_string(),
+            task_prompt:
+                "Test password validation, auth token display copy, and notification behavior."
+                    .to_string(),
+            expected_areas: vec!["src/login-form.tsx".to_string()],
+            acceptance_criteria: vec!["Password validation behavior is covered.".to_string()],
+            validation_commands: vec!["yarn test".to_string()],
+            max_total_rounds: 2,
+        };
+
+        brief
+            .validate()
+            .expect("domain auth words should not be treated as leaked secrets");
+    }
+
+    #[test]
+    fn hermes_text_rejects_private_local_paths() {
+        let brief = HepaHermesRunBrief {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            lane_id: "lane-1".to_string(),
+            author_profile_id: "hepa-worker".to_string(),
+            task_prompt: "Read /Users/example/private-project/.env before editing.".to_string(),
+            expected_areas: vec!["src/login-form.tsx".to_string()],
+            acceptance_criteria: vec!["No private paths are present.".to_string()],
+            validation_commands: vec!["yarn test".to_string()],
+            max_total_rounds: 2,
+        };
+
+        let error = brief
+            .validate()
+            .expect_err("Hermes task text with a local path should fail");
+
+        assert_eq!(error.field, "task_prompt");
+        assert!(error.message.contains("private local paths"));
     }
 
     #[test]
