@@ -676,8 +676,18 @@ fn run_dashboard_card(
             if existing.status != HepaTaskStatus::Ready
                 || existing.readiness != HepaReadinessState::Ready
             {
+                if existing.status == HepaTaskStatus::Running {
+                    registry
+                        .block_task(&task.task_id, &now)
+                        .map_err(|error| error.to_string())?;
+                }
+                if existing.status != HepaTaskStatus::Queued {
+                    registry
+                        .resume_task(&task.task_id, &now)
+                        .map_err(|error| error.to_string())?;
+                }
                 registry
-                    .resume_task(&task.task_id, &now)
+                    .mark_task_ready(&task.task_id, &now)
                     .map_err(|error| error.to_string())?;
             }
         }
@@ -2837,6 +2847,47 @@ Validation:
         let spec_json = std::fs::read_to_string(spec_path).expect("spec json");
         assert!(spec_json.contains("Route tests cover auth"));
         assert!(spec_json.contains("pnpm test --filter gateway"));
+
+        task_command(&s(&[
+            "block",
+            "t_abc123",
+            "--control-root",
+            control.to_str().expect("control path"),
+        ]))
+        .expect("block imported dashboard task");
+        let rerun = hermes_command(&s(&[
+            "run-dashboard-card",
+            "todo-project",
+            repo.to_str().expect("repo"),
+            "t_abc123",
+            "--task-json",
+            task_json.to_str().expect("task json path"),
+            "--dry-run",
+            "--no-hermes-update",
+            "--control-root",
+            control.to_str().expect("control path"),
+        ]))
+        .expect("dashboard dry rerun");
+        assert!(rerun.contains("selected=1"));
+
+        let registry = HepaFleetRegistry::new(&control);
+        registry
+            .claim_task_into_lane("t_abc123", "stale-lane", "t-stale")
+            .expect("claim stale lane");
+        let stale_rerun = hermes_command(&s(&[
+            "run-dashboard-card",
+            "todo-project",
+            repo.to_str().expect("repo"),
+            "t_abc123",
+            "--task-json",
+            task_json.to_str().expect("task json path"),
+            "--dry-run",
+            "--no-hermes-update",
+            "--control-root",
+            control.to_str().expect("control path"),
+        ]))
+        .expect("dashboard dry rerun from stale running");
+        assert!(stale_rerun.contains("selected=1"));
 
         std::fs::remove_dir_all(&root).ok();
     }
