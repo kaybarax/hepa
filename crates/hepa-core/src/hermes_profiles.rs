@@ -56,7 +56,7 @@ pub fn default_hermes_profiles() -> Vec<HepaHermesProfile> {
             responsibilities: vec![
                 "intake project specs and tasks into Hermes Kanban".to_string(),
                 "prioritize work, assign lanes, and mediate worker/reviewer cycles".to_string(),
-                "author project-specific PR intent after gates pass".to_string(),
+                "author human-friendly project-specific PR bodies with summary, task, changes, validation, review, risk, and run context after gates pass".to_string(),
                 "stop after bounded rounds and request human help when needed".to_string(),
             ],
             activation: "always-on orchestration profile for Hermes-led HEPA runs".to_string(),
@@ -186,7 +186,7 @@ mod tests {
                 && profile
                     .responsibilities
                     .iter()
-                    .any(|line| line.contains("PR intent"))
+                    .any(|line| line.contains("human-friendly project-specific PR bodies"))
         }));
         assert!(profiles.iter().any(|profile| {
             profile.profile_id == "hepa-worker"

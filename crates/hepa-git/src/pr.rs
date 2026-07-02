@@ -929,7 +929,7 @@ mod tests {
             lane_id: "lane-1".to_string(),
             author_profile_id: "hepa-manager".to_string(),
             title: "Add starter template readiness badge".to_string(),
-            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Validation\n- yarn test:e2e passed\n".to_string(),
+            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Changes\n- Updated the app README badge area.\n\n## Validation\n- yarn test:e2e passed\n\n## Review\n- Reviewer approved the scoped change.\n\n## Risk\n- Low risk; documentation-only change.\n\n## Run Context\n- HEPA manager-owned PR publication; human review required.\n".to_string(),
             audit_summary: vec![
                 "HEPA checked safe staging before PR creation.".to_string(),
                 "Human review remains required before merge.".to_string(),
@@ -967,7 +967,7 @@ mod tests {
             lane_id: "lane-1".to_string(),
             author_profile_id: "hepa-reviewer".to_string(),
             title: "Add starter template readiness badge".to_string(),
-            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Validation\n- yarn test:e2e passed\n".to_string(),
+            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Changes\n- Updated the app README badge area.\n\n## Validation\n- yarn test:e2e passed\n\n## Review\n- Reviewer approved the scoped change.\n\n## Risk\n- Low risk; documentation-only change.\n\n## Run Context\n- HEPA manager-owned PR publication; human review required.\n".to_string(),
             audit_summary: vec!["HEPA checked safe staging before PR creation.".to_string()],
             human_review_required: true,
         };
@@ -986,7 +986,7 @@ mod tests {
             lane_id: "lane-1".to_string(),
             author_profile_id: "hepa-manager".to_string(),
             title: "HEPA validation: Update app".to_string(),
-            body: "## Summary\n- Task: HEPA validation: update app\n\n## Validation\n- passed\n"
+            body: "## Summary\n- Task: HEPA validation: update app\n\n## Changes\n- changed files\n\n## Validation\n- passed\n\n## Review\n- approved\n\n## Risk\n- low\n\n## Run Context\n- HEPA\n"
                 .to_string(),
             audit_summary: vec!["validation passed".to_string()],
             human_review_required: true,

@@ -104,11 +104,13 @@ available and must lead the workflow. In that mode HEPA refuses the headless
 fallback path unless a Hermes worker brief source is configured through
 `HEPA_HERMES_RUN_BRIEF_COMMAND` or `HEPA_HERMES_RUN_BRIEF_FILE`.
 
-When review passes, the manager profile writes PR intent: title, body, audit
-summary, and human-review requirement. HEPA validates that the intent came from
-`hepa-manager`, rejects generic validation-template bodies, appends the HEPA
-audit section, and performs the manager-owned GitHub operation. The PR remains
-for human review; HEPA does not auto-merge.
+When review passes, the manager profile writes the human-facing PR content:
+title, descriptive body, audit summary, and human-review requirement. The body
+must explain the task, changes, validation, review result, risk, and run context
+for the human who may merge it. HEPA validates that the content came from
+`hepa-manager`, rejects generic validation-template bodies, appends deterministic
+run evidence and the HEPA audit section, and performs the manager-owned GitHub
+operation. The PR remains for human review; HEPA does not auto-merge.
 
 Hermes reviewer profiles can hand HEPA review output by setting
 `HEPA_HERMES_REVIEW_ARTIFACT_FILE` to a JSON `HepaHermesReviewArtifact` file.

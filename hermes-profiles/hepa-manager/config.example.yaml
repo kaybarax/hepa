@@ -1,0 +1,25 @@
+# Example Hermes configuration for the hepa-manager profile.
+# Copy relevant sections into the profile's real config.yaml and replace
+# placeholder paths. Do not put secrets in this file.
+
+terminal:
+  backend: local
+
+skills:
+  external_dirs:
+    - "~/<path-to-workspace>/hepa/hermes-skills"
+
+hepa:
+  role: manager
+  workspace_root: "~/<path-to-target-repos>"
+  hepa_repo: "~/<path-to-workspace>/hepa"
+  default_worker_adapter: "pi"
+  default_model: "deepseek-chat"
+
+  safety:
+    auto_merge: false
+    require_validation: true
+    require_review_lgtm: true
+    stop_on_dirty_tree: true
+    manager_owned_git: true
+    human_review_required: true

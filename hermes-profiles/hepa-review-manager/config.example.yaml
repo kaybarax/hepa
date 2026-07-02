@@ -1,0 +1,21 @@
+# Example Hermes configuration for the hepa-review-manager profile.
+# Copy relevant sections into the profile's real config.yaml and replace
+# placeholder paths. Do not put secrets in this file.
+
+terminal:
+  backend: local
+
+skills:
+  external_dirs:
+    - "~/<path-to-workspace>/hepa/hermes-skills"
+
+hepa:
+  role: review-manager
+  workspace_root: "~/<path-to-target-repos>"
+  hepa_repo: "~/<path-to-workspace>/hepa"
+
+  safety:
+    auto_merge: false
+    manager_owned_git: true
+    arbitration_only: true
+    human_review_required: true

@@ -161,10 +161,38 @@ fn output_contains_secret_marker(output: &str, marker: &str) -> bool {
 }
 
 fn assignment_marker_has_value(output: &str, value_start: usize) -> bool {
-    output[value_start..]
-        .chars()
+    let value = output[value_start..]
+        .split_whitespace()
         .next()
-        .is_some_and(|character| !character.is_ascii_whitespace())
+        .unwrap_or_default()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '<' | '>'
+            )
+        });
+    if value.is_empty() {
+        return false;
+    }
+    !is_redacted_secret_placeholder(value)
+}
+
+fn is_redacted_secret_placeholder(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "redacted"
+            | "<redacted>"
+            | "[redacted]"
+            | "***"
+            | "****"
+            | "xxxxx"
+            | "xxxx"
+            | "example"
+            | "example-value"
+            | "placeholder"
+            | "<placeholder>"
+    )
 }
 
 fn contains_secret_assignment(line: &str, marker: &str) -> bool {
@@ -327,7 +355,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            policy.check_output("api_key=redacted"),
+            policy.check_output("api_key=real-token-value"),
             Err(HepaMonitorStop {
                 kind: HepaMonitorStopKind::SecretDetected,
                 ..
@@ -353,8 +381,13 @@ mod tests {
                 .check_output("monitor emitted an empty sentinel: secret=")
                 .is_ok()
         );
+        assert!(
+            policy
+                .check_output("monitor emitted a redacted sentinel: secret=redacted")
+                .is_ok()
+        );
         assert!(matches!(
-            policy.check_output("monitor emitted a real value: secret=redacted"),
+            policy.check_output("monitor emitted a real value: secret=real-token-value"),
             Err(HepaMonitorStop {
                 kind: HepaMonitorStopKind::SecretDetected,
                 ..
