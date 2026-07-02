@@ -1469,7 +1469,6 @@ fn write_dashboard_hermes_runtime_artifacts(
         audit_summary: vec![
             "Hermes manager authored this PR intent from the dashboard task contract.".to_string(),
             "Review lane artifacts for deterministic execution, validation, and publication evidence.".to_string(),
-            "Human review is required before merge.".to_string(),
         ],
         human_review_required: true,
     };
@@ -1508,7 +1507,7 @@ fn dashboard_pr_intent_body(spec: &HermesLaunchSpec) -> String {
         .join("\n");
 
     format!(
-        "## Summary\nImplements: {task_title}.\n\n## Task\nAcceptance criteria:\n{criteria_lines}\n\nNon-goals:\n- Do not expand beyond the requested task scope.\n- Do not merge this PR without human review.\n\n## Changes\n- Updates the source and test files needed for the requested behavior.\n- Keeps the change focused on the task acceptance criteria.\n\n## Validation\n{validation}\n\n## Review\n- Review the changed files against the task acceptance criteria.\n- Confirm the implementation remains compatible with existing behavior.\n\n## Risk\n- Human review is required before merge.\n- Main residual risk is whether the added or changed tests cover all intended edge cases.\n"
+        "## Summary\nImplements: {task_title}.\n\n## Task\nAcceptance criteria:\n{criteria_lines}\n\nNon-goals:\n- Do not expand beyond the requested task scope.\n\n## Changes\n- Updates the source and test files needed for the requested behavior.\n- Keeps the change focused on the task acceptance criteria.\n\n## Validation\n{validation}\n\n## Review\n- Review the changed files against the task acceptance criteria.\n- Confirm the implementation remains compatible with existing behavior.\n\n## Risk\n- Main residual risk is whether the added or changed tests cover all intended edge cases.\n"
     )
 }
 
@@ -3295,7 +3294,16 @@ Validation:
         assert!(!intent.body.contains("## Run Context"));
         assert!(!intent.body.contains("HEPA"));
         assert!(!intent.body.contains("Hermes"));
+        assert!(!intent.body.contains("human review"));
+        assert!(!intent.body.contains("Human review"));
+        assert!(!intent.body.contains("Do not merge"));
         assert!(!intent.body.contains("Fallback Evidence Artifact"));
+        assert!(
+            !intent
+                .audit_summary
+                .iter()
+                .any(|line| line.to_lowercase().contains("human review"))
+        );
 
         let brief: HepaHermesRunBrief =
             read_json_file(&default_hermes_run_brief_path(&config)).expect("run brief");
