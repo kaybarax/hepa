@@ -169,12 +169,16 @@ pub fn parse_pi_json_events(raw: &str) -> Result<HepaPiParsedOutput, HepaPiParse
         if line.is_empty() {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
-            HepaPiParseError::new(format!(
-                "line {} is not valid JSON: {error}",
-                line_index + 1
-            ))
-        })?;
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) if saw_agent_end && error.is_eof() => break,
+            Err(error) => {
+                return Err(HepaPiParseError::new(format!(
+                    "line {} is not valid JSON: {error}",
+                    line_index + 1
+                )));
+            }
+        };
         let event_type = value
             .get("type")
             .or_else(|| value.get("event"))
@@ -393,6 +397,19 @@ mod tests {
             parsed.final_message,
             "{\"status\":\"approved\",\"summary\":[\"ok\"],\"findings\":[]}"
         );
+    }
+
+    #[test]
+    fn pi_event_stream_ignores_truncated_tail_after_agent_end() {
+        let raw = r#"{"type":"agent_start"}
+{"type":"tool_call","name":"edit"}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}
+{"type":"debug","message":"unterminated"#;
+
+        let parsed = parse_pi_json_events(raw).expect("completed Pi stream should parse");
+
+        assert_eq!(parsed.final_message, "done");
+        assert_eq!(parsed.tool_activity, vec!["tool_call"]);
     }
 
     #[test]

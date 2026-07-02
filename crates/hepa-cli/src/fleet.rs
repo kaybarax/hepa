@@ -1454,7 +1454,7 @@ fn write_dashboard_hermes_runtime_artifacts(
         .map_err(|error| format!("Hermes reviewer artifact failed validation: {error}"))?;
     write_json(&default_hermes_review_artifact_path(config), &review)?;
 
-    let title = format!("{} via HEPA", collapse_single_line(&spec.task.title));
+    let title = collapse_single_line(&spec.task.title);
     let body = dashboard_pr_intent_body(spec);
     let intent = HepaHermesPrIntent {
         schema_version: CONTRACT_SCHEMA_VERSION,
@@ -1465,8 +1465,8 @@ fn write_dashboard_hermes_runtime_artifacts(
         body,
         audit_summary: vec![
             "Hermes manager authored this PR intent from the dashboard task contract.".to_string(),
-            "HEPA appended deterministic lane evidence before creating the PR.".to_string(),
-            "Human review is required; HEPA did not auto-merge.".to_string(),
+            "Review lane artifacts for deterministic execution, validation, and publication evidence.".to_string(),
+            "Human review is required before merge.".to_string(),
         ],
         human_review_required: true,
     };
@@ -1488,7 +1488,7 @@ fn dashboard_pr_intent_body(spec: &HermesLaunchSpec) -> String {
     let task_title = collapse_single_line(&spec.task.title);
     let criteria = dashboard_acceptance_criteria(&spec.task_spec);
     let validation = if spec.task_spec.validation_commands.is_empty() {
-        "- HEPA manager-owned validation will run the smallest applicable repository checks and append exact results below.".to_string()
+        "- The smallest applicable repository checks should pass before merge.".to_string()
     } else {
         spec.task_spec
             .validation_commands
@@ -1505,7 +1505,7 @@ fn dashboard_pr_intent_body(spec: &HermesLaunchSpec) -> String {
         .join("\n");
 
     format!(
-        "## Summary\nThis PR implements the Hermes dashboard task: {task_title}.\n\n## Task Spec\nAcceptance criteria:\n{criteria_lines}\n\nNon-goals:\n- Do not merge this validation PR automatically.\n- Do not expand beyond the dashboard task scope.\n\n## Changes\n- HEPA will append the concrete changed-file evidence below after the lane finishes.\n- The intended change scope is limited to files required by the task and acceptance criteria.\n\n## Validation\n{validation}\n\n## Review\n- Hermes reviewer policy participates through HEPA's review artifact gate.\n- HEPA appends the concrete review outcome below before PR creation.\n\n## Risk\n- Human review is required before merge.\n- Residual risks and blocked findings, if any, are appended from lane artifacts below.\n\n## Run Context\n- Orchestration: Hermes dashboard card -> HEPA manager -> Pi worker adapter -> Hermes reviewer policy -> HEPA manager-owned PR.\n- Safety: bounded rounds, safe staging, manager-owned Git lifecycle, no auto-merge.\n"
+        "## Summary\nImplements: {task_title}.\n\n## Task\nAcceptance criteria:\n{criteria_lines}\n\nNon-goals:\n- Do not expand beyond the requested task scope.\n- Do not merge this PR without human review.\n\n## Changes\n- Updates the source and test files needed for the requested behavior.\n- Keeps the change focused on the task acceptance criteria.\n\n## Validation\n{validation}\n\n## Review\n- Review the changed files against the task acceptance criteria.\n- Confirm the implementation remains compatible with existing behavior.\n\n## Risk\n- Human review is required before merge.\n- Main residual risk is whether the added or changed tests cover all intended edge cases.\n"
     )
 }
 
@@ -3287,8 +3287,11 @@ Validation:
             read_json_file(&default_hermes_pr_intent_path(&config)).expect("pr intent");
         assert_eq!(intent.author_profile_id, "hepa-manager");
         assert!(intent.body.contains("## Summary"));
+        assert!(intent.body.contains("## Task"));
         assert!(intent.body.contains("## Changes"));
-        assert!(intent.body.contains("## Run Context"));
+        assert!(!intent.body.contains("## Run Context"));
+        assert!(!intent.body.contains("HEPA"));
+        assert!(!intent.body.contains("Hermes"));
         assert!(!intent.body.contains("Fallback Evidence Artifact"));
 
         let brief: HepaHermesRunBrief =

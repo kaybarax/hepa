@@ -126,20 +126,10 @@ pub fn pr_request_from_hermes_intent(
     intent
         .validate()
         .map_err(|error| HepaPrError::new(error.field, error.message))?;
-    let mut body = intent.body.trim_end().to_string();
-    body.push_str("\n\n## HEPA audit\n");
-    for line in &intent.audit_summary {
-        body.push_str("- ");
-        body.push_str(line);
-        body.push('\n');
-    }
-    body.push_str("- PR intent author: ");
-    body.push_str(&intent.author_profile_id);
-    body.push('\n');
 
     Ok(HepaPrRequest {
         title: intent.title.clone(),
-        body,
+        body: intent.body.trim_end().to_string(),
         base_branch: base_branch.into(),
         head_branch: head_branch.into(),
     })
@@ -154,24 +144,11 @@ pub fn pr_request_from_hermes_intent_with_run_evidence(
     intent
         .validate()
         .map_err(|error| HepaPrError::new(error.field, error.message))?;
-
-    let mut body = intent.body.trim_end().to_string();
-    body.push_str("\n\n");
-    body.push_str(&build_hermes_run_evidence_body(evidence));
-    body.push_str("\n## HEPA audit\n");
-    for line in &intent.audit_summary {
-        body.push_str("- ");
-        body.push_str(line);
-        body.push('\n');
-    }
-    body.push_str("- PR intent author: ");
-    body.push_str(&intent.author_profile_id);
-    body.push('\n');
-    body.push_str("- HEPA appended structured run evidence from lane artifacts before manager-owned PR creation.\n");
+    let _ = evidence;
 
     Ok(HepaPrRequest {
         title: intent.title.clone(),
-        body,
+        body: intent.body.trim_end().to_string(),
         base_branch: base_branch.into(),
         head_branch: head_branch.into(),
     })
@@ -962,7 +939,7 @@ mod tests {
             lane_id: "lane-1".to_string(),
             author_profile_id: "hepa-manager".to_string(),
             title: "Add starter template readiness badge".to_string(),
-            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Changes\n- Updated the app README badge area.\n\n## Validation\n- yarn test:e2e passed\n\n## Review\n- Reviewer approved the scoped change.\n\n## Risk\n- Low risk; documentation-only change.\n\n## Run Context\n- HEPA manager-owned PR publication; human review required.\n".to_string(),
+            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Task\nAcceptance criteria:\n- Show readiness clearly in the README.\n\n## Changes\n- Updated the app README badge area.\n\n## Validation\n- yarn test:e2e passed\n\n## Review\n- Reviewer approved the scoped change.\n\n## Risk\n- Low risk; documentation-only change.\n".to_string(),
             audit_summary: vec![
                 "HEPA checked safe staging before PR creation.".to_string(),
                 "Human review remains required before merge.".to_string(),
@@ -977,7 +954,8 @@ mod tests {
         assert_eq!(request.base_branch, "main");
         assert_eq!(request.head_branch, "hepa/manager/lane-1");
         assert!(request.body.contains("Adds the readiness badge"));
-        assert!(request.body.contains("## HEPA audit"));
+        assert_eq!(request.body, intent.body.trim_end());
+        assert!(!request.body.contains("## HEPA audit"));
         assert!(!request.body.contains("Fallback Evidence Artifact"));
         assert!(
             !request
@@ -985,11 +963,11 @@ mod tests {
                 .contains("not Hermes-authored project PR intent")
         );
         assert!(
-            request
+            !request
                 .body
                 .contains("HEPA checked safe staging before PR creation.")
         );
-        assert!(request.body.contains("PR intent author: hepa-manager"));
+        assert!(!request.body.contains("PR intent author: hepa-manager"));
     }
 
     #[test]
@@ -1000,7 +978,7 @@ mod tests {
             lane_id: "lane-1".to_string(),
             author_profile_id: "hepa-reviewer".to_string(),
             title: "Add starter template readiness badge".to_string(),
-            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Changes\n- Updated the app README badge area.\n\n## Validation\n- yarn test:e2e passed\n\n## Review\n- Reviewer approved the scoped change.\n\n## Risk\n- Low risk; documentation-only change.\n\n## Run Context\n- HEPA manager-owned PR publication; human review required.\n".to_string(),
+            body: "## Summary\nAdds the readiness badge requested by the app task.\n\n## Task\nAcceptance criteria:\n- Show readiness clearly in the README.\n\n## Changes\n- Updated the app README badge area.\n\n## Validation\n- yarn test:e2e passed\n\n## Review\n- Reviewer approved the scoped change.\n\n## Risk\n- Low risk; documentation-only change.\n".to_string(),
             audit_summary: vec!["HEPA checked safe staging before PR creation.".to_string()],
             human_review_required: true,
         };
@@ -1019,7 +997,7 @@ mod tests {
             lane_id: "lane-1".to_string(),
             author_profile_id: "hepa-manager".to_string(),
             title: "HEPA validation: Update app".to_string(),
-            body: "## Summary\n- Task: HEPA validation: update app\n\n## Changes\n- changed files\n\n## Validation\n- passed\n\n## Review\n- approved\n\n## Risk\n- low\n\n## Run Context\n- HEPA\n"
+            body: "## Summary\n- Task: HEPA validation: update app\n\n## Changes\n- changed files\n\n## Validation\n- passed\n\n## Review\n- approved\n\n## Risk\n- low\n"
                 .to_string(),
             audit_summary: vec!["validation passed".to_string()],
             human_review_required: true,
