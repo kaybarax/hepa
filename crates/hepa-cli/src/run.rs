@@ -882,6 +882,43 @@ pub fn run_live_task(
         });
     }
 
+    if let Some(reason) =
+        manager_changed_file_policy_blocker(&attempt_outcome.changed_files, &task_spec.goal)
+    {
+        transition_and_record(
+            &lane_paths,
+            &mut lane,
+            8,
+            HepaLaneState::Blocked,
+            "live manager changed-file policy blocked staging",
+            "2026-06-16T00:00:08Z",
+        )?;
+        return finish_blocked_live_run(FinishBlockedInput {
+            config,
+            task,
+            run_paths: &run_paths,
+            lane_paths: &lane_paths,
+            allocator: &allocator,
+            lane: &mut lane,
+            validation,
+            review_signals: review_outcome.signals.clone(),
+            arbitration: Some(review_outcome.arbitration.clone()),
+            timing: live_timing_record(LiveTimingInput {
+                config,
+                adapter_id,
+                worker_duration_seconds: attempt_outcome.duration_seconds,
+                validation_duration_seconds,
+                review_duration_seconds,
+                reviewer_passes: review_outcome.reviewer_passes,
+                terminal_phase: LivePipelinePhase::PrFailed,
+                repair_timing,
+            }),
+            reason: format!(
+                "Manager changed-file policy blocked staging before PR creation: {reason}"
+            ),
+        });
+    }
+
     transition_and_record(
         &lane_paths,
         &mut lane,
@@ -2326,6 +2363,90 @@ fn first_secret_like_changed_path(changed_files: &[String]) -> Option<String> {
         .iter()
         .find(|path| is_live_secret_like_path(path))
         .cloned()
+}
+
+fn manager_changed_file_policy_blocker(
+    changed_files: &[String],
+    task_text: &str,
+) -> Option<String> {
+    let unexpected_lockfiles: Vec<&str> = changed_files
+        .iter()
+        .map(String::as_str)
+        .filter(|path| is_dependency_lockfile_change(path))
+        .collect();
+    if !unexpected_lockfiles.is_empty() && !task_allows_dependency_lockfile_changes(task_text) {
+        return Some(format!(
+            "dependency lockfile changes require explicit dependency/package-manager intent: {}",
+            unexpected_lockfiles.join(", ")
+        ));
+    }
+
+    let unexpected_workspace_configs: Vec<&str> = changed_files
+        .iter()
+        .map(String::as_str)
+        .filter(|path| is_workspace_config_change(path))
+        .collect();
+    if !unexpected_workspace_configs.is_empty() && !task_allows_workspace_config_changes(task_text)
+    {
+        return Some(format!(
+            "workspace/package-manager config changes require explicit workspace/package-manager intent: {}",
+            unexpected_workspace_configs.join(", ")
+        ));
+    }
+
+    None
+}
+
+fn is_dependency_lockfile_change(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next().unwrap_or(path),
+        "pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "bun.lock" | "bun.lockb"
+    )
+}
+
+fn is_workspace_config_change(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next().unwrap_or(path),
+        "pnpm-workspace.yaml" | "lerna.json" | "nx.json" | "turbo.json" | "rush.json"
+    )
+}
+
+fn task_allows_dependency_lockfile_changes(task_text: &str) -> bool {
+    let text = task_text.to_ascii_lowercase();
+    [
+        "dependency",
+        "dependencies",
+        "lockfile",
+        "lock file",
+        "package manager",
+        "package-manager",
+        "pnpm install",
+        "npm install",
+        "yarn install",
+        "bun install",
+        "add package",
+        "upgrade package",
+        "update package",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn task_allows_workspace_config_changes(task_text: &str) -> bool {
+    let text = task_text.to_ascii_lowercase();
+    [
+        "workspace",
+        "monorepo config",
+        "package manager",
+        "package-manager",
+        "pnpm-workspace",
+        "turbo",
+        "nx",
+        "lerna",
+        "rush",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 fn is_live_secret_like_path(path: &str) -> bool {
@@ -5826,6 +5947,70 @@ JSON
         assert_eq!(
             redact_secret_like_path_for_report(&secret_path),
             "<secret-like-path>"
+        );
+    }
+
+    #[test]
+    fn manager_changed_file_policy_blocks_unrequested_lockfile_churn() {
+        let changed = vec![
+            "apps/web/README.md".to_string(),
+            "apps/web/package.json".to_string(),
+            "apps/web/src/__tests__/health.test.ts".to_string(),
+            "apps/web/src/helpers/validators.ts".to_string(),
+            "pnpm-lock.yaml".to_string(),
+        ];
+
+        let blocker = manager_changed_file_policy_blocker(
+            &changed,
+            "Improve the apps/web Jest health-check surface with a script, utility, tests, and docs.",
+        )
+        .expect("unrequested lockfile churn should block");
+
+        assert!(blocker.contains("pnpm-lock.yaml"));
+        assert!(blocker.contains("dependency lockfile changes"));
+    }
+
+    #[test]
+    fn manager_changed_file_policy_blocks_unrequested_workspace_config_churn() {
+        let changed = vec![
+            "apps/web/package.json".to_string(),
+            "pnpm-workspace.yaml".to_string(),
+        ];
+
+        let blocker = manager_changed_file_policy_blocker(
+            &changed,
+            "Add a deterministic test script to apps/web/package.json.",
+        )
+        .expect("unrequested workspace config churn should block");
+
+        assert!(blocker.contains("pnpm-workspace.yaml"));
+        assert!(blocker.contains("workspace/package-manager config"));
+    }
+
+    #[test]
+    fn manager_changed_file_policy_allows_explicit_dependency_and_workspace_tasks() {
+        let dependency_changed = vec![
+            "apps/web/package.json".to_string(),
+            "pnpm-lock.yaml".to_string(),
+        ];
+        assert!(
+            manager_changed_file_policy_blocker(
+                &dependency_changed,
+                "Add a dependency and update the lockfile."
+            )
+            .is_none()
+        );
+
+        let workspace_changed = vec![
+            "package.json".to_string(),
+            "pnpm-workspace.yaml".to_string(),
+        ];
+        assert!(
+            manager_changed_file_policy_blocker(
+                &workspace_changed,
+                "Update the pnpm-workspace package-manager configuration."
+            )
+            .is_none()
         );
     }
 
