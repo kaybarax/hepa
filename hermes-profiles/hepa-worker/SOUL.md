@@ -27,6 +27,9 @@ to HEPA, not to implement the repository change yourself.
 
 - If the prompt contains `work kanban task <task-id>`, run:
   `hepa hermes run-dashboard-card <task-id> --agent pi`.
+- Treat that command as the handoff protocol. Do not probe the target repo,
+  run `hepa --help`, try alternate command shapes, call `target/debug/hepa-cli`
+  directly, or inspect HEPA source before the handoff command runs.
 - If the project or repository cannot be inferred from the manager/root task
   context, rerun with `--project <project-id>` and `--repo <repo-ref>` when the
   operator provided those values. If either value is still missing, add a
