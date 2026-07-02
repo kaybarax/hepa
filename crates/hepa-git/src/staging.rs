@@ -529,7 +529,10 @@ fn is_secret_assignment_key(key: &str) -> bool {
 
 fn is_documented_secret_placeholder(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
-    normalized.starts_with("your-") || normalized.starts_with("<your-")
+    normalized.starts_with("your-")
+        || normalized.starts_with("<your-")
+        || normalized == "test-secret-value"
+        || normalized == "test-jwt-secret"
 }
 
 fn is_safe_auth_code_reference(value: &str) -> bool {
@@ -864,6 +867,30 @@ mod tests {
         assert_eq!(
             report.staged_files,
             vec!["src/main/config.test.ts".to_string()]
+        );
+
+        remove_test_dir(repo);
+    }
+
+    #[test]
+    fn stage_approved_files_allows_gateway_health_test_fixtures() {
+        let repo = unique_test_dir("stage-content-gateway-health-test");
+        init_repo(&repo);
+        fs::create_dir_all(repo.join("apps/api-gateway/src/__tests__")).expect("test dir");
+        fs::write(
+            repo.join("apps/api-gateway/src/__tests__/health.test.ts"),
+            "beforeAll(() => {\n  process.env.JWT_SECRET = 'test-secret-value';\n  process.env.CORS_ORIGIN = 'http://localhost:3000';\n});\nmockUpstreams({\n  'localhost:3001': healthyResponse(JSON.stringify({ status: 'ready' })),\n  'localhost:3002': unhealthyResponse(503, 'Service Unavailable'),\n});\nexpect(body.status).toBe('all-down');\n",
+        )
+        .expect("health test write");
+        let staging = HepaSafeStaging::new(&repo);
+
+        let report = staging
+            .stage_approved_files(&["apps/api-gateway/src/__tests__/health.test.ts".to_string()])
+            .expect("ordinary gateway health test fixtures should stage");
+
+        assert_eq!(
+            report.staged_files,
+            vec!["apps/api-gateway/src/__tests__/health.test.ts".to_string()]
         );
 
         remove_test_dir(repo);
