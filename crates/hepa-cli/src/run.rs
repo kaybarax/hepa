@@ -108,6 +108,7 @@ pub fn run_fake_task(config: &HepaFakeRunConfig) -> Result<HepaFakeRunResult, St
     let allocation = allocator
         .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
         .map_err(|error| error.to_string())?;
+    prepare_live_worktree_dependency_reuse(&config.repo_path, &allocation.worktree_path)?;
 
     fs::create_dir_all(&lane_paths.lane_dir).map_err(|error| error.to_string())?;
     write_json(&run_paths.task_state, &task_spec).map_err(|error| error.to_string())?;
@@ -882,6 +883,11 @@ pub fn run_live_task(
         });
     }
 
+    attempt_outcome.changed_files = discard_unrequested_package_manager_churn(
+        &allocation.worktree_path,
+        &attempt_outcome.changed_files,
+        &task_spec.goal,
+    )?;
     if let Some(reason) =
         manager_changed_file_policy_blocker(&attempt_outcome.changed_files, &task_spec.goal)
     {
@@ -2464,6 +2470,69 @@ fn manager_changed_file_policy_blocker(
     }
 
     None
+}
+
+fn prepare_live_worktree_dependency_reuse(repo_path: &Path, worktree: &Path) -> Result<(), String> {
+    for dependency_dir in ["node_modules"] {
+        let source = repo_path.join(dependency_dir);
+        let destination = worktree.join(dependency_dir);
+        if !source.exists() || destination.exists() {
+            continue;
+        }
+        symlink_dependency_dir(&source, &destination).map_err(|error| {
+            format!(
+                "failed to reuse dependency dir {} at {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_dependency_dir(source: &Path, destination: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source, destination)
+}
+
+#[cfg(not(unix))]
+fn symlink_dependency_dir(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn discard_unrequested_package_manager_churn(
+    worktree: &Path,
+    changed_files: &[String],
+    task_text: &str,
+) -> Result<Vec<String>, String> {
+    let should_restore = |path: &str| {
+        (is_dependency_lockfile_change(path) && !task_allows_dependency_lockfile_changes(task_text))
+            || (is_workspace_config_change(path)
+                && !task_allows_workspace_config_changes(task_text))
+    };
+    let restore_paths = changed_files
+        .iter()
+        .filter(|path| should_restore(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if restore_paths.is_empty() {
+        return Ok(changed_files.to_vec());
+    }
+
+    let mut command = Command::new("git");
+    command.current_dir(worktree).args(["checkout", "--"]);
+    for path in &restore_paths {
+        command.arg(path);
+    }
+    let output = command.output().map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to restore unrequested package-manager changes: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    collect_changed_files(worktree)
 }
 
 fn is_dependency_lockfile_change(path: &str) -> bool {
@@ -6240,6 +6309,53 @@ JSON
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn dependency_reuse_links_root_node_modules_into_live_worktree() {
+        let root = unique_test_dir("dependency-reuse");
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        fs::create_dir_all(repo.join("node_modules")).expect("repo node_modules");
+        fs::create_dir_all(&worktree).expect("worktree");
+
+        prepare_live_worktree_dependency_reuse(&repo, &worktree).expect("dependency reuse");
+
+        assert!(worktree.join("node_modules").exists());
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn unrequested_package_manager_churn_is_discarded_before_staging() {
+        let root = unique_test_dir("discard-lockfile-churn");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").expect("lockfile");
+        fs::write(repo.join("src.ts"), "export const value = 1;\n").expect("source");
+        git(&repo, ["add", "pnpm-lock.yaml", "src.ts"]);
+        git(&repo, ["commit", "-m", "add app files"]);
+
+        fs::write(
+            repo.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nchanged: true\n",
+        )
+        .expect("lockfile change");
+        fs::write(repo.join("src.ts"), "export const value = 2;\n").expect("source change");
+
+        let changed = collect_changed_files(&repo).expect("changed files");
+        let cleaned = discard_unrequested_package_manager_churn(
+            &repo,
+            &changed,
+            "Improve source behavior without dependency changes.",
+        )
+        .expect("discard churn");
+
+        assert_eq!(cleaned, vec!["src.ts".to_string()]);
+        assert_eq!(
+            fs::read_to_string(repo.join("pnpm-lock.yaml")).expect("lockfile restored"),
+            "lockfileVersion: '9.0'\n"
+        );
+        remove_test_dir(root);
     }
 
     #[test]
