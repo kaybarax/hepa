@@ -1,11 +1,12 @@
 # HEPA
 
-**HEPA — Hermes-Pi-Automata** (inspired by HOCA) is an independent, Rust-first
-engineering automation system: Hermes coordinates the fleet, and the **Pi Coding
-Agent** ([pi.dev](https://pi.dev), MIT) is the built-in default harness that does
-the actual coding — so cloud models (e.g. DeepSeek) and tool-call-capable local
-models (e.g. via llama.cpp, Ollama, or vLLM) work out of the box without wiring
-your own CLI.
+**HEPA — Hermes-Pi-Automata** (inspired by
+[HOCA](https://github.com/kaybarax/hoca)) is an independent, Rust-first
+engineering automation system: Hermes coordinates the fleet, and the **Pi
+Coding Agent** ([pi.dev](https://pi.dev), MIT) is the built-in default harness
+that does the actual coding — so cloud models (e.g. DeepSeek) and
+tool-call-capable local models (e.g. via llama.cpp, Ollama, or vLLM) use the
+same adapter path without wiring your own CLI.
 
 HEPA stays **agent-agnostic**: Pi is the default and namesake, **not** a hard
 requirement. Every implementation/review agent — Pi, Claude Code, Codex, custom,
@@ -28,8 +29,10 @@ unavailable — board sync degrades and catches up rather than blocking.
 | Containers | 2 per round default | 0 default; container mode opt-in |
 | Operator surface | optional bridge | default Hermes Kanban/dashboard |
 
-HEPA carries every HOCA safety gate forward unchanged in behavior. Divergences
-are recorded in commit messages or these docs.
+HEPA carries every HOCA safety gate forward unchanged in behavior. HOCA is the
+public inspiration and parity reference for HEPA, while HEPA remains a separate
+Rust-first implementation with its own architecture. Divergences are recorded in
+commit messages or these docs.
 
 ## Rust Workspace
 
@@ -88,8 +91,8 @@ flags in non-interactive runs so project-local Pi resources do not expand the
 execution surface and HEPA's lane artifact remains the single persistent
 transcript.
 
-For a release-grade local route, serve a tool-call-capable coding model through
-an OpenAI-compatible endpoint. The tested local release route is llama.cpp with
+For a local route, serve a tool-call-capable coding model through an
+OpenAI-compatible endpoint. The recommended path is llama.cpp with
 chat-template/tool-call support enabled:
 
 ```bash

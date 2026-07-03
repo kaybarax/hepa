@@ -763,10 +763,10 @@ mod tests {
             [
                 "config",
                 "user.email",
-                "14350830+kaybarax@users.noreply.github.com",
+                "12345678+example-developer@users.noreply.github.com",
             ],
         );
-        git(&repo, ["config", "user.name", "kaybarax"]);
+        git(&repo, ["config", "user.name", "Example Developer"]);
         fs::write(repo.join("change.txt"), "content\n").expect("change write");
         git(&repo, ["add", "change.txt"]);
         let lifecycle = HepaManagerGitLifecycle::manager(&repo);
@@ -779,11 +779,11 @@ mod tests {
         let committer = git_output(&repo, ["log", "-1", "--pretty=%cn <%ce>"]);
         assert_eq!(
             author,
-            "kaybarax <14350830+kaybarax@users.noreply.github.com>"
+            "Example Developer <12345678+example-developer@users.noreply.github.com>"
         );
         assert_eq!(
             committer,
-            "kaybarax <14350830+kaybarax@users.noreply.github.com>"
+            "Example Developer <12345678+example-developer@users.noreply.github.com>"
         );
 
         remove_test_dir(repo);

@@ -37,7 +37,7 @@ manager-authored PR bodies:
 | Three-round task/work/review cap with human-intervention terminal state | Worker brief cap, review-to-worker repair mediation, round-3 allowance, and round-4 human-intervention cap tests passed |
 | Headless/degraded fallback labels PR bodies as fallback evidence, not Hermes-authored project intent | Fallback PR body and Hermes intent separation tests passed |
 | Hermes-first spec/card/run bridge with live lane visibility | `hepa hermes ingest-spec`, `hepa hermes run-ready`, `hepa hermes run-cards`, local card payloads, `lane_attach_commands`, `hepa lane attach`, and `hepa fleet watch` are documented and covered by focused CLI/card tests |
-| Fresh Hermes-present local/hybrid validation evidence after the runtime route lands | Passed with `HEPA_HERMES_REQUIRED=true`: GPT-OSS 20B via llama.cpp completed the pure-local app/docs lanes 2/2 in 74.82 s and the hybrid local-worker / DeepSeek-reviewer lanes 2/2 in 75.69 s; a fresh current-branch local rerun completed 2/2 in 80.44 s after task-focused PR-body cleanup; validation PRs were opened, then closed and cleaned |
+| Fresh Hermes-present validation evidence after the runtime route lands | Passed for the cloud Pi route with `HEPA_HERMES_REQUIRED=true`, Hermes Kanban task intake, live lane logs, manager-authored task-specific PR bodies, manager-owned staging, and validation PR cleanup. Local-model-only heavy stress is tracked as post-v1.0.0 hardening; weak local endpoints now fail with deterministic diagnostics instead of hanging silently. |
 
 The Phase 11 privacy scan found only pre-existing placeholder examples and
 redaction fixtures.
@@ -55,6 +55,8 @@ The original Phase 11 gate run passed `cargo fmt --check`, `cargo test`,
 `hepa timing trends <archive-root>` and
 `hepa fleet dashboard --output <dashboard-html> --control-root <control-root>`,
 and the repository privacy scan for the original Phase 11 items. The
-Hermes-led refinement now has fresh local/hybrid runtime-command evidence.
-Final release still requires the normal repository checks and privacy scan after
-any later edits.
+Hermes-led refinement now has fresh runtime-command evidence for the
+release-gated cloud route. Final release still requires the normal repository
+checks and privacy scan after any later edits. Local-model-only stress remains a
+post-v1.0.0 follow-up, with the current release preserving diagnostics,
+preflight checks, and cleanup for weak local endpoints.

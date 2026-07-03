@@ -84,11 +84,11 @@ Empty Pi environment values deliberately clear optional `.env` settings. Use
 that when switching from a loopback local profile back to a cloud profile so
 `hepa adapter doctor` does not keep requiring the stale local base URL.
 
-Release-grade local Pi route:
+Local Pi route:
 
 Pi local routes must expose OpenAI-compatible chat completions plus reliable
-tool-call semantics. The tested release-grade path is llama.cpp with
-chat-template/tool-call support enabled:
+tool-call semantics. The recommended path is llama.cpp with chat-template and
+tool-call support enabled:
 
 ```bash
 llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080 --ctx-size 8192 --jinja

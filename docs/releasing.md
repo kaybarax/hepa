@@ -41,7 +41,9 @@ provider credentials for cloud models such as DeepSeek, or a tool-call-capable
 loopback local endpoint such as llama.cpp with chat-template/tool-call support,
 Ollama, or vLLM. Run `hepa doctor` before release stress runs; known-weak or
 unverified generic local endpoints must be fixed or replaced before they count
-as local-model release evidence.
+as local-model release evidence. The v1.0.0 release gate is the Hermes-present
+cloud Pi route; local-model-only heavy stress is tracked as post-release
+hardening unless fresh local evidence is attached to a later release.
 
 ## Source Fallback
 
