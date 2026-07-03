@@ -1733,7 +1733,7 @@ fn dashboard_pr_intent_body(spec: &HermesLaunchSpec) -> String {
         .join("\n");
 
     format!(
-        "## Summary\nImplements: {task_title}.\n\n## Task\nAcceptance criteria:\n{criteria_lines}\n\nNon-goals:\n- Do not expand beyond the requested task scope.\n\n## Changes\n- Updates the source and test files needed for the requested behavior.\n- Keeps the change focused on the task acceptance criteria.\n\n## Validation\n{validation}\n\n## Review\n- Review the changed files against the task acceptance criteria.\n- Confirm the implementation remains compatible with existing behavior.\n\n## Risk\n- Main residual risk is whether the added or changed tests cover all intended edge cases.\n"
+        "## Summary\nImplements: {task_title}.\n\n## Task\nAcceptance criteria:\n{criteria_lines}\n\nNon-goals:\n- Do not expand beyond the requested task scope.\n\n## Changes\n- Updates the project areas named in the acceptance criteria for this task.\n- Adds or updates the task-specific behavior and tests requested above.\n- Leaves unrelated apps, generated output, dependency locks, and workspace configuration untouched unless the task explicitly asks for them.\n\n## Validation\n{validation}\n\n## Review\n- Check the changed files directly against the task and validation command above.\n- Confirm the requested behavior is covered without broadening the scope.\n\n## Risk\n- Main residual risk is missed edge cases outside the requested acceptance criteria.\n"
     )
 }
 
