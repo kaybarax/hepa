@@ -3,8 +3,8 @@
 **HEPA — Hermes-Pi-Automata** (inspired by HOCA) is an independent, Rust-first
 engineering automation system: Hermes coordinates the fleet, and the **Pi Coding
 Agent** ([pi.dev](https://pi.dev), MIT) is the built-in default harness that does
-the actual coding — so cloud models (e.g. DeepSeek) and local models (e.g. via
-exo + Apple MLX, llama.cpp, Ollama, or vLLM) work out of the box without wiring
+the actual coding — so cloud models (e.g. DeepSeek) and tool-call-capable local
+models (e.g. via llama.cpp, Ollama, or vLLM) work out of the box without wiring
 your own CLI.
 
 HEPA stays **agent-agnostic**: Pi is the default and namesake, **not** a hard
@@ -88,21 +88,28 @@ flags in non-interactive runs so project-local Pi resources do not expand the
 execution surface and HEPA's lane artifact remains the single persistent
 transcript.
 
-For an exo + Apple MLX local route, run exo's local OpenAI-compatible endpoint
-and set:
+For a release-grade local route, serve a tool-call-capable coding model through
+an OpenAI-compatible endpoint. The tested local release route is llama.cpp with
+chat-template/tool-call support enabled:
 
 ```bash
-export HEPA_PI_MODEL=local/mlx-community/<model>
+llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080 --ctx-size 8192 --jinja
+
+export HEPA_PI_MODEL=llama-cpp/<model-id>
 export HEPA_PI_PROVIDER_KEY_ENV=
-export HEPA_PI_BASE_URL=http://127.0.0.1:52415/v1
+export HEPA_PI_BASE_URL=http://127.0.0.1:8080/v1
 ```
 
 When switching a working tree from a local Pi profile back to DeepSeek/cloud,
 clear stale local overrides such as `HEPA_PI_REVIEW_MODEL` and
 `HEPA_PI_BASE_URL`; empty values intentionally override `.env` entries.
 
-llama.cpp, Ollama, and vLLM-style loopback routes are also supported. Local Pi
-routes derive `cost_class=local`, so they satisfy `local-only` routing policy.
+Pi local routes must support OpenAI-style tool calling because Pi needs
+read/edit/write/bash tool execution to change a repository. HEPA's doctor and
+live-run preflight reject known-weak exo + Apple MLX generic local routes until
+their endpoint proves the `tools`, `tool_choice`, `tool_calls`, and tool-result
+message contract. Local Pi routes derive `cost_class=local`, so they satisfy
+`local-only` routing policy once they pass this tool-call readiness gate.
 
 Fleet commands accept `--control-root <path>` to target an isolated control
 root (used throughout the test suite).
@@ -148,7 +155,7 @@ in that flow, but review is performed by Hermes reviewer profiles.
 
 The **Pi adapter** is the batteries-included default harness: `hepa adapter
 install pi` installs it and you route it to any model — DeepSeek and other
-clouds directly, or local models via exo + Apple MLX, llama.cpp, Ollama, or
+clouds directly, or tool-call-capable local models via llama.cpp, Ollama, or
 vLLM. Because all execution and review route through the adapter contract, you
 can use Pi, Claude Code, Codex, custom, or local adapters interchangeably — no
 feature hard-requires a specific vendor CLI. Built-in adapters, the Pi setup,

@@ -27,10 +27,11 @@ Pi is the default one-loop harness. HEPA invokes
 `pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files -p --mode json --model ...`
 once per worker or reviewer attempt, feeds the prompt on stdin, and captures the
 JSON event stream from stdout into the lane artifact. DeepSeek and other cloud
-routes count as paid-cloud lanes; exo + Apple MLX, Ollama, other loopback
-endpoints, and no-key routes count as local lanes and can satisfy `local-only`
-projects. Container count remains zero for trusted host-worktree runs and
-becomes one only when container mode is required, such as untrusted projects.
+routes count as paid-cloud lanes; tool-call-capable loopback endpoints such as
+llama.cpp, Ollama, vLLM, and no-key routes count as local lanes and can satisfy
+`local-only` projects once they pass the Pi tool-call readiness gate. Container
+count remains zero for trusted host-worktree runs and becomes one only when
+container mode is required, such as untrusted projects.
 
 ## Live matrix evidence
 
@@ -225,12 +226,13 @@ Interpretation:
   worker loop with manager-owned `yarn install --frozen-lockfile`, `yarn build`,
   and `git diff --check`; the docs lane initially failed `git diff --check`,
   then completed after one bounded local-worker repair. Both validation PRs had
-  task-focused bodies, `HEPA Manager <hepa-manager@local.invalid>` commit
-  authorship, concrete changed-file context, no run-context/audit boilerplate,
-  and were closed and cleaned after evidence capture.
+  task-focused bodies, concrete changed-file context, no run-context/audit
+  boilerplate, and were closed and cleaned after evidence capture. HEPA now
+  preserves the user's configured Git identity for manager-owned commits.
 - exo exposes local OpenAI/Ollama-compatible APIs and uses MLX as an inference
-  backend, so it exercises the same HEPA local-provider class as other loopback
-  local servers while accurately representing the runtime used in this test.
+  backend, but the generic exo/MLX route is no longer treated as release-grade
+  Pi evidence unless it proves the OpenAI tool-call contract. It remains useful
+  as deterministic evidence for weak-local-provider blocking behavior.
 - Max RSS and peak footprint are measured for the HEPA manager process. External
   model-serving memory and compute for exo/MLX or llama.cpp live outside that
   process and should be measured separately when sizing a local deployment.
@@ -241,9 +243,10 @@ Interpretation:
   with blocked final reports and cleanup, keeps local-provider workers out of
   validation command loops, runs manager-owned Yarn validation with bounded
   timeouts, scopes Pi provider credentials by role, and gives live-matrix reruns
-  unique lane/branch IDs. Weak local providers still fail deterministically with
-  evidence, while the tested Devstral/llama.cpp local and hybrid routes now pass
-  the app-starter and docs validation lanes.
+  unique lane/branch IDs. Weak local providers now fail deterministic preflight
+  or attempt checks with evidence, while the tested Devstral/llama.cpp and
+  GPT-OSS 20B/llama.cpp local and hybrid routes pass the app-starter and docs
+  validation lanes.
 
 These numbers are release evidence for the tested validation tasks and
 environment. Larger changes, slow dependency installs, long test suites, CI

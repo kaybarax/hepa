@@ -84,26 +84,29 @@ Empty Pi environment values deliberately clear optional `.env` settings. Use
 that when switching from a loopback local profile back to a cloud profile so
 `hepa adapter doctor` does not keep requiring the stale local base URL.
 
-exo + Apple MLX local:
+Release-grade local Pi route:
 
-exo can serve MLX Community models through a local OpenAI-compatible endpoint.
-Use HEPA's generic local provider route and the exo loopback base URL:
-
-```bash
-export HEPA_DEFAULT_ADAPTER=pi
-export HEPA_PI_MODEL=local/mlx-community/Qwen3-30B-A3B-4bit
-export HEPA_PI_PROVIDER_KEY_ENV=
-export HEPA_PI_BASE_URL=http://127.0.0.1:52415/v1
-```
-
-llama.cpp local:
+Pi local routes must expose OpenAI-compatible chat completions plus reliable
+tool-call semantics. The tested release-grade path is llama.cpp with
+chat-template/tool-call support enabled:
 
 ```bash
+llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080 --ctx-size 8192 --jinja
+
 export HEPA_DEFAULT_ADAPTER=pi
 export HEPA_PI_MODEL=llama-cpp/<model-id>
 export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:8080/v1
 ```
+
+Known-weak or unverified local endpoints:
+
+exo + Apple MLX can expose local OpenAI-compatible endpoints, but HEPA does not
+treat the generic `local/mlx-community/...` route as release-ready unless that
+endpoint proves support for `tools`, `tool_choice`, assistant `tool_calls`, and
+tool-result messages. `hepa doctor` and live Pi preflight block this route with
+an actionable diagnostic instead of letting a heavy run stall or complete with
+no repository edits.
 
 Ollama-compatible local:
 
@@ -114,10 +117,11 @@ export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
-Cost class is derived from the model/base URL/key surface: exo/MLX through the
-generic `local/...` provider, llama.cpp/Ollama/loopback/no-key routes are
-local, while remote provider routes with keys are paid-cloud. The existing
-`local-only` routing policy and paid-lane caps enforce the result.
+Cost class is derived from the model/base URL/key surface: llama.cpp,
+Ollama/loopback/no-key routes are local, while remote provider routes with keys
+are paid-cloud. A local route must also pass the Pi tool-call readiness gate
+before it is allowed into release stress runs. The existing `local-only` routing
+policy and paid-lane caps enforce the result.
 
 Hybrid Pi runs can use a local worker model and a cloud reviewer model by
 setting `HEPA_PI_MODEL` and `HEPA_PI_REVIEW_MODEL` separately. HEPA filters Pi

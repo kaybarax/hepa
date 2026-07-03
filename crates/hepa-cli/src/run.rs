@@ -1,7 +1,7 @@
 use hepa_adapters::{
     engine::{HepaOneshotAdapterExecutor, HepaOneshotAdapterInvocation},
     fake::{HepaFakeAdapter, HepaFakeReviewerInput, HepaFakeWorkerInput},
-    pi::{HepaPiParsedOutput, parse_pi_json_events},
+    pi::{HepaPiParsedOutput, parse_pi_json_events, pi_local_route_diagnostic},
     registry::HepaAdapterRegistry,
     routing::{HepaReviewFanout, HepaReviewPassPolicy},
     spec::{HepaAdapterOutputCapture, HepaAdapterRole, HepaAdapterTemplateContext},
@@ -1287,6 +1287,31 @@ fn execute_live_worker_attempt(
         .map_err(|error| error.to_string())?;
     let cost_class = spec.cost_class.clone();
     let output_capture = spec.output_capture.clone();
+    if let Some(blocked_reason) =
+        pi_local_worker_route_preflight_block_reason(adapter_id, &environment)
+    {
+        let attempt = HepaAttemptReport {
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            attempt_id: attempt_id.to_string(),
+            lane_id: config.lane_id.clone(),
+            task_id: config.task_id.clone(),
+            round,
+            role: HepaAgentRole::Worker,
+            adapter_id: adapter_id.to_string(),
+            status: hepa_core::contracts::HepaAttemptStatus::Blocked,
+            commands_run: vec![format!("live adapter invocation: {adapter_id}")],
+            changed_files: collect_changed_files(&allocation.worktree_path).unwrap_or_default(),
+            summary: vec![
+                "Local Pi provider did not satisfy HEPA's tool-call preflight.".to_string(),
+            ],
+            blocked_reason: Some(blocked_reason.clone()),
+            started_at: started_at.to_string(),
+            completed_at: Some(completed_at.to_string()),
+        };
+        write_live_adapter_stream_logs(&attempt_paths, "", "")?;
+        write_attempt(lane_paths, &attempt)?;
+        return Err(blocked_reason);
+    }
     let _local_generation_permit = match local_pi_generation_concurrency_permit(
         adapter_id,
         &environment,
@@ -3461,6 +3486,23 @@ fn pi_worker_model_needs_local_permit(
         .unwrap_or_default();
     let base_url = environment.get("HEPA_PI_BASE_URL").cloned();
     pi_model_is_local(&worker_model, &base_url)
+}
+
+fn pi_local_worker_route_preflight_block_reason(
+    adapter_id: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    if adapter_id != "pi" || !pi_worker_model_needs_local_permit(environment) {
+        return None;
+    }
+    let diagnostic = pi_local_route_diagnostic(environment);
+    if !diagnostic.is_blocking() {
+        return None;
+    }
+    Some(format!(
+        "{}; action={}",
+        diagnostic.detail, diagnostic.action
+    ))
 }
 
 fn local_pi_generation_concurrency_permit(
@@ -7324,6 +7366,116 @@ JSON
             .expect("permit decision")
             .is_none()
         );
+    }
+
+    #[test]
+    fn live_pi_exo_mlx_route_blocks_before_adapter_invocation() {
+        let root = unique_test_dir("live-pi-exo-mlx-preflight");
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let config = HepaFakeRunConfig {
+            repo_path: repo.clone(),
+            control_root: root.join("control"),
+            worktree_root: root.join("worktrees"),
+            archive_root: root.join("archive"),
+            run_id: "run-local-preflight".to_string(),
+            task_id: "task-local-preflight".to_string(),
+            lane_id: "lane-local-preflight".to_string(),
+            task_text: "Update README.md".to_string(),
+            timing: true,
+        };
+        let layout =
+            HepaArtifactLayout::new(&config.control_root, &config.archive_root).expect("layout");
+        let lane_paths = layout
+            .run(&config.run_id, &config.task_id)
+            .expect("run paths")
+            .lane(&config.lane_id)
+            .expect("lane paths");
+        fs::create_dir_all(&lane_paths.lane_dir).expect("lane dir");
+        let allocator = HepaWorktreeAllocator::new(&config.repo_path, &config.worktree_root);
+        let allocation = allocator
+            .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
+            .expect("allocation");
+        let fake_pi = root.join("pi-should-not-run");
+        write_executable(
+            &fake_pi,
+            "#!/usr/bin/env sh\necho adapter-invoked >&2\nexit 42\n",
+        );
+        let spec = HepaAdapterSpec {
+            schema_version: ADAPTER_SPEC_SCHEMA_VERSION,
+            id: "pi".to_string(),
+            display_name: "Pi Coding Agent".to_string(),
+            roles: vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
+            mode: HepaAdapterMode::Oneshot,
+            command: format!("{} --mode json", fake_pi.display()),
+            review_command: None,
+            workdir: "{worktree}".to_string(),
+            required_commands: vec![fake_pi.to_string_lossy().to_string()],
+            required_env: Vec::new(),
+            sandbox: HepaAdapterSandbox::None,
+            supports_resume: true,
+            supports_json_output: true,
+            capabilities: vec!["local-only".to_string()],
+            cost_class: HepaAdapterCostClass::Local,
+            resource_weight: 1,
+            max_concurrency: 1,
+            prompt_transport: HepaAdapterPromptTransport::Stdin,
+            output_capture: HepaAdapterOutputCapture::Stdout,
+        };
+
+        let error = match execute_live_worker_attempt(ExecuteLiveAttemptInput {
+            config: &config,
+            lane_paths: &lane_paths,
+            allocation: &allocation,
+            spec,
+            adapter_id: "pi",
+            environment: std::collections::BTreeMap::from([
+                (
+                    "HEPA_PI_MODEL".to_string(),
+                    "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+                ),
+                (
+                    "HEPA_PI_BASE_URL".to_string(),
+                    "http://127.0.0.1:52415/v1".to_string(),
+                ),
+            ]),
+            attempt_id: "attempt-1",
+            round: 1,
+            prompt: "fixture prompt".to_string(),
+            started_at: "2026-06-16T00:00:02Z",
+            completed_at: "2026-06-16T00:00:03Z",
+        }) {
+            Ok(_) => panic!("unsupported local route must fail before invoking Pi"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("local_tool_calling_unsupported"));
+        assert!(error.contains("llama.cpp"));
+        assert!(error.contains("--jinja"));
+        let stderr_log = fs::read_to_string(
+            lane_paths
+                .attempt("attempt-1")
+                .expect("attempt paths")
+                .attempt_dir
+                .join("stderr.log"),
+        )
+        .expect("stderr log");
+        assert!(!stderr_log.contains("adapter-invoked"));
+        let attempt_json = fs::read_to_string(
+            lane_paths
+                .attempt("attempt-1")
+                .expect("attempt paths")
+                .attempt_dir
+                .join("attempt.json"),
+        )
+        .expect("attempt report");
+        assert!(attempt_json.contains("\"status\": \"blocked\""));
+        assert!(attempt_json.contains("local_tool_calling_unsupported"));
+
+        allocator
+            .cleanup_lane(&config.lane_id, "2026-06-16T00:00:09Z")
+            .expect("cleanup");
+        remove_test_dir(root);
     }
 
     #[test]

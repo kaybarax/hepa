@@ -85,9 +85,11 @@ bypass flag.
 
 Cloud egress is an adapter property. `local-only` routing restricts execution to
 local adapters, and the resource governor budgets paid-cloud lanes separately
-from local lanes. Pi local-provider routes such as exo + Apple MLX on a loopback
-OpenAI-compatible endpoint require no provider-key environment entries and run
-under the same worktree confinement, env allowlists, and deterministic monitor.
+from local lanes. Pi local-provider routes on loopback OpenAI-compatible
+endpoints require no provider-key environment entries and run under the same
+worktree confinement, env allowlists, and deterministic monitor. Pi local routes
+must also pass the tool-call readiness gate before HEPA treats them as
+release-grade implementation lanes.
 Built-in local CLI templates such as `local-worker`, `aider-local`, and
 `opencode-local` also advertise `local-only` and keep the same safety boundary.
 

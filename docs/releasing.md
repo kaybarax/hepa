@@ -37,8 +37,11 @@ Download the archive for your platform from the GitHub Release, verify it
 against `SHA256SUMS.txt`, extract it, and place `hepa` on your `PATH`.
 
 Using HEPA's default Pi harness still requires Pi and a configured model route:
-provider credentials for cloud models such as DeepSeek, or a loopback local
-endpoint for exo + Apple MLX, llama.cpp, Ollama, or vLLM.
+provider credentials for cloud models such as DeepSeek, or a tool-call-capable
+loopback local endpoint such as llama.cpp with chat-template/tool-call support,
+Ollama, or vLLM. Run `hepa doctor` before release stress runs; known-weak or
+unverified generic local endpoints must be fixed or replaced before they count
+as local-model release evidence.
 
 ## Source Fallback
 
@@ -51,4 +54,3 @@ cargo build --release -p hepa-cli
 
 The source fallback requires the Rust toolchain. After building, copy
 `target/release/hepa-cli` to a location on your `PATH` as `hepa`.
-

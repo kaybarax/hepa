@@ -6,7 +6,7 @@ use crate::{
 };
 use hepa_core::config::HepaPiConfig;
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 pub const PI_ADAPTER_ID: &str = "pi";
 pub const PI_COMMAND: &str = "pi";
@@ -54,11 +54,42 @@ impl HepaPiModelConfig {
             .as_deref()
             .map(is_local_model)
             .unwrap_or(worker_is_local);
-        if self.provider_key_env.is_some() && (!worker_is_local || !reviewer_is_local) {
+        if self
+            .provider_key_env
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && (!worker_is_local || !reviewer_is_local)
+        {
             HepaAdapterCostClass::PaidCloud
         } else {
             HepaAdapterCostClass::Local
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HepaPiLocalRouteStatus {
+    Cloud,
+    ToolCallingReady,
+    ToolCallingUnverified,
+    ToolCallingUnsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HepaPiLocalRouteDiagnostic {
+    pub status: HepaPiLocalRouteStatus,
+    pub detail: String,
+    pub action: String,
+}
+
+impl HepaPiLocalRouteDiagnostic {
+    pub fn is_blocking(&self) -> bool {
+        matches!(
+            self.status,
+            HepaPiLocalRouteStatus::ToolCallingUnsupported
+                | HepaPiLocalRouteStatus::ToolCallingUnverified
+        )
     }
 }
 
@@ -70,7 +101,7 @@ pub fn env_key_for_model(model: &str) -> Option<&'static str> {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "google" | "gemini" => Some("GOOGLE_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
-        "ollama" | "lmstudio" | "vllm" => None,
+        "ollama" | "vllm" | "llama-cpp" | "llamacpp" | "local" | "mlx" | "mlx-lm" => None,
         _ => None,
     }
 }
@@ -95,7 +126,7 @@ pub fn model_config_from_env(
     let review_model = environment.get("HEPA_PI_REVIEW_MODEL").cloned();
     let provider_key_env = environment
         .get("HEPA_PI_PROVIDER_KEY_ENV")
-        .cloned()
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.clone()))
         .or_else(|| env_key_for_model(&format!("{provider}/{model}")).map(str::to_string))
         .or_else(|| {
             review_model
@@ -110,6 +141,86 @@ pub fn model_config_from_env(
         review_model,
         provider_key_env,
         base_url,
+    }
+}
+
+pub fn pi_local_route_diagnostic(
+    environment: &BTreeMap<String, String>,
+) -> HepaPiLocalRouteDiagnostic {
+    let config = model_config_from_env(environment);
+    local_route_diagnostic_from_config(&config)
+}
+
+pub fn local_route_diagnostic_from_config(
+    config: &HepaPiModelConfig,
+) -> HepaPiLocalRouteDiagnostic {
+    let worker_model = format!("{}/{}", config.provider, config.model);
+    let worker_is_local =
+        is_local_model(&worker_model) || config.base_url.as_deref().is_some_and(is_loopback_url);
+    let reviewer_is_local = config
+        .review_model
+        .as_deref()
+        .map(|model| {
+            is_local_model(model) || config.base_url.as_deref().is_some_and(is_loopback_url)
+        })
+        .unwrap_or(worker_is_local);
+    if !worker_is_local && !reviewer_is_local {
+        return HepaPiLocalRouteDiagnostic {
+            status: HepaPiLocalRouteStatus::Cloud,
+            detail: "cloud_route".to_string(),
+            action: "No local model action required.".to_string(),
+        };
+    }
+
+    let provider = config.provider.to_ascii_lowercase();
+    let model = config.model.to_ascii_lowercase();
+    let base_url = config
+        .base_url
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let route = if config.base_url.as_deref().is_some_and(is_loopback_url) {
+        format!(
+            "{provider}/{} via {}",
+            config.model,
+            config.base_url.as_deref().unwrap_or("")
+        )
+    } else {
+        format!("{provider}/{}", config.model)
+    };
+
+    if provider == "local" && (model.contains("mlx-community") || base_url.contains(":52415")) {
+        return HepaPiLocalRouteDiagnostic {
+            status: HepaPiLocalRouteStatus::ToolCallingUnsupported,
+            detail: format!(
+                "local_tool_calling_unsupported:{route}: generic exo/Apple MLX endpoints have not proven the OpenAI tools/tool_choice/tool_calls contract Pi needs for HEPA edits"
+            ),
+            action: "Serve the local coding model through a tool-call-capable OpenAI-compatible server such as llama.cpp with --jinja, then set HEPA_PI_MODEL=llama-cpp/<model-id> and HEPA_PI_BASE_URL=http://127.0.0.1:8080/v1; keep exo/MLX routes out of release runs until they pass that tool-call contract."
+                .to_string(),
+        };
+    }
+
+    if matches!(
+        provider.as_str(),
+        "llama-cpp" | "llamacpp" | "ollama" | "vllm"
+    ) {
+        return HepaPiLocalRouteDiagnostic {
+            status: HepaPiLocalRouteStatus::ToolCallingReady,
+            detail: format!(
+                "local_tool_calling_ready:{route}: route class supports OpenAI-compatible tool calling when the served model/template is tool-capable"
+            ),
+            action: "Confirm the server is running before the stress run; for llama.cpp use llama-server with chat-template/tool-call support such as --jinja."
+                .to_string(),
+        };
+    }
+
+    HepaPiLocalRouteDiagnostic {
+        status: HepaPiLocalRouteStatus::ToolCallingUnverified,
+        detail: format!(
+            "local_tool_calling_unverified:{route}: HEPA cannot prove this local provider exposes the tool-call semantics Pi needs"
+        ),
+        action: "Use a known tool-call-capable local route for release validation, preferably llama.cpp with --jinja, or replace this provider with a wrapper that implements OpenAI tools/tool_choice/tool_calls reliably."
+            .to_string(),
     }
 }
 
@@ -128,6 +239,7 @@ pub fn adapter_spec_from_config(config: &HepaPiConfig) -> HepaAdapterSpec {
         provider_key_env: config
             .provider_key_env
             .clone()
+            .filter(|value| !value.trim().is_empty())
             .or_else(|| env_key_for_model(&config.model).map(str::to_string))
             .or_else(|| {
                 config
@@ -344,7 +456,7 @@ fn extract_message_text(value: &serde_json::Value) -> Option<String> {
 fn is_local_model(model: &str) -> bool {
     matches!(
         model.split('/').next().unwrap_or_default(),
-        "ollama" | "lmstudio" | "vllm" | "local"
+        "ollama" | "vllm" | "local" | "llama-cpp" | "llamacpp" | "mlx" | "mlx-lm"
     )
 }
 
@@ -456,6 +568,63 @@ mod tests {
         )]));
         assert_eq!(ollama.provider_key_env, None);
         assert_eq!(ollama.cost_class(), HepaAdapterCostClass::Local);
+    }
+
+    #[test]
+    fn pi_local_route_blocks_exo_mlx_without_tool_call_contract() {
+        let diagnostic = pi_local_route_diagnostic(&BTreeMap::from([
+            (
+                "HEPA_PI_MODEL".to_string(),
+                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+            ),
+            (
+                "HEPA_PI_BASE_URL".to_string(),
+                "http://127.0.0.1:52415/v1".to_string(),
+            ),
+        ]));
+
+        assert_eq!(
+            diagnostic.status,
+            HepaPiLocalRouteStatus::ToolCallingUnsupported
+        );
+        assert!(diagnostic.is_blocking());
+        assert!(diagnostic.action.contains("llama.cpp"));
+        assert!(diagnostic.action.contains("--jinja"));
+    }
+
+    #[test]
+    fn pi_local_route_accepts_llama_cpp_as_tool_call_ready() {
+        let diagnostic = pi_local_route_diagnostic(&BTreeMap::from([
+            (
+                "HEPA_PI_MODEL".to_string(),
+                "llama-cpp/gpt-oss-20b".to_string(),
+            ),
+            (
+                "HEPA_PI_BASE_URL".to_string(),
+                "http://127.0.0.1:8080/v1".to_string(),
+            ),
+        ]));
+
+        assert_eq!(diagnostic.status, HepaPiLocalRouteStatus::ToolCallingReady);
+        assert!(!diagnostic.is_blocking());
+    }
+
+    #[test]
+    fn pi_model_config_marks_llama_cpp_as_local_without_key() {
+        let llama = model_config_from_env(&BTreeMap::from([
+            (
+                "HEPA_PI_MODEL".to_string(),
+                "llama-cpp/gpt-oss-20b".to_string(),
+            ),
+            ("HEPA_PI_PROVIDER_KEY_ENV".to_string(), "".to_string()),
+            (
+                "HEPA_PI_BASE_URL".to_string(),
+                "http://127.0.0.1:8080/v1".to_string(),
+            ),
+        ]));
+
+        assert_eq!(llama.provider_key_env, None);
+        assert_eq!(llama.cost_class(), HepaAdapterCostClass::Local);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::{
+    pi::{HepaPiLocalRouteStatus, local_route_diagnostic_from_config, model_config_from_env},
     registry::HepaAdapterRegistry,
     spec::{
         HepaAdapterCostClass, HepaAdapterMode, HepaAdapterRole, HepaAdapterSandbox,
@@ -6,7 +7,12 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, env, fs, path::PathBuf, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
+    path::PathBuf,
+    process::Command,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HepaAdapterDoctorReport {
@@ -109,11 +115,12 @@ impl HepaAdapterDoctorReport {
             .filter(|check| check.status != HepaAdapterCheckStatus::Ok)
             .map(|check| {
                 format!(
-                    "{}: command={} auth={} version={} template={} sandbox={} max_concurrency={}",
+                    "{}: command={} auth={} version={} local_route={} template={} sandbox={} max_concurrency={}",
                     redact_detail(&check.adapter_id),
                     redact_detail(&check.command_presence),
                     redact_detail(&check.auth_state),
                     redact_detail(&check.version_state),
+                    redact_detail(&check.local_route_state),
                     redact_detail(&check.invocation_template),
                     check.sandbox_posture,
                     check.concurrency_cap
@@ -147,6 +154,7 @@ pub struct HepaAdapterDoctorCheck {
     pub command_presence: String,
     pub auth_state: String,
     pub version_state: String,
+    pub local_route_state: String,
     pub invocation_template: String,
     pub sandbox_posture: String,
     pub concurrency_cap: u32,
@@ -177,6 +185,13 @@ pub trait HepaAdapterDoctorProbe {
     fn command_present(&self, command: &str) -> bool;
     fn command_version(&self, command: &str) -> Option<String>;
     fn env_present(&self, name: &str) -> bool;
+    fn env_value(&self, name: &str) -> Option<String> {
+        if self.env_present(name) {
+            Some("<present>".to_string())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +217,10 @@ impl HepaAdapterDoctorProbe for HepaSystemAdapterDoctorProbe {
 
     fn env_present(&self, name: &str) -> bool {
         env::var_os(name).is_some()
+    }
+
+    fn env_value(&self, name: &str) -> Option<String> {
+        env::var(name).ok()
     }
 }
 
@@ -294,6 +313,7 @@ fn check_adapter(
     };
 
     let version_state = check_versions(spec, probe, &missing_commands, &mut status, &mut actions);
+    let local_route_state = check_pi_local_route(spec, probe, &mut status, &mut actions);
     let invocation_template = check_invocation_template(spec, &mut status, &mut actions);
     let sandbox_posture = sandbox_name(&spec.sandbox).to_string();
     if spec.max_concurrency == 0 {
@@ -307,6 +327,7 @@ fn check_adapter(
         command_presence,
         auth_state,
         version_state,
+        local_route_state,
         invocation_template,
         sandbox_posture,
         concurrency_cap: spec.max_concurrency,
@@ -315,6 +336,77 @@ fn check_adapter(
         } else {
             actions.join("; ")
         },
+    }
+}
+
+fn check_pi_local_route(
+    spec: &HepaAdapterSpec,
+    probe: &impl HepaAdapterDoctorProbe,
+    status: &mut HepaAdapterCheckStatus,
+    actions: &mut Vec<String>,
+) -> String {
+    if spec.id != "pi" {
+        return "not_applicable".to_string();
+    }
+
+    let mut environment = BTreeMap::new();
+    for key in [
+        "HEPA_PI_MODEL",
+        "HEPA_PI_REVIEW_MODEL",
+        "HEPA_PI_PROVIDER_KEY_ENV",
+        "HEPA_PI_BASE_URL",
+    ] {
+        if let Some(value) = probe
+            .env_value(key)
+            .filter(|value| !value.trim().is_empty())
+        {
+            environment.insert(key.to_string(), value);
+        }
+    }
+    if !environment.contains_key("HEPA_PI_MODEL") {
+        if let Some(model) = pi_model_from_command(&spec.command) {
+            environment.insert("HEPA_PI_MODEL".to_string(), model);
+        }
+    }
+    if !environment.contains_key("HEPA_PI_REVIEW_MODEL") {
+        if let Some(review_command) = spec.review_command.as_deref() {
+            if let Some(model) = pi_model_from_command(review_command) {
+                environment.insert("HEPA_PI_REVIEW_MODEL".to_string(), model);
+            }
+        }
+    }
+
+    let config = model_config_from_env(&environment);
+    let diagnostic = local_route_diagnostic_from_config(&config);
+    match diagnostic.status {
+        HepaPiLocalRouteStatus::Cloud => "cloud_route".to_string(),
+        HepaPiLocalRouteStatus::ToolCallingReady => "local_tool_calling_ready".to_string(),
+        HepaPiLocalRouteStatus::ToolCallingUnverified
+        | HepaPiLocalRouteStatus::ToolCallingUnsupported => {
+            *status = HepaAdapterCheckStatus::Failed;
+            actions.push(diagnostic.action);
+            diagnostic.detail
+        }
+    }
+}
+
+fn pi_model_from_command(command: &str) -> Option<String> {
+    let mut provider = None;
+    let mut model = None;
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        match token {
+            "--provider" => provider = tokens.next().map(str::to_string),
+            "--model" => model = tokens.next().map(str::to_string),
+            _ => {}
+        }
+    }
+    match (provider, model) {
+        (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+            Some(format!("{provider}/{model}"))
+        }
+        (None, Some(model)) if model.contains('/') => Some(model),
+        _ => None,
     }
 }
 
@@ -586,6 +678,7 @@ mod tests {
         commands: BTreeSet<String>,
         versions: BTreeMap<String, String>,
         env: BTreeSet<String>,
+        env_values: BTreeMap<String, String>,
     }
 
     impl HepaAdapterDoctorProbe for FakeProbe {
@@ -598,7 +691,14 @@ mod tests {
         }
 
         fn env_present(&self, name: &str) -> bool {
-            self.env.contains(name)
+            self.env.contains(name) || self.env_values.contains_key(name)
+        }
+
+        fn env_value(&self, name: &str) -> Option<String> {
+            self.env_values
+                .get(name)
+                .cloned()
+                .or_else(|| self.env.contains(name).then(|| "<present>".to_string()))
         }
     }
 
@@ -753,6 +853,65 @@ mod tests {
     }
 
     #[test]
+    fn doctor_fails_exo_mlx_pi_route_before_stress_runs() {
+        let mut probe = FakeProbe::default();
+        probe.commands.insert("pi".to_string());
+        probe
+            .versions
+            .insert("pi".to_string(), "0.79.6".to_string());
+        probe.env_values.insert(
+            "HEPA_PI_MODEL".to_string(),
+            "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+        );
+        probe.env_values.insert(
+            "HEPA_PI_BASE_URL".to_string(),
+            "http://127.0.0.1:52415/v1".to_string(),
+        );
+        let mut spec = builtin_adapter_specs().remove("pi").expect("pi spec");
+        spec.command =
+            "pi --mode json --provider local --model mlx-community/Qwen3-30B-A3B-4bit".to_string();
+        spec.required_env = vec!["HEPA_PI_BASE_URL".to_string()];
+
+        let report = HepaAdapterDoctorReport::from_specs([&spec], &probe);
+        let check = &report.checks[0];
+
+        assert_eq!(check.status, HepaAdapterCheckStatus::Failed);
+        assert!(
+            check
+                .local_route_state
+                .contains("local_tool_calling_unsupported")
+        );
+        assert!(check.action.contains("llama.cpp"));
+        assert!(check.action.contains("--jinja"));
+    }
+
+    #[test]
+    fn doctor_accepts_llama_cpp_local_pi_route() {
+        let mut probe = FakeProbe::default();
+        probe.commands.insert("pi".to_string());
+        probe
+            .versions
+            .insert("pi".to_string(), "0.79.6".to_string());
+        probe.env_values.insert(
+            "HEPA_PI_MODEL".to_string(),
+            "llama-cpp/gpt-oss-20b".to_string(),
+        );
+        probe.env_values.insert(
+            "HEPA_PI_BASE_URL".to_string(),
+            "http://127.0.0.1:8080/v1".to_string(),
+        );
+        let mut spec = builtin_adapter_specs().remove("pi").expect("pi spec");
+        spec.command = "pi --mode json --provider llama-cpp --model gpt-oss-20b".to_string();
+        spec.required_env = vec!["HEPA_PI_BASE_URL".to_string()];
+
+        let report = HepaAdapterDoctorReport::from_specs([&spec], &probe);
+        let check = &report.checks[0];
+
+        assert_eq!(check.status, HepaAdapterCheckStatus::Ok);
+        assert_eq!(check.local_route_state, "local_tool_calling_ready");
+    }
+
+    #[test]
     fn builtin_hepa_adapter_templates_do_not_compose_host_bypass_flags() {
         let context = template_context();
         let dangerous_flags = [
@@ -833,6 +992,7 @@ mod tests {
                 command_presence: format!("missing:{private_path}"),
                 auth_state: format!("missing_env:{account}"),
                 version_state: format!("drift:{private_path}"),
+                local_route_state: format!("local:{private_path}"),
                 invocation_template: format!("invalid:{account}"),
                 sandbox_posture: "agent-native".to_string(),
                 concurrency_cap: 1,
