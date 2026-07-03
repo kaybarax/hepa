@@ -119,15 +119,21 @@ hepa hermes run-ready project-1 --limit 2 --max-concurrency 2 --agent pi
 hepa fleet watch
 ```
 
-Example Hermes Desktop view while HEPA is working a Kanban task:
+Example Hermes Desktop views from real HEPA Kanban-driven work:
+
+![Hermes Kanban board overview with HEPA task lanes](docs/assets/hermes-kanban-board-overview-redacted.png)
+
+![Hermes Kanban task drawer showing HEPA task metadata and handoff comments](docs/assets/hermes-kanban-task-detail-redacted.png)
+
+![Hermes Kanban task drawer showing redacted worker activity and lane attach logs](docs/assets/hermes-kanban-live-activity-log-redacted.png)
 
 ![Hermes Kanban dashboard showing a HEPA task lane in progress](docs/assets/hermes-kanban-hepa-workflow-redacted.png)
 
 In this workflow Hermes is the visible operator surface: cards move through the
 board, task metadata stays inspectable, and the worker log area shows live lane
 activity. HEPA remains the authority for task state, lane records, validation,
-review, safe staging, and PR creation. The screenshot above is redacted to hide
-local machine paths and terminal details.
+review, safe staging, and PR creation. The screenshots above are redacted to
+hide local machine paths, hostnames, workspace locations, and terminal details.
 
 Board actions are transition *requests*; HEPA validates each before changing
 authoritative state. See [docs/hermes-kanban.md](docs/hermes-kanban.md).
