@@ -1364,7 +1364,7 @@ fn execute_live_worker_attempt(
             artifact_dir: lane_paths.lane_dir.display().to_string(),
         },
         prompt,
-        environment,
+        environment: environment.clone(),
         monitor_policy: live_monitor_policy(),
     };
     let worker_started = Instant::now();
@@ -1374,6 +1374,45 @@ fn execute_live_worker_attempt(
             write_live_adapter_stream_logs(&attempt_paths, &error.stdout, &error.stderr)?;
             let changed_files =
                 collect_changed_files(&allocation.worktree_path).unwrap_or_default();
+            if pi_local_monitor_stop_with_changed_files_can_continue(
+                adapter_id,
+                &environment,
+                &error,
+                &changed_files,
+            ) {
+                append_pi_monitor_stop_continued_stream_event(
+                    lane_paths,
+                    round,
+                    &error.sanitized_summary(),
+                    &changed_files,
+                )?;
+                let attempt = HepaAttemptReport {
+                    schema_version: CONTRACT_SCHEMA_VERSION,
+                    attempt_id: attempt_id.to_string(),
+                    lane_id: config.lane_id.clone(),
+                    task_id: config.task_id.clone(),
+                    round,
+                    role: HepaAgentRole::Worker,
+                    adapter_id: adapter_id.to_string(),
+                    status: hepa_core::contracts::HepaAttemptStatus::Completed,
+                    commands_run: vec![format!("live adapter invocation: {adapter_id}")],
+                    changed_files: changed_files.clone(),
+                    summary: live_attempt_summary(
+                        &allocation.worktree_path,
+                        &error.stdout,
+                        &error.stderr,
+                    ),
+                    blocked_reason: None,
+                    started_at: started_at.to_string(),
+                    completed_at: Some(completed_at.to_string()),
+                };
+                write_attempt(lane_paths, &attempt)?;
+                return Ok(LiveAttemptOutcome {
+                    duration_seconds: worker_started.elapsed().as_secs_f64(),
+                    changed_files,
+                    usage_entries: Vec::new(),
+                });
+            }
             let attempt = HepaAttemptReport {
                 schema_version: CONTRACT_SCHEMA_VERSION,
                 attempt_id: attempt_id.to_string(),
@@ -1444,6 +1483,11 @@ fn execute_live_worker_attempt(
                         &changed_files,
                     )?;
                 } else {
+                    let blocked_reason = pi_local_provider_output_failure_reason(
+                        &error.to_string(),
+                        &result.stdout,
+                        &result.stderr,
+                    );
                     let attempt = HepaAttemptReport {
                         schema_version: CONTRACT_SCHEMA_VERSION,
                         attempt_id: attempt_id.to_string(),
@@ -1460,16 +1504,12 @@ fn execute_live_worker_attempt(
                             &result.stdout,
                             &result.stderr,
                         ),
-                        blocked_reason: Some(format!(
-                            "local_provider_empty_or_malformed_response: {error}"
-                        )),
+                        blocked_reason: Some(blocked_reason.clone()),
                         started_at: started_at.to_string(),
                         completed_at: Some(completed_at.to_string()),
                     };
                     write_attempt(lane_paths, &attempt)?;
-                    return Err(format!(
-                        "local_provider_empty_or_malformed_response: {error}"
-                    ));
+                    return Err(blocked_reason);
                 }
             }
         }
@@ -1622,9 +1662,109 @@ fn append_pi_truncated_stream_event(
     file.flush().map_err(|error| error.to_string())
 }
 
+fn append_pi_monitor_stop_continued_stream_event(
+    lane_paths: &hepa_core::artifacts::HepaLaneArtifactPaths,
+    round: u32,
+    error: &str,
+    changed_files: &[String],
+) -> Result<(), String> {
+    let stream_path = lane_paths
+        .lane_dir
+        .join("streams")
+        .join("manager-tool-summary-stream.jsonl");
+    if let Some(parent) = stream_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stream_path)
+        .map_err(|error| error.to_string())?;
+    let event = serde_json::json!({
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "source": "hepa-manager",
+        "event": "pi_local_monitor_stop_with_changes_continued",
+        "round": round,
+        "error": bounded_model_visible_summary(error),
+        "changed_files": changed_files,
+        "policy": "Local Pi stopped on the monitor budget after producing changed files; HEPA continued to manager-owned validation/review instead of discarding the attempt."
+    });
+    serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())
+}
+
 fn pi_parse_error_is_eof_truncation(error: &hepa_adapters::pi::HepaPiParseError) -> bool {
     let message = error.to_string();
     message.contains("EOF while parsing")
+}
+
+fn pi_local_monitor_stop_with_changed_files_can_continue(
+    adapter_id: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+    error: &hepa_adapters::engine::HepaAdapterExecutionError,
+    changed_files: &[String],
+) -> bool {
+    adapter_id == "pi"
+        && !changed_files.is_empty()
+        && pi_worker_model_needs_local_permit(environment)
+        && error.status.as_deref() == Some("blocked")
+        && error.field == "monitor"
+        && (error.message.contains("stall:") || error.message.contains("timeout:"))
+}
+
+fn pi_local_provider_output_failure_reason(error: &str, stdout: &str, stderr: &str) -> String {
+    if pi_local_provider_output_indicates_context_overflow(error, stdout, stderr) {
+        format!(
+            "local_provider_context_window_exceeded: {}",
+            bounded_model_visible_summary(error)
+        )
+    } else if pi_local_provider_output_indicates_tool_protocol_failure(error, stdout, stderr) {
+        format!(
+            "local_provider_tool_call_protocol_error: {}",
+            bounded_model_visible_summary(error)
+        )
+    } else {
+        format!(
+            "local_provider_empty_or_malformed_response: {}",
+            bounded_model_visible_summary(error)
+        )
+    }
+}
+
+fn pi_local_provider_output_indicates_context_overflow(
+    error: &str,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    let combined = format!("{error}\n{stdout}\n{stderr}").to_ascii_lowercase();
+    [
+        "exceeds the available context size",
+        "context window",
+        "context length exceeded",
+        "maximum context length",
+        "maximum context",
+        "too many tokens",
+        "token limit",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
+}
+
+fn pi_local_provider_output_indicates_tool_protocol_failure(
+    error: &str,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    let combined = format!("{error}\n{stdout}\n{stderr}").to_ascii_lowercase();
+    [
+        "peg-native format",
+        "does not match the expected",
+        "invalid_tool",
+        "malformed tool",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
 }
 
 fn bounded_model_visible_summary(message: &str) -> String {
@@ -2253,13 +2393,15 @@ fn repo_privacy_rules() -> &'static str {
 }
 
 fn pi_local_provider_bounded_task_rules() -> &'static str {
-    "\nLocal-provider bounded task rules:\n- Keep the first attempt small and direct: inspect only the files needed for the task, edit the smallest existing file set that satisfies it, then stop.\n- Prefer grep/find and targeted reads over reading large test, lockfile, bundle, or generated files into context.\n- Do not create new styling, helper, config, package manager, lockfile, or test-support files unless the task explicitly requires them or no existing file can satisfy the acceptance criteria.\n- Do not run dependency installs or package-manager commands that can rewrite lockfiles.\n- Do not run validation commands yourself; HEPA's manager owns validation after your edit and will run the task's validation commands.\n- If you cannot find the correct file after a few targeted reads/finds, report the blocker instead of looping.\n"
+    "\nLocal-provider bounded task rules:\n- Keep the first attempt small and direct: inspect only the files needed for the task, edit the smallest existing file set that satisfies it, then stop.\n- Use at most a few targeted grep/find/read calls before editing; never repeatedly re-read the same broad tree or file family.\n- Prefer grep/find and targeted reads over reading large test, lockfile, bundle, build-output, archive, or generated files into context.\n- Do not create new styling, helper, config, package manager, lockfile, or test-support files unless the task explicitly requires them or no existing file can satisfy the acceptance criteria.\n- Do not run dependency installs or package-manager commands that can rewrite lockfiles.\n- Do not run validation commands yourself; HEPA's manager owns validation after your edit and will run the task's validation commands.\n- Keep the final response concise: changed files, what changed, and any blocker. Do not include reasoning traces, transcript-like notes, or repeated planning.\n- If you cannot find the correct file after a few targeted reads/finds, report the blocker instead of looping.\n"
 }
 
 fn pi_model_needs_no_think_suffix(model: &str, base_url: &Option<String>) -> bool {
     let model = model.to_ascii_lowercase();
-    let is_qwen = model.contains("qwen");
-    is_qwen && pi_model_is_local(&model, base_url)
+    let is_reasoning_local_model = ["qwen", "gpt-oss", "deepseek-r1", "reasoning", "r1-", "-r1"]
+        .iter()
+        .any(|needle| model.contains(needle));
+    is_reasoning_local_model && pi_model_is_local(&model, base_url)
 }
 
 fn pi_model_is_local(model: &str, base_url: &Option<String>) -> bool {
@@ -5155,7 +5297,7 @@ mod tests {
     }
 
     #[test]
-    fn live_worker_prompt_adds_bounded_rules_without_no_think_for_local_llama_cpp_pi() {
+    fn live_worker_prompt_adds_bounded_rules_without_no_think_for_non_reasoning_local_pi() {
         let config = hepa_core::config::HepaConfig::load(
             None,
             &std::collections::BTreeMap::new(),
@@ -5174,6 +5316,26 @@ mod tests {
         assert!(prompt.contains("targeted reads"));
         assert!(prompt.contains("Do not run validation commands yourself"));
         assert!(!prompt.contains("/no_think"));
+    }
+
+    #[test]
+    fn live_worker_prompt_adds_no_think_for_local_gpt_oss_pi() {
+        let config = hepa_core::config::HepaConfig::load(
+            None,
+            &std::collections::BTreeMap::new(),
+            HepaConfigOverrides {
+                pi_model: Some("llama-cpp/gpt-oss-20b".to_string()),
+                pi_base_url: Some(Some("http://127.0.0.1:8080/v1".to_string())),
+                ..HepaConfigOverrides::default()
+            },
+        )
+        .expect("config should load");
+
+        let prompt = live_worker_prompt_for_adapter("Update README.md", "pi", &config);
+
+        assert!(prompt.contains("Local-provider bounded task rules"));
+        assert!(prompt.contains("Do not include reasoning traces"));
+        assert!(prompt.contains("/no_think"));
     }
 
     #[test]
@@ -5225,7 +5387,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_local_detection_covers_llama_cpp_without_no_think() {
+    fn pi_local_detection_covers_llama_cpp_reasoning_models() {
         let base_url = Some("http://127.0.0.1:8080/v1".to_string());
 
         assert!(pi_model_is_local("llama-cpp/devstral-small-24b", &None));
@@ -5241,9 +5403,37 @@ mod tests {
             &base_url
         ));
         assert!(pi_model_needs_no_think_suffix(
+            "llama-cpp/gpt-oss-20b",
+            &base_url
+        ));
+        assert!(pi_model_needs_no_think_suffix(
             "local/mlx-community/Qwen3-30B-A3B-4bit",
             &base_url
         ));
+    }
+
+    #[test]
+    fn pi_local_provider_context_overflow_is_classified_distinctly() {
+        let reason = pi_local_provider_output_failure_reason(
+            "agent_end missing final assistant message",
+            r#"{"type":"agent_start"}"#,
+            "request (16862 tokens) exceeds the available context size (16384)",
+        );
+
+        assert!(reason.contains("local_provider_context_window_exceeded"));
+        assert!(!reason.contains("local_provider_empty_or_malformed_response"));
+    }
+
+    #[test]
+    fn pi_local_provider_tool_protocol_failure_is_classified_distinctly() {
+        let reason = pi_local_provider_output_failure_reason(
+            "agent_end missing final assistant message",
+            r#"{"type":"message","errorMessage":"The model produced output that does not match the expected peg-native format"}"#,
+            "",
+        );
+
+        assert!(reason.contains("local_provider_tool_call_protocol_error"));
+        assert!(!reason.contains("local_provider_empty_or_malformed_response"));
     }
 
     #[test]
@@ -7366,6 +7556,63 @@ JSON
             .expect("permit decision")
             .is_none()
         );
+    }
+
+    #[test]
+    fn local_pi_monitor_stop_with_changes_can_continue_only_for_local_pi() {
+        let local_environment = std::collections::BTreeMap::from([(
+            "HEPA_PI_MODEL".to_string(),
+            "llama-cpp/devstral-small-24b".to_string(),
+        )]);
+        let cloud_environment = std::collections::BTreeMap::from([(
+            "HEPA_PI_MODEL".to_string(),
+            "deepseek/deepseek-chat".to_string(),
+        )]);
+        let stall_error = hepa_adapters::engine::HepaAdapterExecutionError {
+            field: "monitor".to_string(),
+            message: "stall: stall budget exceeded".to_string(),
+            status: Some("blocked".to_string()),
+            stdout: "partial local output".to_string(),
+            stderr: String::new(),
+        };
+        let command_error = hepa_adapters::engine::HepaAdapterExecutionError {
+            field: "command".to_string(),
+            message: "failed".to_string(),
+            status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+
+        assert!(pi_local_monitor_stop_with_changed_files_can_continue(
+            "pi",
+            &local_environment,
+            &stall_error,
+            &["src/example.ts".to_string()]
+        ));
+        assert!(!pi_local_monitor_stop_with_changed_files_can_continue(
+            "pi",
+            &local_environment,
+            &stall_error,
+            &[]
+        ));
+        assert!(!pi_local_monitor_stop_with_changed_files_can_continue(
+            "pi",
+            &cloud_environment,
+            &stall_error,
+            &["src/example.ts".to_string()]
+        ));
+        assert!(!pi_local_monitor_stop_with_changed_files_can_continue(
+            "custom",
+            &local_environment,
+            &stall_error,
+            &["src/example.ts".to_string()]
+        ));
+        assert!(!pi_local_monitor_stop_with_changed_files_can_continue(
+            "pi",
+            &local_environment,
+            &command_error,
+            &["src/example.ts".to_string()]
+        ));
     }
 
     #[test]
