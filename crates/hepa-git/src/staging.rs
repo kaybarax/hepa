@@ -554,6 +554,7 @@ fn is_documented_secret_placeholder(value: &str) -> bool {
         || normalized == "test-jwt-key"
         || normalized == "test-jwt-key-for-gateway"
         || normalized == "bearer token"
+        || normalized == "bearer test-token"
         || normalized == "bearer <token>"
         || normalized == "bearer your-token"
         || normalized == "nope"
@@ -927,7 +928,7 @@ mod tests {
         let repo = unique_test_dir("stage-content-bearer-token-test");
         init_repo(&repo);
         fs::create_dir_all(repo.join("apps/api-gateway/src/__tests__")).expect("test dir");
-        let content = "process.env.JWT_SECRET = 'test-jwt-key';\nprocess.env.JWT_SECRET = process.env.JWT_SECRET ?? 'test-jwt-key-for-gateway';\nconst request = new Request('http://gateway.local', {\n  headers: {\n    authorization: 'Bearer token',\n    'x-secret-debug': 'nope',\n  },\n});\nexpect(headers.get('authorization')).toBe('Bearer token');\nexpect(headers.get('x-secret-debug')).toBeNull();\n";
+        let content = "process.env.JWT_SECRET = 'test-jwt-key';\nprocess.env.JWT_SECRET = process.env.JWT_SECRET ?? 'test-jwt-key-for-gateway';\nconst request = new Request('http://gateway.local', {\n  headers: {\n    authorization: 'Bearer token',\n    authorization: 'Bearer test-token',\n    'x-secret-debug': 'nope',\n  },\n});\nexpect(headers.get('authorization')).toBe('Bearer token');\nexpect(headers.get('x-secret-debug')).toBeNull();\n";
         assert_eq!(
             classify_staging_path("apps/api-gateway/src/__tests__/route-proxy.test.ts"),
             None
