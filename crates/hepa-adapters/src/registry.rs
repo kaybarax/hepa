@@ -272,7 +272,7 @@ mod tests {
         let config = HepaConfig::load(
             Some(
                 r#"
-                HEPA_PI_MODEL=ollama/qwen2.5-coder
+                HEPA_PI_MODEL=ollama/tool-coder
                 HEPA_PI_PROVIDER_KEY_ENV=
                 HEPA_PI_BASE_URL=http://127.0.0.1:11434/v1
                 "#,
@@ -285,7 +285,7 @@ mod tests {
         let pi = registry.get("pi").expect("pi adapter");
 
         assert!(pi.command.contains("--provider ollama"));
-        assert!(pi.command.contains("--model qwen2.5-coder"));
+        assert!(pi.command.contains("--model tool-coder"));
         assert_eq!(pi.required_env, vec!["HEPA_PI_BASE_URL".to_string()]);
         assert_eq!(pi.cost_class, HepaAdapterCostClass::Local);
 

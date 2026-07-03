@@ -4,9 +4,8 @@
 [HOCA](https://github.com/kaybarax/hoca)) is an independent, Rust-first
 engineering automation system: Hermes coordinates the fleet, and the **Pi
 Coding Agent** ([pi.dev](https://pi.dev), MIT) is the built-in default harness
-that does the actual coding — so cloud models (e.g. DeepSeek) and
-tool-call-capable local models (e.g. via llama.cpp, Ollama, or vLLM) use the
-same adapter path without wiring your own CLI.
+that does the actual coding — so any agentic, tool-call-capable cloud or local
+model route uses the same adapter path without wiring your own CLI.
 
 HEPA stays **agent-agnostic**: Pi is the default and namesake, **not** a hard
 requirement. Every implementation/review agent — Pi, Claude Code, Codex, custom,
@@ -79,9 +78,10 @@ hepa doctor
 # Install and use the default Pi harness.
 hepa adapter install pi
 export HEPA_DEFAULT_ADAPTER=pi
-export HEPA_PI_MODEL=deepseek/deepseek-chat
+export HEPA_PI_MODEL=<provider>/<tool-call-capable-model>
 export HEPA_PI_REVIEW_MODEL=
-export DEEPSEEK_API_KEY=...
+export HEPA_PI_PROVIDER_KEY_ENV=<PROVIDER_API_KEY_ENV>
+export PROVIDER_API_KEY_ENV=...
 export HEPA_PI_BASE_URL=
 hepa run /path/to/repo "Fix login redirect" --agent pi
 ```
@@ -103,7 +103,7 @@ export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:8080/v1
 ```
 
-When switching a working tree from a local Pi profile back to DeepSeek/cloud,
+When switching a working tree from a local Pi profile back to a cloud profile,
 clear stale local overrides such as `HEPA_PI_REVIEW_MODEL` and
 `HEPA_PI_BASE_URL`; empty values intentionally override `.env` entries.
 
@@ -157,12 +157,11 @@ in that flow, but review is performed by Hermes reviewer profiles.
 ## Adapter Setup and Routing
 
 The **Pi adapter** is the batteries-included default harness: `hepa adapter
-install pi` installs it and you route it to any model — DeepSeek and other
-clouds directly, or tool-call-capable local models via llama.cpp, Ollama, or
-vLLM. Because all execution and review route through the adapter contract, you
-can use Pi, Claude Code, Codex, custom, or local adapters interchangeably — no
-feature hard-requires a specific vendor CLI. Built-in adapters, the Pi setup,
-custom adapter
+install pi` installs it and you route it to any agentic, tool-call-capable model
+route — cloud or local. Because all execution and review route through the
+adapter contract, you can use Pi, Claude Code, Codex, custom, or local adapters
+interchangeably — no feature hard-requires a specific vendor CLI. Built-in
+adapters, the Pi setup, custom adapter
 requirements, version pinning, and `hepa adapter doctor` troubleshooting are
 documented in [docs/adapters.md](docs/adapters.md).
 

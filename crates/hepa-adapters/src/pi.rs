@@ -111,13 +111,14 @@ pub fn model_config_from_env(
 ) -> HepaPiModelConfig {
     let model = environment
         .get("HEPA_PI_MODEL")
+        .filter(|value| !value.trim().is_empty())
         .cloned()
-        .unwrap_or_else(|| "deepseek/deepseek-chat".to_string());
+        .unwrap_or_default();
     let provider = model
         .split('/')
         .next()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("deepseek")
+        .unwrap_or_default()
         .to_string();
     let model = model
         .split_once('/')
@@ -154,6 +155,14 @@ pub fn pi_local_route_diagnostic(
 pub fn local_route_diagnostic_from_config(
     config: &HepaPiModelConfig,
 ) -> HepaPiLocalRouteDiagnostic {
+    if config.provider.trim().is_empty() || config.model.trim().is_empty() {
+        return HepaPiLocalRouteDiagnostic {
+            status: HepaPiLocalRouteStatus::Cloud,
+            detail: "pi_model_not_configured".to_string(),
+            action: "Set HEPA_PI_MODEL to a tool-call-capable cloud or local model route before running Pi.".to_string(),
+        };
+    }
+
     let worker_model = format!("{}/{}", config.provider, config.model);
     let worker_is_local =
         is_local_model(&worker_model) || config.base_url.as_deref().is_some_and(is_loopback_url);
@@ -225,6 +234,10 @@ pub fn local_route_diagnostic_from_config(
 }
 
 pub fn adapter_spec_from_config(config: &HepaPiConfig) -> HepaAdapterSpec {
+    if config.model.trim().is_empty() {
+        return builtin_adapter_spec(PI_ADAPTER_ID);
+    }
+
     let (provider, model) = split_provider_model(&config.model);
     let (review_provider, review_model) = config
         .review_model
@@ -472,7 +485,7 @@ fn split_provider_model(value: &str) -> (String, String) {
         Some((provider, model)) if !provider.trim().is_empty() && !model.trim().is_empty() => {
             (provider.to_string(), model.to_string())
         }
-        _ => ("deepseek".to_string(), value.to_string()),
+        _ => ("provider".to_string(), value.to_string()),
     }
 }
 
@@ -552,19 +565,21 @@ mod tests {
 
     #[test]
     fn model_config_derives_provider_key_and_cost_class() {
-        let deepseek = model_config_from_env(&BTreeMap::from([(
+        let cloud = model_config_from_env(&BTreeMap::from([(
             "HEPA_PI_MODEL".to_string(),
-            "deepseek/deepseek-chat".to_string(),
+            "openai/gpt-4.1".to_string(),
         )]));
-        assert_eq!(
-            deepseek.provider_key_env.as_deref(),
-            Some("DEEPSEEK_API_KEY")
-        );
-        assert_eq!(deepseek.cost_class(), HepaAdapterCostClass::PaidCloud);
+        assert_eq!(cloud.provider_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(cloud.cost_class(), HepaAdapterCostClass::PaidCloud);
+
+        let missing = model_config_from_env(&BTreeMap::new());
+        assert_eq!(missing.provider, "");
+        assert_eq!(missing.model, "");
+        assert_eq!(missing.provider_key_env, None);
 
         let ollama = model_config_from_env(&BTreeMap::from([(
             "HEPA_PI_MODEL".to_string(),
-            "ollama/qwen2.5-coder".to_string(),
+            "ollama/tool-coder".to_string(),
         )]));
         assert_eq!(ollama.provider_key_env, None);
         assert_eq!(ollama.cost_class(), HepaAdapterCostClass::Local);
@@ -575,7 +590,7 @@ mod tests {
         let diagnostic = pi_local_route_diagnostic(&BTreeMap::from([
             (
                 "HEPA_PI_MODEL".to_string(),
-                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+                "local/mlx-community/reasoning-coder-30b".to_string(),
             ),
             (
                 "HEPA_PI_BASE_URL".to_string(),
@@ -597,7 +612,7 @@ mod tests {
         let diagnostic = pi_local_route_diagnostic(&BTreeMap::from([
             (
                 "HEPA_PI_MODEL".to_string(),
-                "llama-cpp/gpt-oss-20b".to_string(),
+                "llama-cpp/reasoning-coder-20b".to_string(),
             ),
             (
                 "HEPA_PI_BASE_URL".to_string(),
@@ -614,7 +629,7 @@ mod tests {
         let llama = model_config_from_env(&BTreeMap::from([
             (
                 "HEPA_PI_MODEL".to_string(),
-                "llama-cpp/gpt-oss-20b".to_string(),
+                "llama-cpp/reasoning-coder-20b".to_string(),
             ),
             ("HEPA_PI_PROVIDER_KEY_ENV".to_string(), "".to_string()),
             (
@@ -630,14 +645,14 @@ mod tests {
     #[test]
     fn pi_adapter_spec_follows_model_config() {
         let spec = adapter_spec_from_config(&HepaPiConfig {
-            model: "ollama/qwen2.5-coder".to_string(),
-            review_model: Some("ollama/qwen2.5-coder-review".to_string()),
+            model: "ollama/tool-coder".to_string(),
+            review_model: Some("ollama/tool-coder-review".to_string()),
             provider_key_env: None,
             base_url: Some("http://127.0.0.1:11434/v1".to_string()),
         });
 
         assert!(spec.command.contains("--provider ollama"));
-        assert!(spec.command.contains("--model qwen2.5-coder"));
+        assert!(spec.command.contains("--model tool-coder"));
         assert!(spec.command.contains("--no-approve"));
         assert!(!spec.command.contains("--approve "));
         assert_eq!(
@@ -663,8 +678,8 @@ mod tests {
     #[test]
     fn pi_adapter_spec_allows_local_worker_with_cloud_reviewer() {
         let spec = adapter_spec_from_config(&HepaPiConfig {
-            model: "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
-            review_model: Some("deepseek/deepseek-chat".to_string()),
+            model: "local/mlx-community/reasoning-coder-30b".to_string(),
+            review_model: Some("openai/gpt-4.1".to_string()),
             provider_key_env: None,
             base_url: Some("http://127.0.0.1:52415/v1".to_string()),
         });
@@ -672,26 +687,23 @@ mod tests {
         assert!(spec.command.contains("--provider local"));
         assert!(
             spec.command
-                .contains("--model mlx-community/Qwen3-30B-A3B-4bit")
+                .contains("--model mlx-community/reasoning-coder-30b")
         );
         assert!(
             spec.review_command
                 .as_deref()
                 .unwrap()
-                .contains("--provider deepseek")
+                .contains("--provider openai")
         );
         assert!(
             spec.review_command
                 .as_deref()
                 .unwrap()
-                .contains("--model deepseek-chat")
+                .contains("--model gpt-4.1")
         );
         assert_eq!(
             spec.required_env,
-            vec![
-                "DEEPSEEK_API_KEY".to_string(),
-                "HEPA_PI_BASE_URL".to_string()
-            ]
+            vec!["HEPA_PI_BASE_URL".to_string(), "OPENAI_API_KEY".to_string()]
         );
         assert_eq!(spec.cost_class, HepaAdapterCostClass::PaidCloud);
     }

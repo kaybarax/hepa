@@ -20,7 +20,7 @@ hepa:
   workspace_root: "~/<path-to-target-repos>"
   hepa_repo: "~/<path-to-workspace>/hepa"
   default_worker_adapter: "pi"
-  default_model: "deepseek-chat"
+  default_model: "tool-call-capable-model"
 
   safety:
     auto_merge: false

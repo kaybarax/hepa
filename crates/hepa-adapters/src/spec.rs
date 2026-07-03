@@ -588,7 +588,7 @@ mod tests {
             review_command: None,
             workdir: "{worktree}".to_string(),
             required_commands: vec!["pi".to_string()],
-            required_env: vec!["DEEPSEEK_API_KEY".to_string()],
+            required_env: vec!["OPENAI_API_KEY".to_string()],
             sandbox: HepaAdapterSandbox::None,
             supports_resume: true,
             supports_json_output: true,

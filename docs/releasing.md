@@ -37,13 +37,15 @@ Download the archive for your platform from the GitHub Release, verify it
 against `SHA256SUMS.txt`, extract it, and place `hepa` on your `PATH`.
 
 Using HEPA's default Pi harness still requires Pi and a configured model route:
-provider credentials for cloud models such as DeepSeek, or a tool-call-capable
-loopback local endpoint such as llama.cpp with chat-template/tool-call support,
-Ollama, or vLLM. Run `hepa doctor` before release stress runs; known-weak or
-unverified generic local endpoints must be fixed or replaced before they count
-as local-model release evidence. The v1.0.0 release gate is the Hermes-present
-cloud Pi route; local-model-only heavy stress is tracked as post-release
-hardening unless fresh local evidence is attached to a later release.
+provider credentials for a cloud model, or a tool-call-capable loopback local
+endpoint such as llama.cpp with chat-template/tool-call support, Ollama, or
+vLLM. The selected model must be agentic enough for repository work and must
+support tool calling/tool use. Run `hepa doctor` before release stress runs;
+known-weak or unverified generic local endpoints must be fixed or replaced
+before they count as local-model release evidence. The v1.0.0 release gate is a
+Hermes-present cloud Pi route; local-model-only heavy stress is tracked as
+post-release hardening unless fresh local evidence is attached to a later
+release.
 
 ## Source Fallback
 

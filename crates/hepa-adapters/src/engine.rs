@@ -990,17 +990,17 @@ env | sort > "$out"
             crate::pi::PI_ADAPTER_ID,
             vec![HepaAdapterRole::Worker, HepaAdapterRole::Reviewer],
             format!(
-                "{} --provider llama-cpp --model devstral --out {{output_file}}",
+                "{} --provider llama-cpp --model local-tool-coder --out {{output_file}}",
                 script.display()
             ),
             Some(format!(
-                "{} --provider deepseek --model deepseek-chat --out {{review_output_file}}",
+                "{} --provider openai --model gpt-4.1 --out {{review_output_file}}",
                 script.display()
             )),
-            vec!["DEEPSEEK_API_KEY".to_string()],
+            vec!["OPENAI_API_KEY".to_string()],
         );
         let environment = BTreeMap::from([(
-            "DEEPSEEK_API_KEY".to_string(),
+            "OPENAI_API_KEY".to_string(),
             "reviewer-only-secret".to_string(),
         )]);
         let context = template_context(&worktree, &artifact_dir, &worker_output);
@@ -1031,17 +1031,17 @@ env | sort > "$out"
 
         assert_eq!(worker.exit_code, Some(0));
         assert_eq!(reviewer.exit_code, Some(0));
-        assert!(!worker_env.contains("DEEPSEEK_API_KEY"));
+        assert!(!worker_env.contains("OPENAI_API_KEY"));
         assert!(
             !worker
                 .allowed_env_keys
-                .contains(&"DEEPSEEK_API_KEY".to_string())
+                .contains(&"OPENAI_API_KEY".to_string())
         );
-        assert!(reviewer_env.contains("DEEPSEEK_API_KEY=reviewer-only-secret"));
+        assert!(reviewer_env.contains("OPENAI_API_KEY=reviewer-only-secret"));
         assert!(
             reviewer
                 .allowed_env_keys
-                .contains(&"DEEPSEEK_API_KEY".to_string())
+                .contains(&"OPENAI_API_KEY".to_string())
         );
 
         remove_test_dir(root);

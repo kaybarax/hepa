@@ -98,7 +98,7 @@ pub fn import_markdown_spec(markdown: &str) -> Result<HepaImportedSpec, HepaSpec
             }
             TaskSection::Validation => {
                 task.validation_commands
-                    .push(strip_list_marker(line).to_string());
+                    .push(normalize_validation_command(strip_list_marker(line)));
             }
             TaskSection::Dependencies => {
                 task.dependencies.push(strip_list_marker(line).to_string());
@@ -256,7 +256,7 @@ impl TaskBuilder {
             dependencies: self.dependencies.clone(),
             target_branch: None,
             risk_level: HepaRiskLevel::Low,
-            max_total_rounds: 1,
+            max_total_rounds: 3,
             created_at: created_at.clone(),
         };
         let fleet_task = HepaFleetTask {
@@ -319,6 +319,16 @@ fn strip_list_marker(line: &str) -> &str {
         .trim()
 }
 
+fn normalize_validation_command(command: &str) -> String {
+    let command = command.trim();
+    command
+        .strip_prefix('`')
+        .and_then(|value| value.strip_suffix('`'))
+        .unwrap_or(command)
+        .trim()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +377,30 @@ Dependencies:
         assert_eq!(task.task_spec.validation_commands, vec!["cargo test"]);
         assert_eq!(task.fleet_task.status, HepaTaskStatus::Draft);
         assert_eq!(task.fleet_task.readiness, HepaReadinessState::NotReady);
+    }
+
+    #[test]
+    fn markdown_spec_import_strips_inline_code_ticks_from_validation_commands() {
+        let spec = r#"
+Project: project-1
+
+## Task: task-1: Validate shell commands
+Acceptance:
+- Commands are stored in executable form.
+Validation:
+- `pnpm --filter @todo/api-gateway test -- route-proxy app`
+- `git diff --check`
+"#;
+
+        let imported = import_markdown_spec(spec).expect("spec should import");
+
+        assert_eq!(
+            imported.tasks[0].task_spec.validation_commands,
+            vec![
+                "pnpm --filter @todo/api-gateway test -- route-proxy app",
+                "git diff --check"
+            ]
+        );
     }
 
     #[test]

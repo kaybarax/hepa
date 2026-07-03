@@ -20,9 +20,9 @@ An adapter spec (`HepaAdapterSpec`) declares:
 - `capabilities`, `cost_class`, `resource_weight`, `max_concurrency`
 
 Specs are validated and reject manager-only `required_env` entries and invalid
-placeholders. Provider key names such as `DEEPSEEK_API_KEY` are allowed as
-adapter env allowlist entries; manager credentials such as `GITHUB_TOKEN` are
-not.
+placeholders. Configured provider key names such as `PROVIDER_API_KEY` are
+allowed as adapter env allowlist entries; manager credentials such as
+`GITHUB_TOKEN` are not.
 
 ## Built-in adapters
 
@@ -69,15 +69,15 @@ to `streams/worker-adapter-stream.jsonl` or
 `streams/reviewer-adapter-stream.jsonl` under the lane artifact directory so
 parallel lanes have tail-able live logs.
 
-DeepSeek cloud:
+Cloud model route:
 
 ```bash
 export HEPA_DEFAULT_ADAPTER=pi
-export HEPA_PI_MODEL=deepseek/deepseek-chat
+export HEPA_PI_MODEL=<provider>/<tool-call-capable-model>
 export HEPA_PI_REVIEW_MODEL=
-export HEPA_PI_PROVIDER_KEY_ENV=DEEPSEEK_API_KEY
+export HEPA_PI_PROVIDER_KEY_ENV=<PROVIDER_API_KEY_ENV>
 export HEPA_PI_BASE_URL=
-export DEEPSEEK_API_KEY=...
+export PROVIDER_API_KEY_ENV=...
 ```
 
 Empty Pi environment values deliberately clear optional `.env` settings. Use
@@ -108,11 +108,11 @@ tool-result messages. `hepa doctor` and live Pi preflight block this route with
 an actionable diagnostic instead of letting a heavy run stall or complete with
 no repository edits.
 
-Ollama-compatible local:
+OpenAI-compatible local:
 
 ```bash
 export HEPA_DEFAULT_ADAPTER=pi
-export HEPA_PI_MODEL=ollama/qwen2.5-coder
+export HEPA_PI_MODEL=ollama/<tool-call-capable-model>
 export HEPA_PI_PROVIDER_KEY_ENV=
 export HEPA_PI_BASE_URL=http://127.0.0.1:11434/v1
 ```

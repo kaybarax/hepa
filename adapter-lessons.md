@@ -5,10 +5,10 @@
 - Pi local OpenAI-compatible providers should be configured in Pi's user
   `models.json` with `api=openai-completions`; provider keys for loopback
   routes can be inert placeholders and should not become manager credentials.
-- Local Qwen-compatible endpoints, including exo + Apple MLX routes, can be
+- Local reasoning-model endpoints, including exo + Apple MLX routes, can be
   reachable and still fail live editing when they stream only hidden reasoning.
-  HEPA now appends a Pi-only, local Qwen no-think prompt boundary so the worker
-  produces content before the deterministic stall monitor fires.
+  HEPA now appends a Pi-only, local reasoning-model no-think prompt boundary so
+  the worker produces content before the deterministic stall monitor fires.
 - Non-fake adapters must always route through live adapter execution. A CLI
   dispatch path that treats only Pi as live is an agnosticism defect, even if
   fake tests continue to pass.

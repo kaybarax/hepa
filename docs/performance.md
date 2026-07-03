@@ -26,8 +26,8 @@ hidden per-attempt wrappers in this counter.
 Pi is the default one-loop harness. HEPA invokes
 `pi --no-approve --no-session --no-extensions --no-skills --no-prompt-templates --no-context-files -p --mode json --model ...`
 once per worker or reviewer attempt, feeds the prompt on stdin, and captures the
-JSON event stream from stdout into the lane artifact. DeepSeek and other cloud
-routes count as paid-cloud lanes; tool-call-capable loopback endpoints such as
+JSON event stream from stdout into the lane artifact. Cloud model routes count
+as paid-cloud lanes; tool-call-capable loopback endpoints such as
 llama.cpp, Ollama, vLLM, and no-key routes count as local lanes and can satisfy
 `local-only` projects once they pass the Pi tool-call readiness gate. Container
 count remains zero for trusted host-worktree runs and becomes one only when
@@ -42,9 +42,9 @@ machine paths, branch names, and operator identifiers are intentionally omitted.
 
 | Configuration | Scope | Max concurrency | Result | Wall time | Max RSS | Peak footprint | PR lifecycle |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
-| Pi + DeepSeek worker/reviewer | 3 jobs | 3 | 3 succeeded / 0 failed | 24.43 s | 191.8 MiB | 15.5 MiB | PRs opened, then closed/cleaned |
-| Pi + DeepSeek worker/reviewer, Hermes-present | 3 jobs | 3 | 2 succeeded / 1 safety-blocked | 97.97 s | 321.3 MiB | 52.2 MiB | PRs opened for successful lanes, then closed/cleaned |
-| Pi + DeepSeek worker/reviewer, multi-project/multi-task | 2 repos / 4 jobs | 4 | 4 succeeded / 0 failed | 19.54 s | 196.1 MiB | 14.7 MiB | PRs opened, then closed/cleaned |
+| Pi + configured cloud worker/reviewer | 3 jobs | 3 | 3 succeeded / 0 failed | 24.43 s | 191.8 MiB | 15.5 MiB | PRs opened, then closed/cleaned |
+| Pi + configured cloud worker/reviewer, Hermes-present | 3 jobs | 3 | 2 succeeded / 1 safety-blocked | 97.97 s | 321.3 MiB | 52.2 MiB | PRs opened for successful lanes, then closed/cleaned |
+| Pi + configured cloud worker/reviewer, multi-project/multi-task | 2 repos / 4 jobs | 4 | 4 succeeded / 0 failed | 19.54 s | 196.1 MiB | 14.7 MiB | PRs opened, then closed/cleaned |
 
 Wall time is elapsed clock time for the whole fleet run, not the sum of
 per-lane durations. Because lanes run concurrently, it represents what an
@@ -53,9 +53,10 @@ PRs, records evidence, and reaches terminal state for the fleet batch.
 
 Interpretation:
 
-- DeepSeek-only is the v1.0.0 release-gated route. It completed the multi-job
-  cloud matrix and the Hermes-present multi-project/multi-task stress run, with
-  one safety-blocked lane correctly stopped by the deterministic secret monitor.
+- The configured cloud route is the v1.0.0 release-gated route. It completed the
+  multi-job cloud matrix and the Hermes-present multi-project/multi-task stress
+  run, with one safety-blocked lane correctly stopped by the deterministic
+  secret monitor.
 - Each successful lane recorded one worker adapter loop, one manager pass, one
   Hermes reviewer pass, zero containers in trusted host-worktree mode,
   manager-owned staging/commit/PR creation, and validation cleanup.

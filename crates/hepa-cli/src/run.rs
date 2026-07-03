@@ -279,6 +279,7 @@ pub fn run_live_task(
     let allocation = allocator
         .allocate_lane_with_metadata(&config.lane_id, "2026-06-16T00:00:00Z")
         .map_err(|error| error.to_string())?;
+    prepare_live_worktree_dependency_reuse(&config.repo_path, &allocation.worktree_path)?;
 
     fs::create_dir_all(&lane_paths.lane_dir).map_err(|error| error.to_string())?;
     if let Some(brief) = &hermes_run_brief {
@@ -2398,7 +2399,7 @@ fn pi_local_provider_bounded_task_rules() -> &'static str {
 
 fn pi_model_needs_no_think_suffix(model: &str, base_url: &Option<String>) -> bool {
     let model = model.to_ascii_lowercase();
-    let is_reasoning_local_model = ["qwen", "gpt-oss", "deepseek-r1", "reasoning", "r1-", "-r1"]
+    let is_reasoning_local_model = ["reasoning", "think", "r1-", "-r1", "/r1"]
         .iter()
         .any(|needle| model.contains(needle));
     is_reasoning_local_model && pi_model_is_local(&model, base_url)
@@ -2696,8 +2697,20 @@ fn prepare_live_worktree_dependency_reuse(repo_path: &Path, worktree: &Path) -> 
     for dependency_dir in ["node_modules"] {
         let source = repo_path.join(dependency_dir);
         let destination = worktree.join(dependency_dir);
-        if !source.exists() || destination.exists() {
+        if !source.exists() {
             continue;
+        }
+        if destination.exists() {
+            if dependency_dir_reuse_is_usable(&destination) {
+                continue;
+            }
+            remove_stale_dependency_dir(&destination).map_err(|error| {
+                format!(
+                    "failed to replace stale dependency dir {} with {}: {error}",
+                    destination.display(),
+                    source.display()
+                )
+            })?;
         }
         symlink_dependency_dir(&source, &destination).map_err(|error| {
             format!(
@@ -2708,6 +2721,19 @@ fn prepare_live_worktree_dependency_reuse(repo_path: &Path, worktree: &Path) -> 
         })?;
     }
     Ok(())
+}
+
+fn dependency_dir_reuse_is_usable(path: &Path) -> bool {
+    path.is_symlink() || path.join(".bin").exists()
+}
+
+fn remove_stale_dependency_dir(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path)
+    } else {
+        fs::remove_dir_all(path)
+    }
 }
 
 #[cfg(unix)]
@@ -2914,6 +2940,7 @@ fn run_safe_validation_command(
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(worktree)
+        .envs(noninteractive_validation_env())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2954,6 +2981,15 @@ fn run_safe_validation_command(
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn noninteractive_validation_env() -> [(&'static str, &'static str); 4] {
+    [
+        ("CI", "true"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
+        ("PNPM_CONFIG_CONFIRM_MODULES_PURGE", "false"),
+    ]
 }
 
 fn safe_validation_argv(command: &str) -> Result<Vec<String>, String> {
@@ -5273,12 +5309,12 @@ mod tests {
     }
 
     #[test]
-    fn live_worker_prompt_adds_no_think_only_for_local_qwen_pi() {
+    fn live_worker_prompt_adds_no_think_for_local_reasoning_pi() {
         let config = hepa_core::config::HepaConfig::load(
             None,
             &std::collections::BTreeMap::new(),
             HepaConfigOverrides {
-                pi_model: Some("local/mlx-community/Qwen3-30B-A3B-4bit".to_string()),
+                pi_model: Some("local/mlx-community/reasoning-coder-30b".to_string()),
                 pi_base_url: Some(Some("http://127.0.0.1:52415/v1".to_string())),
                 ..HepaConfigOverrides::default()
             },
@@ -5302,7 +5338,7 @@ mod tests {
             None,
             &std::collections::BTreeMap::new(),
             HepaConfigOverrides {
-                pi_model: Some("llama-cpp/devstral-small-24b".to_string()),
+                pi_model: Some("llama-cpp/tool-coder-24b".to_string()),
                 pi_base_url: Some(Some("http://127.0.0.1:8080/v1".to_string())),
                 ..HepaConfigOverrides::default()
             },
@@ -5324,7 +5360,7 @@ mod tests {
             None,
             &std::collections::BTreeMap::new(),
             HepaConfigOverrides {
-                pi_model: Some("llama-cpp/gpt-oss-20b".to_string()),
+                pi_model: Some("llama-cpp/reasoning-coder-20b".to_string()),
                 pi_base_url: Some(Some("http://127.0.0.1:8080/v1".to_string())),
                 ..HepaConfigOverrides::default()
             },
@@ -5344,7 +5380,7 @@ mod tests {
             None,
             &std::collections::BTreeMap::new(),
             HepaConfigOverrides {
-                pi_model: Some("deepseek/deepseek-chat".to_string()),
+                pi_model: Some("openai/gpt-4.1".to_string()),
                 ..HepaConfigOverrides::default()
             },
         )
@@ -5353,7 +5389,7 @@ mod tests {
             None,
             &std::collections::BTreeMap::new(),
             HepaConfigOverrides {
-                pi_model: Some("local/mlx-community/Qwen3-30B-A3B-4bit".to_string()),
+                pi_model: Some("local/mlx-community/reasoning-coder-30b".to_string()),
                 pi_base_url: Some(Some("http://127.0.0.1:52415/v1".to_string())),
                 ..HepaConfigOverrides::default()
             },
@@ -5390,24 +5426,24 @@ mod tests {
     fn pi_local_detection_covers_llama_cpp_reasoning_models() {
         let base_url = Some("http://127.0.0.1:8080/v1".to_string());
 
-        assert!(pi_model_is_local("llama-cpp/devstral-small-24b", &None));
-        assert!(pi_model_is_local("deepseek/deepseek-chat", &base_url));
+        assert!(pi_model_is_local("llama-cpp/tool-coder-24b", &None));
+        assert!(pi_model_is_local("openai/gpt-4.1", &base_url));
         assert!(pi_worker_model_needs_local_permit(
             &std::collections::BTreeMap::from([(
                 "HEPA_PI_MODEL".to_string(),
-                "llama-cpp/devstral-small-24b".to_string(),
+                "llama-cpp/tool-coder-24b".to_string(),
             )])
         ));
         assert!(!pi_model_needs_no_think_suffix(
-            "llama-cpp/devstral-small-24b",
+            "llama-cpp/tool-coder-24b",
             &base_url
         ));
         assert!(pi_model_needs_no_think_suffix(
-            "llama-cpp/gpt-oss-20b",
+            "llama-cpp/reasoning-coder-20b",
             &base_url
         ));
         assert!(pi_model_needs_no_think_suffix(
-            "local/mlx-community/Qwen3-30B-A3B-4bit",
+            "local/mlx-community/reasoning-coder-30b",
             &base_url
         ));
     }
@@ -6690,6 +6726,34 @@ JSON
     }
 
     #[test]
+    fn dependency_reuse_replaces_stale_partial_node_modules() {
+        let root = unique_test_dir("dependency-reuse-stale");
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        fs::create_dir_all(repo.join("node_modules/.bin")).expect("repo node_modules");
+        fs::create_dir_all(worktree.join("node_modules/.cache")).expect("partial node_modules");
+
+        prepare_live_worktree_dependency_reuse(&repo, &worktree).expect("dependency reuse");
+
+        let dependency_path = worktree.join("node_modules");
+        assert!(dependency_dir_reuse_is_usable(&dependency_path));
+        assert!(!dependency_path.join(".cache").exists());
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn manager_validation_env_is_noninteractive_for_package_managers() {
+        let env = noninteractive_validation_env()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(env.get("CI"), Some(&"true"));
+        assert_eq!(env.get("PNPM_CONFIG_CONFIRM_MODULES_PURGE"), Some(&"false"));
+        assert_eq!(env.get("GIT_TERMINAL_PROMPT"), Some(&"0"));
+        assert_eq!(env.get("COREPACK_ENABLE_DOWNLOAD_PROMPT"), Some(&"0"));
+    }
+
+    #[test]
     fn unrequested_package_manager_churn_is_discarded_before_staging() {
         let root = unique_test_dir("discard-lockfile-churn");
         let repo = root.join("repo");
@@ -6919,7 +6983,7 @@ JSON
             None,
             &std::collections::BTreeMap::new(),
             HepaConfigOverrides {
-                pi_model: Some("deepseek/deepseek-chat".to_string()),
+                pi_model: Some("openai/gpt-4.1".to_string()),
                 ..HepaConfigOverrides::default()
             },
         )
@@ -7451,15 +7515,12 @@ JSON
     }
 
     #[test]
-    fn live_review_prompt_adds_no_think_for_local_qwen_review_model() {
+    fn live_review_prompt_adds_no_think_for_local_reasoning_review_model() {
         let environment = std::collections::BTreeMap::from([
-            (
-                "HEPA_PI_MODEL".to_string(),
-                "deepseek/deepseek-chat".to_string(),
-            ),
+            ("HEPA_PI_MODEL".to_string(), "openai/gpt-4.1".to_string()),
             (
                 "HEPA_PI_REVIEW_MODEL".to_string(),
-                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+                "local/mlx-community/reasoning-coder-30b".to_string(),
             ),
             (
                 "HEPA_PI_BASE_URL".to_string(),
@@ -7475,11 +7536,11 @@ JSON
         let local_environment = std::collections::BTreeMap::from([
             (
                 "HEPA_PI_MODEL".to_string(),
-                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+                "local/mlx-community/reasoning-coder-30b".to_string(),
             ),
             (
                 "HEPA_PI_REVIEW_MODEL".to_string(),
-                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+                "local/mlx-community/reasoning-coder-30b".to_string(),
             ),
             (
                 "HEPA_PI_BASE_URL".to_string(),
@@ -7488,16 +7549,16 @@ JSON
         ]);
         let cloud_environment = std::collections::BTreeMap::from([(
             "HEPA_PI_REVIEW_MODEL".to_string(),
-            "deepseek/deepseek-chat".to_string(),
+            "openai/gpt-4.1".to_string(),
         )]);
         let hybrid_environment = std::collections::BTreeMap::from([
             (
                 "HEPA_PI_MODEL".to_string(),
-                "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+                "local/mlx-community/reasoning-coder-30b".to_string(),
             ),
             (
                 "HEPA_PI_REVIEW_MODEL".to_string(),
-                "deepseek/deepseek-chat".to_string(),
+                "openai/gpt-4.1".to_string(),
             ),
             (
                 "HEPA_PI_BASE_URL".to_string(),
@@ -7562,11 +7623,11 @@ JSON
     fn local_pi_monitor_stop_with_changes_can_continue_only_for_local_pi() {
         let local_environment = std::collections::BTreeMap::from([(
             "HEPA_PI_MODEL".to_string(),
-            "llama-cpp/devstral-small-24b".to_string(),
+            "llama-cpp/tool-coder-24b".to_string(),
         )]);
         let cloud_environment = std::collections::BTreeMap::from([(
             "HEPA_PI_MODEL".to_string(),
-            "deepseek/deepseek-chat".to_string(),
+            "openai/gpt-4.1".to_string(),
         )]);
         let stall_error = hepa_adapters::engine::HepaAdapterExecutionError {
             field: "monitor".to_string(),
@@ -7679,7 +7740,7 @@ JSON
             environment: std::collections::BTreeMap::from([
                 (
                     "HEPA_PI_MODEL".to_string(),
-                    "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+                    "local/mlx-community/reasoning-coder-30b".to_string(),
                 ),
                 (
                     "HEPA_PI_BASE_URL".to_string(),

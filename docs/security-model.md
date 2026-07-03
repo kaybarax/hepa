@@ -50,8 +50,8 @@ with the permissions of the Pi process. HEPA therefore owns confinement around
 Pi runs:
 
 - disposable lane worktrees scoped to the target repository;
-- per-role env allowlists that pass provider keys such as `DEEPSEEK_API_KEY`
-  while withholding manager credentials;
+- per-role env allowlists that pass only the configured provider keys required
+  by the selected worker/reviewer route while withholding manager credentials;
 - deterministic monitoring of commands, stderr/stdout, secret-like output, and
   suspicious paths;
 - container mode for untrusted projects.

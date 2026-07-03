@@ -85,7 +85,7 @@ fn pi_command_boundary_rejects_bypass_flags() {
 #[test]
 fn pi_command_boundary_rejects_project_trust_approval() {
     assert_eq!(
-        unsupported_hepa_flags("pi --approve -p --mode json --model deepseek/deepseek-chat"),
+        unsupported_hepa_flags("pi --approve -p --mode json --model openai/gpt-4.1"),
         vec!["--approve".to_string()]
     );
 }

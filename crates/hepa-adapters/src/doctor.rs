@@ -364,7 +364,9 @@ fn check_pi_local_route(
         }
     }
     if !environment.contains_key("HEPA_PI_MODEL") {
-        if let Some(model) = pi_model_from_command(&spec.command) {
+        if let Some(model) = pi_model_from_command(&spec.command)
+            .filter(|model| !model.contains('<') && !model.contains('>'))
+        {
             environment.insert("HEPA_PI_MODEL".to_string(), model);
         }
     }
@@ -374,6 +376,13 @@ fn check_pi_local_route(
                 environment.insert("HEPA_PI_REVIEW_MODEL".to_string(), model);
             }
         }
+    }
+    if !environment.contains_key("HEPA_PI_MODEL") {
+        *status = most_severe(status.clone(), HepaAdapterCheckStatus::Missing);
+        actions.push(
+            "set HEPA_PI_MODEL to a tool-call-capable cloud or local model route".to_string(),
+        );
+        return "pi_model_not_configured".to_string();
     }
 
     let config = model_config_from_env(&environment);
@@ -727,7 +736,10 @@ mod tests {
     #[test]
     fn doctor_skips_optional_builtin_routes_when_default_is_available() {
         let mut probe = FakeProbe::default();
-        probe.env.insert("DEEPSEEK_API_KEY".to_string());
+        probe
+            .env_values
+            .insert("HEPA_PI_MODEL".to_string(), "openai/gpt-4.1".to_string());
+        probe.env.insert("OPENAI_API_KEY".to_string());
         probe.commands.insert("pi".to_string());
         probe
             .versions
@@ -861,7 +873,7 @@ mod tests {
             .insert("pi".to_string(), "0.79.6".to_string());
         probe.env_values.insert(
             "HEPA_PI_MODEL".to_string(),
-            "local/mlx-community/Qwen3-30B-A3B-4bit".to_string(),
+            "local/mlx-community/reasoning-coder-30b".to_string(),
         );
         probe.env_values.insert(
             "HEPA_PI_BASE_URL".to_string(),
@@ -869,7 +881,7 @@ mod tests {
         );
         let mut spec = builtin_adapter_specs().remove("pi").expect("pi spec");
         spec.command =
-            "pi --mode json --provider local --model mlx-community/Qwen3-30B-A3B-4bit".to_string();
+            "pi --mode json --provider local --model mlx-community/reasoning-coder-30b".to_string();
         spec.required_env = vec!["HEPA_PI_BASE_URL".to_string()];
 
         let report = HepaAdapterDoctorReport::from_specs([&spec], &probe);
@@ -894,14 +906,15 @@ mod tests {
             .insert("pi".to_string(), "0.79.6".to_string());
         probe.env_values.insert(
             "HEPA_PI_MODEL".to_string(),
-            "llama-cpp/gpt-oss-20b".to_string(),
+            "llama-cpp/reasoning-coder-20b".to_string(),
         );
         probe.env_values.insert(
             "HEPA_PI_BASE_URL".to_string(),
             "http://127.0.0.1:8080/v1".to_string(),
         );
         let mut spec = builtin_adapter_specs().remove("pi").expect("pi spec");
-        spec.command = "pi --mode json --provider llama-cpp --model gpt-oss-20b".to_string();
+        spec.command =
+            "pi --mode json --provider llama-cpp --model reasoning-coder-20b".to_string();
         spec.required_env = vec!["HEPA_PI_BASE_URL".to_string()];
 
         let report = HepaAdapterDoctorReport::from_specs([&spec], &probe);
