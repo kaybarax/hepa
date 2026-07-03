@@ -13,6 +13,5 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://example.invalid/hepa"
+repository = "https://github.com/kaybarax/hepa"
 rust-version = "1.85"
-

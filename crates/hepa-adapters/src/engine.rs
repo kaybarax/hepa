@@ -477,7 +477,7 @@ fn receive_output_reader(
 }
 
 fn receive_output_reader_snapshot(reader: &OutputReader) -> Vec<u8> {
-    let _ = reader.done.recv_timeout(Duration::from_millis(100));
+    let _ = reader.done.recv_timeout(Duration::from_secs(1));
     reader
         .capture
         .lock()

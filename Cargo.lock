@@ -71,7 +71,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hepa-adapters"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hepa-core",
  "serde",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "hepa-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hepa-adapters",
  "hepa-core",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "hepa-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "hepa-git"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hepa-core",
  "serde",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "hepa-kanban"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hepa-core",
  "hmac",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "hepa-memory"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hepa-core",
  "serde",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "hepa-review"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hepa-adapters",
  "hepa-core",
