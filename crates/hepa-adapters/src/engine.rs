@@ -400,6 +400,12 @@ fn adapter_stream_path(
             )
         })?;
     }
+    fs::File::create(&stream_path).map_err(|error| {
+        HepaAdapterExecutionError::new(
+            "artifact_dir",
+            format!("failed to create stream log: {error}"),
+        )
+    })?;
     Ok(stream_path)
 }
 
@@ -477,7 +483,7 @@ fn receive_output_reader(
 }
 
 fn receive_output_reader_snapshot(reader: &OutputReader) -> Vec<u8> {
-    let _ = reader.done.recv_timeout(Duration::from_secs(1));
+    let _ = reader.done.recv_timeout(Duration::from_millis(500));
     reader
         .capture
         .lock()
